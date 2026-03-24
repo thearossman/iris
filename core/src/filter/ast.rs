@@ -6,6 +6,7 @@ use std::fmt;
 use crate::conntrack::conn::conn_state::StateTxOrd;
 use crate::conntrack::StateTransition;
 use crate::conntrack::{conn::conn_layers::SupportedLayer, LayerState};
+use crate::filter::subscription::FilterSpec;
 use crate::protocols::stream::ConnData;
 use bimap::BiMap;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -91,17 +92,10 @@ pub enum Predicate {
     Custom {
         /// Filter name (function or struct (group) if present)
         name: FuncIdent,
-        /// StateTransition(s) at which the filter must receive streaming updates
-        /// (e.g., "packets in the L4 payload") and/or phase transition
-        /// updates (e.g., "parsed session").
-        /// For a grouped filter (i.e., methods on a struct), each function
-        /// needs its own level.
-        levels: Vec<Vec<StateTransition>>,
+        /// Filter functions
+        specs: Vec<FilterSpec>,
         /// Predicate for `partial match` (Continue) or `matched` (Accept)
         matched: bool,
-        /// Filter function may be associated with "expensive" datatypes that
-        /// need to be tracked in PTrees.
-        filtered_data: Vec<String>,
     },
     /// Streaming callback, which may need to be checked for "unsubscribe"
     /// to determine Actions. This will only be used in filter sub-trees.
@@ -153,12 +147,19 @@ impl Predicate {
         matches!(self, Predicate::Custom { .. })
     }
 
-    // Returns `true` if predicate contains a streaming level
+    // Returns `true` if predicate contains a streaming level or multiple levels
     pub fn is_streaming(&self) -> bool {
-        if let Predicate::Custom { levels, .. } = self {
-            if levels.len() > 1 {
+        if let Predicate::Custom { specs, .. } = self {
+            // Multiple functions
+            if specs.len() > 1 {
                 return true;
             }
+            // One streaming function
+            if specs.iter().any(|s| s.is_streaming()) {
+                return true;
+            }
+            // Not streaming
+            return false;
         }
         self.levels().iter().any(|l| l.is_streaming())
     }
@@ -210,7 +211,13 @@ impl Predicate {
     // Inapplicable to static predicates and LayerState.
     pub fn levels(&self) -> Vec<StateTransition> {
         match self {
-            Predicate::Custom { levels, .. } => levels.iter().flatten().cloned().collect(),
+            Predicate::Custom { specs, .. } => {
+                let mut levels: Vec<StateTransition> =
+                    specs.iter().flat_map(|s| s.levels()).collect();
+                levels.sort();
+                levels.dedup();
+                levels
+            }
             Predicate::Callback { .. } => vec![],
             // Can be checked anytime.
             Predicate::LayerState { .. } => vec![StateTransition::L4FirstPacket],
@@ -273,6 +280,18 @@ impl Predicate {
             || has_path(self.get_protocol(), &protocol!("udp"))
     }
 
+    // Accessor
+    pub(super) fn filtered_data(&self) -> Vec<String> {
+        if let Predicate::Custom { specs, .. } = self {
+            return specs
+                .iter()
+                .flat_map(|s| s.filtered_data.clone())
+                .unique()
+                .collect();
+        }
+        vec![]
+    }
+
     // `self` depends on (layer, state)
     // I.e., `self` cannot be applied unless (layer) is in (state)
     // For grouped filters, we base the dependency on _all_ predicates.
@@ -290,21 +309,25 @@ impl Predicate {
                 match state {
                     LayerState::Discovery => false,
                     LayerState::Headers => {
-                        if let Predicate::Custom { levels, .. } = self {
-                            return levels
+                        if let Predicate::Custom { specs, .. } = self {
+                            // All associated functions require at least L7 disc.
+                            return specs
                                 .iter()
-                                .all(|fnlevel| fnlevel.iter().any(|l| l.layer_idx().is_some()));
+                                .all(|s| s.levels().iter().any(|l| l.layer_idx().is_some()));
                         }
                         // Requires L7 protocol
                         levels.iter().any(|l| l.layer_idx().is_some())
                     }
                     LayerState::Payload => {
-                        if let Predicate::Custom { levels, .. } = self {
-                            return levels.iter().all(|fnlevel| {
-                                fnlevel
-                                    .iter()
-                                    .any(|l| matches!(l, StateTransition::L7EndHdrs))
-                            });
+                        if let Predicate::Custom { specs, .. } = self {
+                            return specs
+                                .iter()
+                                // No functions that can get invoked yet
+                                .all(|s| {
+                                    s.levels()
+                                        .iter()
+                                        .any(|l| matches!(l, StateTransition::L7EndHdrs))
+                                });
                         }
                         // Requires payload or parsed session
                         levels
@@ -328,39 +351,16 @@ impl Predicate {
             // For simplicity, only apply `self` if equivalent
             return s == &state;
         }
+        if let Predicate::Custom { specs, .. } = self {
+            // Grouped filters: "okay to apply" if any of its predicates can be applied
+            return specs.iter().any(|s| s.is_compatible(layer, state));
+        }
         match layer {
             SupportedLayer::L4 => true,
             SupportedLayer::L7 => {
                 match state {
-                    LayerState::Discovery => {
-                        if let Predicate::Custom { levels, .. } = self {
-                            // Grouped filters: "okay to apply" if any of its predicates can be applied
-                            if levels.len() > 1 {
-                                return levels
-                                    .iter()
-                                    // Any filter function
-                                    .any(|fnlevel| {
-                                        fnlevel
-                                            .iter()
-                                            // ...can be invoked
-                                            .all(|l| l.layer_idx().is_none())
-                                    });
-                            }
-                        }
-                        // Does not require a session-layer state
-                        levels.iter().all(|l| l.layer_idx().is_none())
-                    }
+                    LayerState::Discovery => levels.iter().all(|l| l.layer_idx().is_none()),
                     LayerState::Headers => {
-                        if let Predicate::Custom { levels, .. } = self {
-                            // Grouped filters: "okay to apply" if any of its predicates can be applied
-                            if levels.len() > 1 {
-                                return levels.iter().any(|fnlevel| {
-                                    fnlevel.iter().all(|l| {
-                                        l.layer_idx().is_none() || *l == StateTransition::L7OnDisc
-                                    })
-                                });
-                            }
-                        }
                         // Does not require a session-layer state or only
                         // requires L7 protocol discovery
                         levels
@@ -384,16 +384,10 @@ impl Predicate {
 
     // Returns true if the predicate `self` cannot be checked at `curr`
     pub(super) fn is_next_layer(&self, curr: StateTransition) -> bool {
-        if let Predicate::Custom { levels, .. } = self {
+        if let Predicate::Custom { specs, .. } = self {
             // Custom predicates may be grouped, and they should be checked at
             // `curr` if ANY of their contained functions can be applied.
-            if levels.len() > 1 {
-                return levels.iter().all(|fnlevel| {
-                    fnlevel
-                        .iter()
-                        .all(|l| matches!(l.compare(&curr), StateTxOrd::Greater))
-                });
-            }
+            return specs.iter().all(|s| s.is_next_layer(curr));
         }
         !self.levels().is_empty()
             && self

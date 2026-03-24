@@ -634,9 +634,7 @@ impl PTree {
             node = node.get_child(predicate);
             node.children.extend(children);
 
-            // Maintain streaming filter if still `matching` regardless of
-            // later predicate state
-            // NICE-TO-HAVE: do we need this? could avoid additional lookups
+            // Maintain streaming filter if still `matching`
             if node.pred.is_custom() && node.pred.is_matching() {
                 node.actions.merge(&DataActions::from_stream_pred(
                     &node.pred,
@@ -644,6 +642,13 @@ impl PTree {
                     self.filter_layer,
                     &state_pred,
                 ));
+                // Still need data types to invoke filter functions
+                let filtered_dts = node.pred.filtered_data();
+                for dt_name in filtered_dts {
+                    let data = FilteredDatatype::new(dt_name.clone(), actions.refresh_at());
+                    self.filtered_datatypes.insert(dt_name);
+                    node.insert_filtered_data(data);
+                }
             }
 
             if node.pred.is_state() {
@@ -666,17 +671,13 @@ impl PTree {
             self.matched.insert(callback.subscription_id.clone());
         }
         node.actions.merge(actions);
-        let filtered_data_names: Vec<String> = pattern
-            .get_filtered_data()
-            .iter()
-            .chain(callback.filtered_data.iter())
-            .cloned()
-            .collect();
-
-        if !filtered_data_names.is_empty() {
+        // Note: filtered datatypes required for filters are handled in
+        // "matching" filters.
+        let filtered_cb_data: Vec<String> = callback.filtered_data.clone();
+        if !filtered_cb_data.is_empty() {
             self.filtered_datatypes
-                .extend(filtered_data_names.iter().cloned());
-            for dt in filtered_data_names {
+                .extend(filtered_cb_data.iter().cloned());
+            for dt in filtered_cb_data {
                 let data = FilteredDatatype::new(dt.clone(), actions.refresh_at());
                 node.insert_filtered_data(data);
             }
@@ -1099,7 +1100,13 @@ impl fmt::Display for PTree {
 
 #[cfg(test)]
 mod tests {
-    use crate::{conntrack::Actions, filter::subscription::StateTransitionSpec, filter::Filter};
+    use crate::{
+        conntrack::Actions,
+        filter::{
+            subscription::{FilterSpec, StateTransitionSpec},
+            Filter,
+        },
+    };
 
     use super::*;
 
@@ -1178,11 +1185,20 @@ mod tests {
     }
 
     lazy_static! {
+        static ref FILTER_FUNC_SPEC: FilterSpec = FilterSpec {
+            expl_level: Some(StateTransition::InL4Conn),
+            datatypes: vec![StateTransitionSpec {
+                updates: vec![StateTransition::InL4Conn],
+                name: "MyFilterData".into(),
+            }],
+            as_str: "my_filter".into(),
+            filter_id: "my_filter".into(),
+            filtered_data: vec![],
+        };
         static ref CUSTOM_FILTERS: Vec<Predicate> = vec![Predicate::Custom {
             name: filterfunc!("my_filter"),
-            levels: vec![vec![StateTransition::InL4Conn]],
-            matched: true,
-            filtered_data: vec![],
+            specs: vec![FILTER_FUNC_SPEC.clone()],
+            matched: false,
         }];
         static ref SESS_RECORD_DATATYPE: StateTransitionSpec = StateTransitionSpec {
             updates: vec![StateTransition::InL4Conn, StateTransition::L7EndHdrs],
@@ -1301,23 +1317,51 @@ mod tests {
     }
 
     lazy_static! {
+        static ref CUSTOM_FILTER_SPEC_CONN: FilterSpec = FilterSpec {
+            expl_level: Some(StateTransition::InL4Conn),
+            datatypes: vec![StateTransitionSpec {
+                updates: vec![StateTransition::InL4Conn],
+                name: "MyFilterData".into(),
+            }],
+            as_str: "GroupedFil".into(),
+            filter_id: "GroupedFil".into(),
+            filtered_data: vec![],
+        };
+        static ref CUSTOM_FILTER_SPEC_HDRS: FilterSpec = FilterSpec {
+            expl_level: Some(StateTransition::L7EndHdrs),
+            datatypes: vec![StateTransitionSpec {
+                updates: vec![StateTransition::L7EndHdrs],
+                name: "MyFilterData2".into(),
+            }],
+            as_str: "GroupedFil".into(),
+            filter_id: "GroupedFil".into(),
+            filtered_data: vec![],
+        };
+        static ref CUSTOM_FILTER_SPEC_TERM: FilterSpec = FilterSpec {
+            expl_level: Some(StateTransition::L4Terminated),
+            datatypes: vec![StateTransitionSpec {
+                updates: vec![StateTransition::InL4Conn],
+                name: "MyFilterData".into(),
+            }],
+            as_str: "GroupedFil".into(),
+            filter_id: "GroupedFil".into(),
+            filtered_data: vec![],
+        };
         static ref CUSTOM_FILTERS_GROUPED: Vec<Predicate> = vec![Predicate::Custom {
             name: filterfunc!("GroupedFil"),
-            levels: vec![
-                vec![StateTransition::InL4Conn],
-                vec![StateTransition::L7EndHdrs]
+            specs: vec![
+                CUSTOM_FILTER_SPEC_CONN.clone(),
+                CUSTOM_FILTER_SPEC_HDRS.clone()
             ],
             matched: true,
-            filtered_data: vec![],
         }];
         static ref CUSTOM_FILTERS_GROUPED_TERM: Vec<Predicate> = vec![Predicate::Custom {
             name: filterfunc!("GroupedFil"),
-            levels: vec![
-                vec![StateTransition::InL4Conn],
-                vec![StateTransition::L4Terminated]
+            specs: vec![
+                CUSTOM_FILTER_SPEC_HDRS.clone(),
+                CUSTOM_FILTER_SPEC_TERM.clone()
             ],
             matched: true,
-            filtered_data: vec![],
         }];
         static ref TERM_SUB: Vec<CallbackSpec> = vec![CallbackSpec {
             expl_level: Some(StateTransition::L4Terminated),

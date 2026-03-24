@@ -6,7 +6,7 @@ use iris_core::filter::{
     pattern::FlatPattern,
     pred_ptree::PredPTree,
     ptree::PTree,
-    subscription::{CallbackSpec, StateTransitionSpec, SubscriptionLevel},
+    subscription::{CallbackSpec, FilterSpec, StateTransitionSpec, SubscriptionLevel},
 };
 use lazy_static::lazy_static;
 use std::collections::{HashMap, HashSet};
@@ -264,65 +264,30 @@ impl SubscriptionDecoder {
                 assert!(v.len() == 1, "Missing filter group for: {:?}", v);
             }
 
-            // TODO this breaks if filter is trying to
-            // request multiple datatypes like a callback
-            let mut levels = vec![];
-            let mut filtered_data = vec![];
+            let mut specs: Vec<FilterSpec> = vec![];
             for inp in v {
-                let mut lvls = vec![];
                 // Levels of the datatypes in the function(s)
                 match inp {
                     ParsedInput::Filter(f) => {
-                        lvls.extend(self.datatypes_to_levels(&f.func));
-                    }
-                    ParsedInput::FilterGroupFn(f) => {
-                        lvls.extend(self.datatypes_to_levels(&f.func));
-                    }
-                    _ => continue,
-                }
-                if lvls.iter().any(|l| l.is_streaming()) {
-                    assert!(
-                        !inp.levels().is_empty(),
-                        "Filter {}::{} requests streaming datatypes; must explicitly specify level",
-                        name,
-                        inp.name()
-                    );
-                }
-                // Explicitly annotated levels
-                lvls.extend(inp.levels());
-                lvls.sort();
-                lvls.dedup();
-                if !lvls.is_empty() {
-                    levels.push(lvls);
-                }
-                // Filtered ("expensive") datatypes that require tracking in PTree
-                match inp {
-                    ParsedInput::Filter(f) => {
-                        filtered_data.extend(
-                            f.func
-                                .datatypes
-                                .iter()
-                                .filter(|dt| self.filtered_datatypes.contains(*dt))
-                                .cloned(),
+                        self.specs_to_filter(
+                            &f.func,
+                            &f.func.name,
+                            &f.func.name,
+                            &f.level,
+                            &mut specs,
                         );
                     }
                     ParsedInput::FilterGroupFn(f) => {
-                        filtered_data.extend(
-                            f.func
-                                .datatypes
-                                .iter()
-                                .filter(|dt| self.filtered_datatypes.contains(*dt))
-                                .cloned(),
-                        );
+                        let as_str = format!("{}::{}", f.group_name, f.func.name);
+                        self.specs_to_filter(&f.func, &as_str, &f.group_name, &f.level, &mut specs);
                     }
                     _ => continue,
                 }
             }
             self.custom_preds.push(Predicate::Custom {
                 name: FuncIdent(name.clone()),
-                levels,
+                specs,
                 matched: true,
-                filtered_data,
             });
         }
     }
@@ -404,32 +369,8 @@ impl SubscriptionDecoder {
         expl_level: Option<StateTransition>,
     ) -> CallbackSpec {
         let must_deliver = spec.datatypes.iter().any(|dt| dt == "FilterStr");
-        let datatypes = spec
-            .datatypes
-            .iter()
-            .map(|dt_name| {
-                self.datatypes
-                    .get(dt_name)
-                    .unwrap_or_else(|| panic!("Can't find datatype {}", dt_name))
-                    .clone()
-            })
-            .collect::<Vec<_>>();
-        let filtered_data = spec
-            .datatypes
-            .iter()
-            .filter(|dt| self.filtered_datatypes.contains(*dt))
-            .cloned()
-            .collect::<Vec<_>>();
-        if datatypes
-            .iter()
-            .any(|dt| dt.updates.iter().any(|l| l.is_streaming()))
-        {
-            assert!(
-                expl_level.is_some(),
-                "Callback {} requests streaming datatype; must explicitly specify level.",
-                spec.name
-            );
-        }
+        let datatypes = self.spec_to_datatypes(spec, expl_level);
+        let filtered_data = self.spec_to_filtered_datatypes(spec);
         CallbackSpec {
             expl_level,
             datatypes,
@@ -441,31 +382,96 @@ impl SubscriptionDecoder {
         }
     }
 
+    fn spec_to_datatypes(
+        &self,
+        spec: &FnSpec,
+        expl_level: Option<StateTransition>,
+    ) -> Vec<StateTransitionSpec> {
+        let ret = spec
+            .datatypes
+            .iter()
+            .map(|dt_name| {
+                self.datatypes
+                    .get(dt_name)
+                    .unwrap_or_else(|| panic!("Can't find datatype {}", dt_name))
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        if ret
+            .iter()
+            .any(|dt| dt.updates.iter().any(|l| l.is_streaming()))
+        {
+            assert!(
+                expl_level.is_some(),
+                "{} requests streaming datatype; must explicitly specify level.",
+                spec.name
+            );
+        }
+        ret
+    }
+
+    fn spec_to_filtered_datatypes(&self, spec: &FnSpec) -> Vec<String> {
+        spec.datatypes
+            .iter()
+            .filter(|dt| self.filtered_datatypes.contains(*dt))
+            .cloned()
+            .collect::<Vec<_>>()
+    }
+
+    // REFACTOR: combine with `specs_to_cb` since these are basically doing the same thing
+    fn specs_to_filter(
+        &self,
+        spec: &FnSpec,
+        as_str: &String,
+        filter_id: &String,
+        levels: &Vec<StateTransition>,
+        filters: &mut Vec<FilterSpec>,
+    ) {
+        if levels.len() <= 1 {
+            let filter_spec = self.spec_to_filter_int(
+                spec,
+                as_str.clone(),
+                filter_id.clone(),
+                levels.last().cloned(),
+            );
+            filters.push(filter_spec);
+        } else {
+            // See specs_to_cb
+            let mut levels = levels.clone();
+            levels.sort();
+            levels.dedup();
+            for l in levels {
+                let filter_spec =
+                    self.spec_to_filter_int(spec, as_str.clone(), filter_id.clone(), Some(l));
+                filters.push(filter_spec);
+            }
+        }
+    }
+
     // TODO figure out what should go here -- need to fix filters
     // Pull the top-level datatype declaration to infer a function level
-    fn datatypes_to_levels(&self, spec: &FnSpec) -> Vec<StateTransition> {
-        let mut lvls = vec![];
-        for dt_name in &spec.datatypes {
-            let dt_info = self
-                .datatypes_raw
-                .get(dt_name)
-                .unwrap_or_else(|| panic!("Cannot find datatype {}", dt_name));
-            let mut level = dt_info
-                .iter()
-                .find(|grp| matches!(grp, ParsedInput::Datatype(_)))
-                .unwrap_or_else(|| panic!("Cannot find datatype declaration {}", dt_name))
-                .levels();
-            assert!(
-                level.len() == 1,
-                "{} declaration has {} levels (requires 1)",
-                dt_name,
-                level.len()
-            );
-            lvls.push(level.pop().unwrap());
+    fn spec_to_filter_int(
+        &self,
+        spec: &FnSpec,
+        as_str: String,
+        filter_id: String,
+        expl_level: Option<StateTransition>,
+    ) -> FilterSpec {
+        let datatypes = self.spec_to_datatypes(spec, expl_level);
+        if datatypes.len() > 1 {
+            // Supporting multiple data types at different levels requires additional reasoning when constructing trees
+            // about when a filter function can be invoked. A reasonable workaround is to consolidate logic in a data type
+            // or express a filter as multiple functions within a group.
+            panic!("Multiple datatypes not currently supported for filter functions (group under a struct instead): ({})", as_str);
         }
-        lvls.sort();
-        lvls.dedup();
-        lvls
+        let filtered_data = self.spec_to_filtered_datatypes(spec);
+        FilterSpec {
+            expl_level,
+            datatypes,
+            as_str,
+            filter_id,
+            filtered_data,
+        }
     }
 
     fn prune_filters_and_datatypes(&mut self) {

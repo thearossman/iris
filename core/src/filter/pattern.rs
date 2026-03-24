@@ -219,14 +219,7 @@ impl FlatPattern {
             // This applies to custom filters that either:
             // - Have multiple separate functions
             // - Or have any streaming functions
-            if pred.is_custom()
-                && (pred.is_streaming()
-                    || if let Predicate::Custom { levels, .. } = pred {
-                        levels.len() > 1 // REFACTOR: could do pairwise inequality here?
-                    } else {
-                        unreachable!()
-                    })
-            {
+            if pred.is_custom() && pred.is_streaming() {
                 let mut new_pats = vec![];
                 for partial in &all_patterns {
                     // Original pattern with matched=true
@@ -301,25 +294,6 @@ impl FlatPattern {
             .iter()
             .filter_map(StateTransitionSpec::from_pred)
             .collect()
-    }
-
-    /// Get explicitly-tracked and filtered datatypes
-    pub(super) fn get_filtered_data(&self) -> Vec<String> {
-        let mut ret: Vec<String> = self
-            .predicates
-            .iter()
-            .filter_map(|p| {
-                if let Predicate::Custom { filtered_data, .. } = p {
-                    Some(filtered_data.clone())
-                } else {
-                    None
-                }
-            })
-            .flatten()
-            .collect();
-        ret.sort();
-        ret.dedup();
-        ret
     }
 
     pub(super) fn with_l7_state(&self) -> Self {
@@ -558,15 +532,27 @@ mod tests {
     use super::*;
     use crate::{
         conntrack::StateTransition,
-        filter::{ast::Predicate, parser::FilterParser, pred_ptree::PredPTree, Filter},
+        filter::{
+            ast::Predicate, parser::FilterParser, pred_ptree::PredPTree, subscription::FilterSpec,
+            Filter,
+        },
     };
 
     lazy_static! {
+        static ref FILTER_FUNC_SPEC: FilterSpec = FilterSpec {
+            expl_level: Some(StateTransition::InL4Conn),
+            datatypes: vec![StateTransitionSpec {
+                updates: vec![StateTransition::InL4Conn],
+                name: "MyFilterData".into(),
+            }],
+            as_str: "my_filter".into(),
+            filter_id: "my_filter".into(),
+            filtered_data: vec![],
+        };
         static ref CUSTOM_FILTERS: Vec<Predicate> = vec![Predicate::Custom {
             name: filterfunc!("my_filter"),
-            levels: vec![vec![StateTransition::InL4Conn]],
-            matched: true,
-            filtered_data: vec![],
+            specs: vec![FILTER_FUNC_SPEC.clone()],
+            matched: false,
         }];
     }
 

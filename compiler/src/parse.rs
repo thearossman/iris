@@ -32,8 +32,11 @@ pub(crate) enum Constructor {
 /// General representation of a function (filter, callback, or datatype)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct FnSpec {
+    /// Name of the function (excluding group, if applicable)
     pub(crate) name: String,
+    /// Datatypes requested as parameters (excluding `self`, if applicable)
     pub(crate) datatypes: Vec<String>,
+    /// Return value, if applicable
     pub(crate) returns: FnReturn,
 }
 

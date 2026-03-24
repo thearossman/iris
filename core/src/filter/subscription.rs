@@ -81,16 +81,21 @@ impl DataActions {
     ) -> DataActions {
         if let Predicate::Custom {
             name,
-            levels,
+            specs,
             matched,
-            filtered_data: _,
         } = pred
         {
+            // Matched filter predicates don't require anything
             assert!(!*matched);
-            let spec = StateTransitionSpec {
-                updates: levels.iter().flatten().cloned().collect(),
+            // Levels required for the whole filter predicate
+            let mut spec = StateTransitionSpec {
+                updates: specs.iter().flat_map(|s| s.levels()).collect(),
                 name: name.clone().0,
             };
+            spec.updates.sort();
+            spec.updates.dedup();
+
+            // Actions required to reach these levels
             let actions = spec.to_actions(filter_layer);
             let curr_state = match curr_state_pred {
                 Some(p) => match p {
@@ -99,7 +104,10 @@ impl DataActions {
                 },
                 None => None,
             };
+            // Complete refresh_at for all actions
             for mut a in actions.actions {
+                // Take into account if we're conditioned on connection
+                // being in specific state
                 if a.if_matches == curr_state {
                     for p in next_preds {
                         a.transport.refresh_at[p.as_usize()] |= a.transport.active;
@@ -108,6 +116,7 @@ impl DataActions {
                     return a;
                 }
             }
+            // No actions
             return DataActions::new();
         }
         panic!("From_stream_pred called on {:?}", pred);
@@ -435,6 +444,108 @@ impl CallbackSpec {
 
     pub fn is_grouped(&self) -> bool {
         self.as_str != self.subscription_id
+    }
+}
+
+/// Structure for representing a custom filter function
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FilterSpec {
+    /// If the filter explicitly specifies when to be invoked
+    pub expl_level: Option<StateTransition>,
+    /// Datatype inputs to the filter function
+    pub datatypes: Vec<StateTransitionSpec>,
+    /// The name of the filter function (excluding parameters).
+    /// Also excludes the struct for stateful filters, if applicable.
+    pub as_str: String,
+    /// The name of the filter group (struct for stateful filters).
+    /// Equal to `as_str` for ungrouped filters.
+    pub filter_id: String,
+    /// "Expensive" tracked datatypes (by name)
+    pub filtered_data: Vec<String>,
+}
+
+impl Hash for FilterSpec {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str.hash(state);
+        self.filter_id.hash(state);
+    }
+}
+
+impl PartialOrd for FilterSpec {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.as_str.cmp(&other.as_str))
+    }
+}
+
+impl Ord for FilterSpec {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str.cmp(&other.as_str)
+    }
+}
+
+impl FilterSpec {
+    pub fn is_streaming(&self) -> bool {
+        match self.expl_level {
+            Some(l) => l.is_streaming(),
+            None => false,
+        }
+    }
+
+    pub fn is_grouped(&self) -> bool {
+        self.as_str != self.filter_id
+    }
+
+    /// State transitions this filter needs to reach:
+    /// - To construct data types
+    /// - To evaluate the function
+    pub fn levels(&self) -> Vec<StateTransition> {
+        let mut levels: Vec<StateTransition> = self
+            .datatypes
+            .iter()
+            .flat_map(|d| d.updates.iter().cloned())
+            .collect();
+        if let Some(expl_level) = self.expl_level {
+            levels.push(expl_level);
+        }
+        levels
+    }
+
+    pub fn is_compatible(&self, layer: SupportedLayer, state: LayerState) -> bool {
+        match layer {
+            SupportedLayer::L4 => true,
+            SupportedLayer::L7 => {
+                match state {
+                    LayerState::Discovery => {
+                        // Can't pull any state from L7
+                        (self.expl_level.is_none()
+                            || self.expl_level.as_ref().unwrap().layer_idx().is_none())
+                            && self.levels().iter().all(|l| l.layer_idx().is_none())
+                    }
+                    LayerState::Headers => {
+                        // Can pull protocol from L7
+                        (self.expl_level.is_none()
+                            || ({
+                                let expl_level = self.expl_level.as_ref().unwrap();
+                                expl_level.layer_idx().is_none()
+                                    || *expl_level == StateTransition::L7OnDisc
+                            }))
+                            && self
+                                .levels()
+                                .iter()
+                                .all(|l| l.layer_idx().is_none() || *l == StateTransition::L7OnDisc)
+                    }
+                    LayerState::Payload => true, // Can pull any state from L7
+                    LayerState::None => panic!("Should not have LayerState::None predicate"),
+                }
+            }
+        }
+    }
+
+    /// Function can't be applied at this layer because it requires a parameter that isn't ready
+    pub fn is_next_layer(&self, curr: StateTransition) -> bool {
+        self.levels()
+            .iter()
+            .any(|l| matches!(l.compare(&curr), StateTxOrd::Greater))
     }
 }
 
