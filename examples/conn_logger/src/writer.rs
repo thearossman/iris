@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 /// One more than the maximum CoreId.raw() value.  Must match the number of
 /// RX cores configured in the runtime config file.  The +1 accounts for the
 /// main core that never processes packets.
-const ARR_LEN: usize = 17;
+const ARR_LEN: usize = 33;
 
 /// 64 KB per-core write buffer — amortises syscall overhead across ~100+
 /// records before a flush is needed.
