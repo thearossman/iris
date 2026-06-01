@@ -82,14 +82,14 @@ fn parse_hex_key(s: &str) -> [u8; 32] {
     assert_eq!(s.len(), 64, "CryptoPAN key must be 64 hex characters (32 bytes)");
     let mut out = [0u8; 32];
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        let hi = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16)
+        let byte = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16)
             .expect("invalid hex character in key");
-        out[i] = hi;
+        out[i] = byte;
     }
     out
 }
 
-pub fn now_unix_ms() -> u64 {
+fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -154,6 +154,9 @@ impl ConnLogger {
         tcp: &TcpFlowState,
         core: &CoreId,
     ) -> bool {
+        // Capture the monotonic instant first so that all_windows and the
+        // wall-clock end_ms reflect the same point in time.
+        let end_ts = Instant::now();
         let end_wall_ms = now_unix_ms();
         let duration_ms = end_wall_ms.saturating_sub(self.start_wall_ms);
 
@@ -169,12 +172,10 @@ impl ConnLogger {
             duration_ms,
             end_reason: tcp.end_reason(),
             tcp_flags: tcp.flag_names(),
-            windows: windows.all_windows(Instant::now()),
+            windows: windows.all_windows(end_ts),
         };
 
-        writer::with_writer(core, |w| {
-            let _ = serde_json::to_writer(w, &record);
-        });
+        writer::with_writer(core, |w| serde_json::to_writer(w, &record));
 
         false
     }
@@ -226,9 +227,7 @@ fn log_tls(tls: &TlsHandshake, ft: &FiveTuple, core: &CoreId) {
         five_tuple: anon_ft(ft),
         sni: sni.to_owned(),
     };
-    writer::with_writer(core, |w| {
-        let _ = serde_json::to_writer(w, &record);
-    });
+    writer::with_writer(core, |w| serde_json::to_writer(w, &record));
 }
 
 // ---------------------------------------------------------------------------
@@ -254,9 +253,7 @@ fn log_quic(quic: &QuicStream, ft: &FiveTuple, core: &CoreId) {
         five_tuple: anon_ft(ft),
         sni: sni.to_owned(),
     };
-    writer::with_writer(core, |w| {
-        let _ = serde_json::to_writer(w, &record);
-    });
+    writer::with_writer(core, |w| serde_json::to_writer(w, &record));
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +272,7 @@ struct DnsRecord {
 
 #[callback("dns")]
 fn log_dns(dns: &DnsTransaction, ft: &FiveTuple, core: &CoreId) {
+    use dns_parser::ResponseCode;
     use iris_core::protocols::stream::dns::Data;
 
     let query = dns.query_domain().to_owned();
@@ -285,7 +283,15 @@ fn log_dns(dns: &DnsTransaction, ft: &FiveTuple, core: &CoreId) {
     let (rcode, answers) = match &dns.response {
         None => ("NoResponse".to_owned(), vec![]),
         Some(resp) => {
-            let rcode = format!("{:?}", resp.response_code);
+            let rcode = match resp.response_code {
+                ResponseCode::NoError => "NoError".to_owned(),
+                ResponseCode::FormatError => "FormatError".to_owned(),
+                ResponseCode::ServerFailure => "ServerFailure".to_owned(),
+                ResponseCode::NameError => "NameError".to_owned(),
+                ResponseCode::NotImplemented => "NotImplemented".to_owned(),
+                ResponseCode::Refused => "Refused".to_owned(),
+                ResponseCode::Reserved(n) => format!("Reserved({})", n),
+            };
             let answers = resp
                 .answers
                 .iter()
@@ -313,9 +319,7 @@ fn log_dns(dns: &DnsTransaction, ft: &FiveTuple, core: &CoreId) {
         rcode,
         answers,
     };
-    writer::with_writer(core, |w| {
-        let _ = serde_json::to_writer(w, &record);
-    });
+    writer::with_writer(core, |w| serde_json::to_writer(w, &record));
 }
 
 // ---------------------------------------------------------------------------
@@ -348,9 +352,7 @@ fn log_http(http: &HttpTransaction, ft: &FiveTuple, core: &CoreId) {
         uri,
         status: http.status_code(),
     };
-    writer::with_writer(core, |w| {
-        let _ = serde_json::to_writer(w, &record);
-    });
+    writer::with_writer(core, |w| serde_json::to_writer(w, &record));
 }
 
 // ---------------------------------------------------------------------------
@@ -372,5 +374,6 @@ fn main() {
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config, filter).unwrap();
     runtime.run();
 
+    writer::flush_writers();
     writer::finalize_writers();
 }

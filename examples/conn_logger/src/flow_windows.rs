@@ -249,6 +249,11 @@ fn tcp_window_size(pdu: &L4Pdu) -> Option<u16> {
     let mbuf: &Mbuf = pdu.mbuf_ref();
     // Use the already-known IP version from the connection context to avoid
     // the failed IPv4 parse attempt on every IPv6 packet.
+    //
+    // NOTE: 802.1Q VLAN-tagged frames are not supported.  On such networks
+    // the inner EtherType is hidden behind a VLAN tag, so parse_to::<Ipv4/6>()
+    // fails and this function returns None, leaving all tcp_*_win_* fields as
+    // 0.0 in the output.
     if let Ok(eth) = mbuf.parse_to::<Ethernet>() {
         if pdu.ctxt.src.is_ipv4() {
             if let Ok(ip4) = eth.parse_to::<Ipv4>() {
@@ -325,8 +330,11 @@ impl FlowWindows {
     pub fn update(&mut self, pdu: &L4Pdu) {
         let now = pdu.ts;
 
-        if now.duration_since(self.curr_start) >= WINDOW_DURATION {
-            self.flush_window(now);
+        // Flush one window per WINDOW_DURATION boundary, not just once per
+        // arrival.  A single `if` would produce a window wider than
+        // WINDOW_SECS whenever packets arrive more than 10 seconds apart.
+        while now.duration_since(self.curr_start) >= WINDOW_DURATION {
+            self.flush_window(self.curr_start + WINDOW_DURATION);
         }
 
         let is_orig = pdu.dir;

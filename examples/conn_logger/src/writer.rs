@@ -43,15 +43,34 @@ pub fn init_writers() {
 /// Borrow the per-core writer, call `f` to write the record body, then
 /// append a newline.  Writes go into a 64 KB `BufWriter` — no intermediate
 /// heap allocation is needed by the caller.
+///
+/// The newline is written only if `f` succeeds; a failed serialization
+/// produces no output rather than a truncated JSONL record.
 #[inline]
-pub fn with_writer<F: FnOnce(&mut BufWriter<File>)>(core_id: &CoreId, f: F) {
+pub fn with_writer<F>(core_id: &CoreId, f: F)
+where
+    F: FnOnce(&mut BufWriter<File>) -> serde_json::Result<()>,
+{
     let idx = core_id.raw() as usize;
-    if idx >= ARR_LEN {
-        return;
-    }
+    assert!(
+        idx < ARR_LEN,
+        "core_id {} out of bounds; increase ARR_LEN in writer.rs to at least {}",
+        idx,
+        idx + 1
+    );
     let w = unsafe { &mut *writers()[idx].load(Ordering::Relaxed) };
-    f(w);
-    let _ = w.write_all(b"\n");
+    if f(w).is_ok() {
+        let _ = w.write_all(b"\n");
+    }
+}
+
+/// Flush all per-core write buffers to disk.  Must be called before
+/// `finalize_writers` so that the file-size check sees all written data.
+pub fn flush_writers() {
+    for i in 0..ARR_LEN {
+        let w = unsafe { &mut *writers()[i].load(Ordering::Relaxed) };
+        let _ = w.flush();
+    }
 }
 
 /// Flush and remove empty per-core files after the runtime finishes.
