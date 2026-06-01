@@ -5,6 +5,10 @@
 ///   - Jitter (std-dev of inter-packet delay in µs, per direction)
 ///   - TCP: receive-window min/max/mean (per direction)
 ///   - TCP: retransmission count, sequence-gap count
+///
+/// Note: `orig_jitter_us`, `resp_jitter_us`, and all `tcp_*_win_*` fields
+/// are always 0.0 for `idx == 0`.  Detailed stats begin at `idx == 1`
+/// (i.e., only for connections that have been active for at least 10 seconds).
 use iris_compiler::*;
 use iris_core::protocols::packet::ethernet::Ethernet;
 use iris_core::protocols::packet::ipv4::Ipv4;
@@ -291,9 +295,10 @@ impl FlowWindows {
         let now = first_pkt.ts;
         Self {
             start_ts: now,
-            // Most connections span fewer than 4 windows; pre-allocating
-            // avoids the first few reallocation copies.
-            completed: Vec::with_capacity(4),
+            // Defer allocation: most connections are short-lived and never
+            // cross a window boundary, so Vec::new() avoids allocating until
+            // the first flush at 10 seconds.
+            completed: Vec::new(),
             curr: WindowAcc::default(),
             curr_start: now,
             curr_idx: 0,
@@ -314,6 +319,11 @@ impl FlowWindows {
         self.curr_idx += 1;
         self.curr = WindowAcc::default();
         self.curr_start = now;
+        // Reset per-direction timestamps so each window's jitter is computed
+        // from intra-window IATs only; a cross-boundary gap can be seconds
+        // long and would badly skew the stddev of the new window.
+        self.orig_last_ts = None;
+        self.resp_last_ts = None;
     }
 
     /// Return all completed windows plus the current partial window.
@@ -345,30 +355,41 @@ impl FlowWindows {
             self.curr.orig_pkts += 1;
             self.curr.orig_pkt_bytes += pkt_bytes;
             self.curr.orig_payload_bytes += payload_bytes;
-            if let Some(prev) = self.orig_last_ts {
-                self.curr
-                    .orig_iat_us
-                    .update(now.duration_since(prev).as_micros() as f64);
+            // Only compute jitter for flows that have crossed at least one
+            // 10-second boundary.  orig_last_ts is reset by flush_window so
+            // each window's jitter reflects intra-window IATs only.
+            if self.curr_idx > 0 {
+                if let Some(prev) = self.orig_last_ts {
+                    self.curr
+                        .orig_iat_us
+                        .update(now.duration_since(prev).as_micros() as f64);
+                }
             }
             self.orig_last_ts = Some(now);
         } else {
             self.curr.resp_pkts += 1;
             self.curr.resp_pkt_bytes += pkt_bytes;
             self.curr.resp_payload_bytes += payload_bytes;
-            if let Some(prev) = self.resp_last_ts {
-                self.curr
-                    .resp_iat_us
-                    .update(now.duration_since(prev).as_micros() as f64);
+            if self.curr_idx > 0 {
+                if let Some(prev) = self.resp_last_ts {
+                    self.curr
+                        .resp_iat_us
+                        .update(now.duration_since(prev).as_micros() as f64);
+                }
             }
             self.resp_last_ts = Some(now);
         }
 
         if self.is_tcp {
-            if let Some(win) = tcp_window_size(pdu) {
-                if is_orig {
-                    self.curr.orig_win.update(win as f64);
-                } else {
-                    self.curr.resp_win.update(win as f64);
+            // TCP window-size parsing (L2→L3→L4 re-parse) is skipped for the
+            // first window; only collected once the flow is confirmed long-lived.
+            if self.curr_idx > 0 {
+                if let Some(win) = tcp_window_size(pdu) {
+                    if is_orig {
+                        self.curr.orig_win.update(win as f64);
+                    } else {
+                        self.curr.resp_win.update(win as f64);
+                    }
                 }
             }
 
