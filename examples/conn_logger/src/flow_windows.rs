@@ -17,48 +17,100 @@ use std::time::{Duration, Instant};
 
 pub const WINDOW_SECS: u64 = 10;
 
+// Pre-compute the Duration once so the per-packet comparison is a simple
+// 128-bit integer compare against a constant.
+const WINDOW_DURATION: Duration = Duration::from_secs(WINDOW_SECS);
+
 // ---------------------------------------------------------------------------
-// Welford online variance
+// Welford online variance — min/max variant (TCP window stats)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
-pub struct WelfordStats {
+#[derive(Debug, Clone)]
+struct WelfordStats {
     count: u64,
     mean: f64,
     m2: f64,
-    pub min: f64,
-    pub max: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Default for WelfordStats {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            // Sentinel values so branchless min/max work correctly from the
+            // very first sample without a special-case count==1 check.
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        }
+    }
 }
 
 impl WelfordStats {
-    pub fn update(&mut self, v: f64) {
+    #[inline]
+    fn update(&mut self, v: f64) {
         self.count += 1;
-        if self.count == 1 {
+        // Branchless min/max (compiles to MINSD/MAXSD on x86-64).
+        if v < self.min {
             self.min = v;
+        }
+        if v > self.max {
             self.max = v;
-        } else {
-            if v < self.min {
-                self.min = v;
-            }
-            if v > self.max {
-                self.max = v;
-            }
         }
         let delta = v - self.mean;
         self.mean += delta / self.count as f64;
         self.m2 += delta * (v - self.mean);
     }
 
-    pub fn stddev(&self) -> f64 {
+    #[inline]
+    fn mean(&self) -> f64 {
+        self.mean
+    }
+
+    /// Finite min/max (returns 0.0 when no samples have been observed).
+    #[inline]
+    fn min_or_zero(&self) -> f64 {
+        if self.count == 0 { 0.0 } else { self.min }
+    }
+
+    #[inline]
+    fn max_or_zero(&self) -> f64 {
+        if self.count == 0 { 0.0 } else { self.max }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Welford online variance — no min/max (IAT / jitter)
+// ---------------------------------------------------------------------------
+
+/// Lighter variant used for inter-arrival time: only stddev is needed, so
+/// min and max fields are omitted.  16 bytes smaller per instance than
+/// WelfordStats, and one fewer branch per packet.
+#[derive(Debug, Clone, Default)]
+struct IatStats {
+    count: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl IatStats {
+    #[inline]
+    fn update(&mut self, v: f64) {
+        self.count += 1;
+        let delta = v - self.mean;
+        self.mean += delta / self.count as f64;
+        self.m2 += delta * (v - self.mean);
+    }
+
+    #[inline]
+    fn stddev(&self) -> f64 {
         if self.count < 2 {
             0.0
         } else {
             (self.m2 / (self.count - 1) as f64).sqrt()
         }
-    }
-
-    pub fn mean(&self) -> f64 {
-        self.mean
     }
 }
 
@@ -73,14 +125,15 @@ fn seq_lt(lhs: u32, rhs: u32) -> bool {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct TcpDirState {
+struct TcpDirState {
     hwm: Option<u32>,
     next_exp: Option<u32>,
 }
 
 impl TcpDirState {
     /// Returns `(is_retransmission, is_new_gap)`.
-    pub fn observe(&mut self, seq_no: u32, length: u32, flags: u8) -> (bool, bool) {
+    #[inline]
+    fn observe(&mut self, seq_no: u32, length: u32, flags: u8) -> (bool, bool) {
         use iris_core::protocols::packet::tcp::SYN;
 
         if length == 0 && (flags & SYN == 0) {
@@ -119,24 +172,25 @@ impl TcpDirState {
 // Per-window accumulator and serializable record
 // ---------------------------------------------------------------------------
 
+/// 192 bytes — fits in exactly 3 cache lines.
 #[derive(Debug, Clone, Default)]
-pub struct WindowAcc {
-    pub orig_pkts: u64,
-    pub resp_pkts: u64,
-    pub orig_pkt_bytes: u64,
-    pub resp_pkt_bytes: u64,
-    pub orig_payload_bytes: u64,
-    pub resp_payload_bytes: u64,
-    orig_iat_us: WelfordStats,
-    resp_iat_us: WelfordStats,
+struct WindowAcc {
+    orig_pkts: u64,
+    resp_pkts: u64,
+    orig_pkt_bytes: u64,
+    resp_pkt_bytes: u64,
+    orig_payload_bytes: u64,
+    resp_payload_bytes: u64,
+    orig_iat_us: IatStats,
+    resp_iat_us: IatStats,
     orig_win: WelfordStats,
     resp_win: WelfordStats,
-    pub tcp_retransmissions: u64,
-    pub tcp_seq_gaps: u64,
+    tcp_retransmissions: u64,
+    tcp_seq_gaps: u64,
 }
 
 impl WindowAcc {
-    pub fn finalize(&self, idx: u32, start_ms: u64, end_ms: u64) -> WindowRecord {
+    fn finalize(&self, idx: u32, start_ms: u64, end_ms: u64) -> WindowRecord {
         WindowRecord {
             idx,
             start_ms,
@@ -149,11 +203,11 @@ impl WindowAcc {
             resp_payload_bytes: self.resp_payload_bytes,
             orig_jitter_us: self.orig_iat_us.stddev(),
             resp_jitter_us: self.resp_iat_us.stddev(),
-            tcp_orig_win_min: self.orig_win.min,
-            tcp_orig_win_max: self.orig_win.max,
+            tcp_orig_win_min: self.orig_win.min_or_zero(),
+            tcp_orig_win_max: self.orig_win.max_or_zero(),
             tcp_orig_win_mean: self.orig_win.mean(),
-            tcp_resp_win_min: self.resp_win.min,
-            tcp_resp_win_max: self.resp_win.max,
+            tcp_resp_win_min: self.resp_win.min_or_zero(),
+            tcp_resp_win_max: self.resp_win.max_or_zero(),
             tcp_resp_win_mean: self.resp_win.mean(),
             tcp_retransmissions: self.tcp_retransmissions,
             tcp_seq_gaps: self.tcp_seq_gaps,
@@ -193,10 +247,14 @@ pub struct WindowRecord {
 
 fn tcp_window_size(pdu: &L4Pdu) -> Option<u16> {
     let mbuf: &Mbuf = pdu.mbuf_ref();
+    // Use the already-known IP version from the connection context to avoid
+    // the failed IPv4 parse attempt on every IPv6 packet.
     if let Ok(eth) = mbuf.parse_to::<Ethernet>() {
-        if let Ok(ip4) = eth.parse_to::<Ipv4>() {
-            if let Ok(tcp) = ip4.parse_to::<Tcp>() {
-                return Some(tcp.window());
+        if pdu.ctxt.src.is_ipv4() {
+            if let Ok(ip4) = eth.parse_to::<Ipv4>() {
+                if let Ok(tcp) = ip4.parse_to::<Tcp>() {
+                    return Some(tcp.window());
+                }
             }
         } else if let Ok(ip6) = eth.parse_to::<Ipv6>() {
             if let Ok(tcp) = ip6.parse_to::<Tcp>() {
@@ -228,7 +286,9 @@ impl FlowWindows {
         let now = first_pkt.ts;
         Self {
             start_ts: now,
-            completed: Vec::new(),
+            // Most connections span fewer than 4 windows; pre-allocating
+            // avoids the first few reallocation copies.
+            completed: Vec::with_capacity(4),
             curr: WindowAcc::default(),
             curr_start: now,
             curr_idx: 0,
@@ -265,7 +325,7 @@ impl FlowWindows {
     pub fn update(&mut self, pdu: &L4Pdu) {
         let now = pdu.ts;
 
-        if now.duration_since(self.curr_start) >= Duration::from_secs(WINDOW_SECS) {
+        if now.duration_since(self.curr_start) >= WINDOW_DURATION {
             self.flush_window(now);
         }
 

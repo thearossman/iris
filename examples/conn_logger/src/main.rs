@@ -172,9 +172,9 @@ impl ConnLogger {
             windows: windows.all_windows(Instant::now()),
         };
 
-        if let Ok(line) = serde_json::to_string(&record) {
-            writer::write_json(&line, core);
-        }
+        writer::with_writer(core, |w| {
+            let _ = serde_json::to_writer(w, &record);
+        });
 
         false
     }
@@ -226,9 +226,9 @@ fn log_tls(tls: &TlsHandshake, ft: &FiveTuple, core: &CoreId) {
         five_tuple: anon_ft(ft),
         sni: sni.to_owned(),
     };
-    if let Ok(line) = serde_json::to_string(&record) {
-        writer::write_json(&line, core);
-    }
+    writer::with_writer(core, |w| {
+        let _ = serde_json::to_writer(w, &record);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -254,9 +254,9 @@ fn log_quic(quic: &QuicStream, ft: &FiveTuple, core: &CoreId) {
         five_tuple: anon_ft(ft),
         sni: sni.to_owned(),
     };
-    if let Ok(line) = serde_json::to_string(&record) {
-        writer::write_json(&line, core);
-    }
+    writer::with_writer(core, |w| {
+        let _ = serde_json::to_writer(w, &record);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -313,9 +313,9 @@ fn log_dns(dns: &DnsTransaction, ft: &FiveTuple, core: &CoreId) {
         rcode,
         answers,
     };
-    if let Ok(line) = serde_json::to_string(&record) {
-        writer::write_json(&line, core);
-    }
+    writer::with_writer(core, |w| {
+        let _ = serde_json::to_writer(w, &record);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -348,9 +348,9 @@ fn log_http(http: &HttpTransaction, ft: &FiveTuple, core: &CoreId) {
         uri,
         status: http.status_code(),
     };
-    if let Ok(line) = serde_json::to_string(&record) {
-        writer::write_json(&line, core);
-    }
+    writer::with_writer(core, |w| {
+        let _ = serde_json::to_writer(w, &record);
+    });
 }
 
 // ---------------------------------------------------------------------------
