@@ -250,7 +250,10 @@ impl<'a> StateTxData<'a> {
             Layer::L7(layer) => match state {
                 StateTransition::L7OnDisc => Self::L7OnDisc(layer.get_protocol()),
                 StateTransition::L7EndHdrs => {
-                    Self::L7EndHdrs(layer.sessions.last().expect("L7EndHdrs without session"))
+                    match layer.sessions.last() {
+                        Some(session) => Self::L7EndHdrs(session),
+                        None => Self::Null, // TODO
+                    }
                 }
                 _ => Self::Null,
             },
