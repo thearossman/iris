@@ -313,4 +313,5 @@ fn main() {
 
     writer::flush_writers();
     writer::finalize_writers();
+    writer::combine_writers();
 }

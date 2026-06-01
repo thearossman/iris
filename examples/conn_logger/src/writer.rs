@@ -5,6 +5,8 @@ use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 
+pub const COMBINED_FILE: &str = "conn_log.jsonl";
+
 /// One more than the maximum CoreId.raw() value.  Must match the number of
 /// RX cores configured in the runtime config file.  The +1 accounts for the
 /// main core that never processes packets.
@@ -82,6 +84,27 @@ pub fn finalize_writers() {
             if m.len() == 0 {
                 let _ = std::fs::remove_file(p);
             }
+        }
+    }
+}
+
+/// Concatenate all non-empty per-core files into `COMBINED_FILE` and remove
+/// the per-core files.  Must be called after `finalize_writers` (which has
+/// already pruned the empty ones).  Uses `io::copy` to stream each file
+/// directly into the output buffer without loading records into memory.
+pub fn combine_writers() {
+    use std::io::copy;
+
+    let out_file = File::create(COMBINED_FILE).expect("create combined output file");
+    let mut out = BufWriter::with_capacity(BUF_CAPACITY, out_file);
+
+    for core_id in 0..ARR_LEN {
+        let path = format!("{}{}.jsonl", OUTFILE_PREFIX, core_id);
+        let p = std::path::Path::new(&path);
+        if let Ok(mut f) = File::open(p) {
+            copy(&mut f, &mut out).expect("copy per-core file to combined output");
+            drop(f);
+            let _ = std::fs::remove_file(p);
         }
     }
 }
