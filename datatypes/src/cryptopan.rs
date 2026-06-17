@@ -1,3 +1,6 @@
+use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::Aes128;
+use iris_core::FiveTuple;
 /// Helper for Prefix-preserving IP address anonymization using CryptoPAN.
 ///
 /// Because this requires a global CryptoPAN variable, we don't expose this
@@ -24,11 +27,7 @@
 ///      .expect("CryptoPAN not initialized")
 ///      .anonymize_fivetuple(ft)
 /// }
-
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use aes::cipher::{BlockEncrypt, KeyInit};
-use aes::Aes128;
-use iris_core::FiveTuple;
 
 pub struct CryptoPAN {
     cipher: Aes128,
@@ -39,10 +38,8 @@ unsafe impl Send for CryptoPAN {}
 unsafe impl Sync for CryptoPAN {}
 
 impl CryptoPAN {
-
     pub fn new(key: &[u8; 32]) -> Self {
-        let cipher =
-            Aes128::new_from_slice(&key[..16]).expect("16-byte AES key is always valid");
+        let cipher = Aes128::new_from_slice(&key[..16]).expect("16-byte AES key is always valid");
 
         let mut pad_block = aes::Block::clone_from_slice(&key[16..]);
         cipher.encrypt_block(&mut pad_block);
@@ -73,17 +70,9 @@ impl CryptoPAN {
 
     /// 128-bit AES input for bit position `i` (0 = MSB).
     fn make_input(&self, result: u128, i: u32) -> [u8; 16] {
-        let prefix_msb: u128 = if i == 0 {
-            0
-        } else {
-            result << (128 - i)
-        };
+        let prefix_msb: u128 = if i == 0 { 0 } else { result << (128 - i) };
         // Mask keeping only bits i+1 … 127 of pad (bit i and above are zeroed).
-        let pad_mask: u128 = if i + 1 < 128 {
-            u128::MAX >> (i + 1)
-        } else {
-            0
-        };
+        let pad_mask: u128 = if i + 1 < 128 { u128::MAX >> (i + 1) } else { 0 };
         (prefix_msb | (self.pad & pad_mask)).to_be_bytes()
     }
 
