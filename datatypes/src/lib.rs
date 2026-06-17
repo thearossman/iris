@@ -23,6 +23,9 @@ pub use quic_stream::QuicStream;
 pub mod ssh_handshake;
 pub use ssh_handshake::SshHandshake;
 
+pub mod cryptopan;
+pub use cryptopan::CryptoPAN;
+
 pub mod static_type;
 pub use static_type::*;
 
