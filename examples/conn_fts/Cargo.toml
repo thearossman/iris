@@ -1,0 +1,16 @@
+[package]
+name = "conn_fts"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+env_logger = "0.8.4"
+iris-core = { path = "../../core" }
+iris-compiler = { path = "../../compiler" }
+iris-datatypes = { path = "../../datatypes" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "3.2.23", features = ["derive"] }
+aes = "0.8"
+array-init = "2.0"
+dns-parser = { git = "https://github.com/stanford-esrg/dns-parser" }
