@@ -1,0 +1,12 @@
+[package]
+name = "tls"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "3.2.23", features = ["derive"] }
+env_logger = "0.8.4"
+iris-core = { path = "../../core", features = ["prometheus"] }
+iris-compiler = { path = "../../compiler" }
+iris-datatypes = { path = "../../datatypes" }
+prometheus-client = "0.22.3"

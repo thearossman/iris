@@ -1,0 +1,129 @@
+use iris_compiler::*;
+use iris_core::protocols::stream::SessionProto;
+use iris_core::{L4Pdu, Mbuf};
+use iris_core::config::load_config;
+use iris_core::{CoreId, Runtime};
+use iris_core::subscription::StreamingCallback;
+
+mod writer;
+
+use clap::Parser;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Capture 1 connection out of every `SAMPLE_N`. 1 = capture everything.
+// Set once from `--sample` before the runtime starts, then read per flow.
+static SAMPLE_N: AtomicU64 = AtomicU64::new(1);
+
+// Number of leading packets to capture per sampled connection (the TLS
+// handshake and a little payload), after which we stop tracking the flow.
+const MAX_PKTS: u32 = 13;
+
+// Decide once per connection whether to capture it, by hashing its 5-tuple.
+// Deterministic, so the choice is stable for the life of the flow.
+fn should_sample(first_pkt: &L4Pdu) -> bool {
+    let n = SAMPLE_N.load(Ordering::Relaxed);
+    if n <= 1 {
+        return true;
+    }
+    let mut hasher = DefaultHasher::new();
+    first_pkt.ctxt.src.hash(&mut hasher);
+    first_pkt.ctxt.dst.hash(&mut hasher);
+    hasher.finish() % n == 0
+}
+
+#[derive(Debug)]
+#[callback("tcp.port = 443,parsers=tls")]
+struct TlsCbStreaming {
+    // Whether this connection was selected by the sampler.
+    sample: bool,
+    // Packets buffered for this connection, awaiting a flush trigger.
+    mbufs: Vec<Mbuf>,
+    // Set by `on_proto` when SessionProto::Null is discovered; tells `update`
+    // to flush the buffered packets. `on_proto` runs before `update` for the
+    // same PDU, so the flag is seen on that packet.
+    write_out: bool,
+}
+
+impl StreamingCallback for TlsCbStreaming {
+    fn new(first_pkt: &L4Pdu) -> Self {
+        Self {
+            sample: should_sample(first_pkt),
+            mbufs: Vec::new(),
+            write_out: false,
+        }
+    }
+    fn clear(&mut self) {
+        self.mbufs.clear();
+        self.write_out = false;
+    }
+}
+
+impl TlsCbStreaming {
+    #[callback_fn("TlsCbStreaming,level=InL4Stream")]
+    fn update(&mut self, pdu: &L4Pdu, core: &CoreId) -> bool {
+        // Not sampling this flow: stop tracking it immediately so no reassembly
+        // work is spent on it.
+        if !self.sample {
+            return false;
+        }
+        self.mbufs.push(Mbuf::new_ref(pdu.mbuf_ref()));
+        // Only write to disk once we've buffered the leading packets, or once
+        // protocol discovery has resolved to Null (signaled via `write_out`).
+        if self.mbufs.len() >= MAX_PKTS as usize || self.write_out {
+            writer::write_mbufs(&self.mbufs, core);
+            self.mbufs.clear();
+            return false;
+        }
+        true
+    }
+
+    #[callback_fn("TlsCbStreaming,level=L7OnDisc")]
+    fn on_proto(&mut self, proto: &SessionProto) -> bool {
+        match proto {
+            SessionProto::Null => {
+                // Flush the buffered packets on the upcoming `update` call.
+                self.write_out = true;
+                return true;
+            }
+            _ => {
+                return false;
+            }
+        }
+    }
+}
+
+
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[clap(
+        short,
+        long,
+        parse(from_os_str),
+        value_name = "FILE",
+        default_value = "./configs/offline.toml"
+    )]
+    config: PathBuf,
+    /// Capture 1 out of every N connections (1 = capture all). Raise this to
+    /// shed load and reduce drops under high traffic.
+    #[clap(short, long, value_name = "N", default_value = "1")]
+    sample: u64,
+}
+
+#[input_files("$IRIS_HOME/datatypes/data.txt")]
+#[iris_end_macros]
+fn main() {
+    env_logger::init();
+    writer::init_files();
+
+    let args = Args::parse();
+    SAMPLE_N.store(args.sample.max(1), Ordering::Relaxed);
+    let config = load_config(&args.config);
+    let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config, filter).unwrap();
+    runtime.run();
+
+    writer::flush_files();
+}
