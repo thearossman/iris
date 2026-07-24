@@ -108,10 +108,14 @@ where
     ) {
         // Pass to next layer(s) if applicable for parsing
         if self.layers[0].needs_stream() {
+            tsc_start!(t_parse);
             let tx = self.layers[0].process_stream(pdu, registry);
+            tsc_record!(subscription.timers, "applayer_parse", t_parse);
             self.exec_state_tx(tx, subscription);
             if self.layers[0].needs_process(tx, pdu) {
+                tsc_start!(t_parse2);
                 let tx = self.layers[0].process_stream(pdu, registry);
+                tsc_record!(subscription.timers, "applayer_parse", t_parse2);
                 self.exec_state_tx(tx, subscription);
             }
         }

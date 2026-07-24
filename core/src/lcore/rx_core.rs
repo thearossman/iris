@@ -130,16 +130,22 @@ where
                     TOTAL_PKT.inc();
                     TOTAL_BYTE.inc_by(mbuf.data_len() as u64);
 
+                    tsc_start!(t_filter);
                     let cont = self.subscription.filter_packet(&mbuf, &self.id);
+                    tsc_record!(self.subscription.timers, "packet_filter", t_filter);
                     if cont {
+                        tsc_start!(t_process);
                         self.subscription.process_packet(mbuf, &mut conn_table);
+                        tsc_record!(self.subscription.timers, "process", t_process);
                     } else {
                         IGNORED_BY_PACKET_FILTER_PKT.inc();
                         IGNORED_BY_PACKET_FILTER_BYTE.inc_by(mbuf.data_len() as u64);
                     }
                 }
             }
+            tsc_start!(t_inactive);
             conn_table.check_inactive(&self.subscription, now);
+            tsc_record!(self.subscription.timers, "remove_inactive", t_inactive);
         }
 
         // // Deliver remaining data in table from unfinished connections

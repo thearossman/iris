@@ -108,7 +108,9 @@ where
                 let pdu = L4Pdu::new(mbuf, ctxt, dir, conn.last_seen_ts);
 
                 // Consume PDU for update, reassembly, and/or parsing
+                tsc_start!(t_conn_track);
                 conn.update(pdu, subscription, &self.registry);
+                tsc_record!(subscription.timers, "conn_track", t_conn_track);
 
                 // Delete stale data for connections no longer matching
                 if conn.remove_from_table() {

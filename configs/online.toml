@@ -36,10 +36,40 @@ tcp_inactivity_timeout = 300000
 tcp_reassembly_timeout = 10000
 tcp_establish_timeout = 5000
 
-[online.prometheus]
-port = 9898
+# Prometheus disabled. Debugging uses the console display + CSV log below instead.
+# [online.prometheus]
+# port = 9898
 
 [online.monitor.display]
 throughput = true
 mempool_usage = true
-port_stats = [ "rx_good_packets", "rx_good_bytes", "rx_phy_packets", "rx_phy_bytes", "rx_mbuf_allocation_errors", "rx_phy_discard_packets", "rx_missed_errors",]
+# Concise console view: the counters that distinguish *why* packets are lost.
+#   rx_missed_errors        -> software loss (rings not drained fast enough) -- the symptom
+#   rx_out_of_buffer        -> no free mbufs when a packet arrived (mempool starvation)
+#   rx_mbuf_allocation_errors -> DPDK-side nombuf equivalent (allocation failed)
+#   rx_phy_discard_packets  -> NIC/bus congestion (loss before software, not our fault)
+port_stats = [
+    "rx_good_packets",
+    "rx_phy_packets",
+    "rx_missed_errors",
+    "rx_out_of_buffer",
+    "rx_mbuf_allocation_errors",
+    "rx_phy_discard_packets",
+]
+
+# CSV log for offline analysis. The "rx_q" substring captures every per-queue
+# counter (rx_q0_packets, rx_q0_bytes, ...). Since each RX queue is polled by a
+# dedicated core, comparing rx_q<n>_packets across queues shows whether load is
+# evenly distributed (H2). One CSV per port is written under `directory`.
+[online.monitor.log]
+directory = "./log"
+interval = 1000
+port_stats = [
+    "rx_q",
+    "rx_missed_errors",
+    "rx_out_of_buffer",
+    "rx_mbuf_allocation_errors",
+    "rx_phy_discard_packets",
+    "rx_good_packets",
+    "rx_phy_packets",
+]

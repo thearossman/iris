@@ -16,7 +16,6 @@ pub use filter::StreamingFilter;
 pub mod callback;
 pub use callback::StreamingCallback;
 
-#[cfg(feature = "timing")]
 use crate::timing::timer::Timers;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,7 +56,6 @@ where
     packet_filter: PacketFilterFn,
     state_tx_filter: StateTxFn<S::Tracked>,
     update_fn: UpdateFn<S::Tracked>,
-    #[cfg(feature = "timing")]
     pub(crate) timers: Timers,
 }
 
@@ -70,7 +68,6 @@ where
             packet_filter: factory.packet_filter,
             state_tx_filter: factory.state_tx,
             update_fn: factory.update_fn,
-            #[cfg(feature = "timing")]
             timers: Timers::new(),
         }
     }

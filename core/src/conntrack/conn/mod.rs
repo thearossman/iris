@@ -135,7 +135,9 @@ where
         // Case 2: reassembly/parsing needed
         match &mut self.l4conn {
             L4Conn::Tcp(tcp_conn) => {
+                tsc_start!(t_reassembly);
                 tcp_conn.reassemble(pdu, &mut self.info, subscription, registry);
+                tsc_record!(subscription.timers, "reassembly", t_reassembly);
                 // Check if, after actions update, the framework/subscriptions
                 // no longer require receiving reassembled traffic.
                 if !self.info.needs_reassembly() {

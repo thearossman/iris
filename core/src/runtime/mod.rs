@@ -33,7 +33,6 @@ where
     mempools: BTreeMap<SocketId, Mempool>,
     online: Option<OnlineRuntime<S>>,
     pub(crate) offline: Option<OfflineRuntime<S>>, // Public for testing only
-    #[cfg(feature = "timing")]
     subscription: Arc<Subscription<S>>,
 }
 
@@ -121,7 +120,6 @@ where
             mempools,
             online,
             offline,
-            #[cfg(feature = "timing")]
             subscription,
         })
     }
@@ -139,11 +137,8 @@ where
         } else {
             log::error!("No runtime");
         }
-        #[cfg(feature = "timing")]
-        {
-            self.subscription.timers.display_stats();
-            self.subscription.timers.dump_stats();
-        }
+        self.subscription.timers.display_stats();
+        self.subscription.timers.dump_stats();
         log::info!("Done.");
     }
 }
