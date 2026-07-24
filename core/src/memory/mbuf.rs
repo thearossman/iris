@@ -134,6 +134,16 @@ impl Mbuf {
         }
     }
 
+    /// Issues a non-blocking prefetch of the first cache line of packet data (the L2/L3/L4
+    /// headers) into cache. Call this ahead of `filter_packet`/parsing so that the first touch
+    /// of the payload hits cache instead of stalling on a cold DRAM/PCIe read. Prefetching a
+    /// whole RX burst up front lets the fetches overlap (memory-level parallelism), which is the
+    /// key mitigation when DDIO has evicted packets before the core reads them.
+    #[inline]
+    pub(crate) fn prefetch(&self) {
+        unsafe { crate::dpdk::rte_prefetch0(self.get_data_address(0) as *const std::ffi::c_void) }
+    }
+
     /// Returns the raw pointer from the offset.
     fn get_data_address(&self, offset: usize) -> *const u8 {
         let raw = self.raw();

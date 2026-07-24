@@ -205,6 +205,7 @@ extern "C" {
     fn rte_pktmbuf_trim_(packet: *mut rte_mbuf, len: u16) -> c_int;
     fn rte_lcore_id_() -> u16;
     fn rte_rdtsc_() -> u64;
+    fn rte_prefetch0_(p: *const c_void);
     fn rte_ring_enqueue_(ring: *mut rte_ring, obj: *mut c_void) -> c_int;
     fn rte_ring_sp_enqueue_(ring: *mut rte_ring, obj: *mut c_void) -> c_int;
     fn rte_ring_mp_enqueue_(ring: *mut rte_ring, obj: *mut c_void) -> c_int;
@@ -317,6 +318,20 @@ pub unsafe fn rte_lcore_id() -> u16 {
 #[inline]
 pub unsafe fn rte_rdtsc() -> u64 {
     rte_rdtsc_()
+}
+
+/// Prefetches a cache line containing address `p` into all cache levels (temporal prefetch).
+///
+/// Used to hide memory-access latency by issuing the load ahead of the actual access. This is
+/// a non-blocking hint: it issues the fetch and returns immediately, allowing multiple
+/// outstanding fetches to overlap (memory-level parallelism).
+///
+/// ## Remarks
+/// This is `unsafe` because it calls the DPDK `rte_prefetch0()` function via FFI. `p` need not
+/// point to valid/mapped memory; a prefetch of a bad address is a no-op rather than a fault.
+#[inline]
+pub unsafe fn rte_prefetch0(p: *const c_void) {
+    rte_prefetch0_(p)
 }
 
 /* RTE_RING functions */

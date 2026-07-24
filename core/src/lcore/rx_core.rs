@@ -16,6 +16,12 @@ use std::time::Instant;
 
 use itertools::Itertools;
 
+/// Number of packets to request per `rte_eth_rx_burst` call. A larger burst drains the RX ring
+/// faster (fewer descriptors left for the NIC to overflow) and gives a wider window to prefetch
+/// packet headers, at the cost of a larger per-iteration working set. 64 is a common sweet spot;
+/// tune alongside `nb_rxd` when debugging software loss (`rx_missed_errors`).
+const RX_BURST_SIZE: u16 = 64;
+
 /// A RxCore polls from `rxqueues` and reduces the stream of packets into
 /// a stream of higher-level network events to be processed by the user.
 pub(crate) struct RxCore<S>
@@ -100,9 +106,18 @@ where
 
         while self.is_running.load(Ordering::Relaxed) {
             for rxqueue in self.rxqueues.iter() {
-                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, 32);
+                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, RX_BURST_SIZE);
                 if mbufs.is_empty() {
                     IDLE_CYCLES.inc();
+                }
+
+                // Prefetch every packet's header up front so the first payload touch in
+                // `filter_packet`/parsing hits cache instead of stalling on a cold DRAM/PCIe
+                // read. Issuing the whole burst's prefetches before processing lets the fetches
+                // overlap (memory-level parallelism) -- the key mitigation when a high ingress
+                // rate causes DDIO to evict packets from L3 before the core reads them.
+                for mbuf in mbufs.iter() {
+                    mbuf.prefetch();
                 }
 
                 TOTAL_CYCLES.inc();
@@ -172,7 +187,7 @@ where
 
         while self.is_running.load(Ordering::Relaxed) {
             for rxqueue in self.rxqueues.iter() {
-                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, 32);
+                let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, RX_BURST_SIZE);
                 for mbuf in mbufs.into_iter() {
                     log::debug!("RSS Hash: 0x{:x}", mbuf.rss_hash());
                     log::debug!(

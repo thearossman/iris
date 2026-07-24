@@ -4,6 +4,7 @@
 #include <rte_lcore.h>
 #include <rte_ring.h>
 #include <rte_cycles.h>
+#include <rte_prefetch.h>
 
 void rte_pktmbuf_free_(struct rte_mbuf *packet) {
     rte_pktmbuf_free(packet);
@@ -47,6 +48,10 @@ unsigned rte_lcore_id_(void) {
 
 uint64_t rte_rdtsc_(void) {
     return rte_rdtsc();
+}
+
+void rte_prefetch0_(const void *p) {
+    rte_prefetch0(p);
 }
 
 /* RTE_RING functions */
