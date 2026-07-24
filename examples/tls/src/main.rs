@@ -1,5 +1,4 @@
 use iris_compiler::*;
-use iris_core::protocols::stream::SessionProto;
 use iris_core::{L4Pdu, Mbuf};
 use iris_core::config::load_config;
 use iris_core::{CoreId, Runtime};
@@ -8,6 +7,7 @@ use iris_core::subscription::StreamingCallback;
 mod writer;
 
 use clap::Parser;
+use iris_datatypes::TlsHandshake;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -35,16 +35,11 @@ fn should_sample(first_pkt: &L4Pdu) -> bool {
 }
 
 #[derive(Debug)]
-#[callback("tcp.port = 443,parsers=tls")]
+#[callback("tls")]
 struct TlsCbStreaming {
-    // Whether this connection was selected by the sampler.
     sample: bool,
-    // Packets buffered for this connection, awaiting a flush trigger.
     mbufs: Vec<Mbuf>,
-    // Set by `on_proto` when SessionProto::Null is discovered; tells `update`
-    // to flush the buffered packets. `on_proto` runs before `update` for the
-    // same PDU, so the flag is seen on that packet.
-    write_out: bool,
+    hshk: bool,
 }
 
 impl StreamingCallback for TlsCbStreaming {
@@ -52,46 +47,43 @@ impl StreamingCallback for TlsCbStreaming {
         Self {
             sample: should_sample(first_pkt),
             mbufs: Vec::new(),
-            write_out: false,
+            hshk: false,
         }
     }
     fn clear(&mut self) {
         self.mbufs.clear();
-        self.write_out = false;
     }
 }
 
 impl TlsCbStreaming {
     #[callback_fn("TlsCbStreaming,level=InL4Stream")]
-    fn update(&mut self, pdu: &L4Pdu, core: &CoreId) -> bool {
+    fn update(&mut self, pdu: &L4Pdu) -> bool {
         // Not sampling this flow: stop tracking it immediately so no reassembly
         // work is spent on it.
         if !self.sample {
             return false;
         }
-        self.mbufs.push(Mbuf::new_ref(pdu.mbuf_ref()));
-        // Only write to disk once we've buffered the leading packets, or once
-        // protocol discovery has resolved to Null (signaled via `write_out`).
-        if self.mbufs.len() >= MAX_PKTS as usize || self.write_out {
-            writer::write_mbufs(&self.mbufs, core);
-            self.mbufs.clear();
-            return false;
+        if self.mbufs.len() < MAX_PKTS as usize {
+            self.mbufs.push(Mbuf::new_ref(pdu.mbuf_ref()));
         }
         true
     }
 
-    #[callback_fn("TlsCbStreaming,level=L7OnDisc")]
-    fn on_proto(&mut self, proto: &SessionProto) -> bool {
-        match proto {
-            SessionProto::Null => {
-                // Flush the buffered packets on the upcoming `update` call.
-                self.write_out = true;
-                return true;
-            }
-            _ => {
-                return false;
-            }
+    // Handshake parsed; unsubscribe
+    #[callback_fn("TlsCbStreaming")]
+    fn on_hshk(&mut self, _: &TlsHandshake) -> bool {
+        self.hshk = true;
+        false
+    }
+
+    #[callback_fn("TlsCbStreaming,level=L4Terminated")]
+    fn on_term(&mut self, core: &CoreId) -> bool {
+        assert!(!self.hshk);
+        if self.sample && !self.mbufs.is_empty() {
+            writer::write_mbufs(&self.mbufs, core);
+            self.mbufs.clear();
         }
+        false
     }
 }
 
