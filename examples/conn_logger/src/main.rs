@@ -2,7 +2,9 @@
 ///
 /// For every TCP or UDP connection Iris observes this application records:
 ///
-///   • Anonymized source/destination IPs (CryptoPAN, prefix-preserving AES-128)
+///   • Anonymized source/destination IPs (CryptoPAN, prefix-preserving AES-128;
+///     anonymizes only the trailing --anon-bits-v4 / --anon-bits-v6 bits of
+///     each address, configurable independently per address family)
 ///   • Source/destination ports
 ///   • Start wall-clock timestamp and end timestamp
 ///   • Flow end reason  (FIN | RST | Timeout)
@@ -75,6 +77,18 @@ struct Args {
         default_value = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
     )]
     key: String,
+
+    /// Number of trailing (least-significant) bits of each IPv4 address to
+    /// anonymize; leading bits — and thus the network prefix — are left in
+    /// plaintext. Defaults to 32, which anonymizes entire addresses.
+    #[clap(long, default_value = "32")]
+    anon_bits_v4: u32,
+
+    /// Number of trailing (least-significant) bits of each IPv6 address to
+    /// anonymize; leading bits — and thus the network prefix — are left in
+    /// plaintext. Defaults to 128, which anonymizes entire addresses.
+    #[clap(long, default_value = "128")]
+    anon_bits_v6: u32,
 }
 
 fn parse_hex_key(s: &str) -> [u8; 32] {
@@ -367,7 +381,9 @@ fn main() {
 
     let args = Args::parse();
     let key = parse_hex_key(&args.key);
-    CRYPTOPAN.set(CryptoPAN::new(&key)).expect("CryptoPAN already initialized");
+    CRYPTOPAN
+        .set(CryptoPAN::new(&key, args.anon_bits_v4, args.anon_bits_v6))
+        .expect("CryptoPAN already initialized");
 
     writer::init_writers();
 
