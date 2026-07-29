@@ -27,7 +27,7 @@ use iris_compiler::*;
 use iris_core::subscription::StreamingCallback;
 use iris_core::{config::load_config, CoreId, FiveTuple, L4Pdu, Runtime};
 use iris_core::protocols::packet::tcp::TCP_PROTOCOL;
-use iris_datatypes::{HttpTransaction, QuicStream, TlsHandshake};
+use iris_datatypes::{DnsTransaction, HttpTransaction, QuicStream, TlsHandshake};
 use serde::Serialize;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -217,7 +217,7 @@ struct TlsRecord {
     sni: String,
 }
 
-#[callback("tcp and tls")]
+#[callback("tls")]
 fn log_tls(tls: &TlsHandshake, ft: &FiveTuple, core: &CoreId) {
     let sni = tls.sni();
     if sni.is_empty() {
@@ -257,7 +257,71 @@ fn log_quic(quic: &QuicStream, ft: &FiveTuple, core: &CoreId) {
     writer::with_writer(core, |w| serde_json::to_writer(w, &record));
 }
 
-// Omit DNS
+// ---------------------------------------------------------------------------
+// DNS transactions
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct DnsRecord {
+    #[serde(rename = "type")]
+    record_type: &'static str,
+    five_tuple: AnonFt,
+    query: String,
+    rcode: String,
+    answers: Vec<String>,
+}
+
+#[callback("dns")]
+fn log_dns(dns: &DnsTransaction, ft: &FiveTuple, core: &CoreId) {
+    use dns_parser::ResponseCode;
+    use iris_core::protocols::stream::dns::Data;
+
+    let query = dns.query_domain().to_owned();
+    if query.is_empty() {
+        return;
+    }
+
+    let (rcode, answers) = match &dns.response {
+        None => ("NoResponse".to_owned(), vec![]),
+        Some(resp) => {
+            let rcode = match resp.response_code {
+                ResponseCode::NoError => "NoError".to_owned(),
+                ResponseCode::FormatError => "FormatError".to_owned(),
+                ResponseCode::ServerFailure => "ServerFailure".to_owned(),
+                ResponseCode::NameError => "NameError".to_owned(),
+                ResponseCode::NotImplemented => "NotImplemented".to_owned(),
+                ResponseCode::Refused => "Refused".to_owned(),
+                ResponseCode::Reserved(n) => format!("Reserved({})", n),
+            };
+            let answers = resp
+                .answers
+                .iter()
+                .map(|r| match &r.data {
+                    Data::A(a) => a.0.to_string(),
+                    Data::Aaaa(a) => a.0.to_string(),
+                    Data::Cname(c) => c.clone(),
+                    Data::Ptr(p) => p.clone(),
+                    Data::Ns(n) => n.clone(),
+                    Data::Mx(m) => format!("{} {}", m.preference, m.exchange),
+                    Data::Txt(t) => t.clone(),
+                    Data::Srv(s) => format!("{}:{}", s.target, s.port),
+                    Data::Soa(s) => s.primary_ns.clone(),
+                    Data::Unknown => "unknown".to_owned(),
+                })
+                .collect();
+            (rcode, answers)
+        }
+    };
+
+    let record = DnsRecord {
+        record_type: "dns",
+        five_tuple: anon_ft(ft),
+        query,
+        rcode,
+        answers,
+    };
+    writer::with_writer(core, |w| serde_json::to_writer(w, &record));
+}
 
 // ---------------------------------------------------------------------------
 // HTTP transactions
@@ -274,7 +338,7 @@ struct HttpRecord {
     status: u16,
 }
 
-#[callback("tcp and http")]
+#[callback("http")]
 fn log_http(http: &HttpTransaction, ft: &FiveTuple, core: &CoreId) {
     let host = http.host().to_owned();
     let uri = http.uri().to_owned();
