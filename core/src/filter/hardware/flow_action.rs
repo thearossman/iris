@@ -83,7 +83,6 @@ impl FlowAction {
         self.rss.push(a_rss_conf);
     }
 
-    #[allow(dead_code)]
     pub(super) fn append_drop(&mut self) {
         let mut a_drop: dpdk::rte_flow_action = unsafe { mem::zeroed() };
         a_drop.type_ = dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_DROP;
