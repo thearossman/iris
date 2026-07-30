@@ -22,13 +22,15 @@
 /// (there is no prior intra-checkpoint packet to measure a gap against).
 /// The TCP-only fields are omitted entirely (not serialized as zeros) for
 /// UDP connections, and are otherwise sampled starting from the first packet.
+use crate::checkpoint_dispatch::{CheckpointOutRecord, CHECKPOINT_DISPATCHER};
+
 use iris_compiler::*;
 use iris_core::protocols::packet::ethernet::Ethernet;
 use iris_core::protocols::packet::ipv4::Ipv4;
 use iris_core::protocols::packet::ipv6::Ipv6;
 use iris_core::protocols::packet::tcp::{Tcp, TCP_PROTOCOL};
 use iris_core::protocols::packet::Packet;
-use iris_core::{L4Pdu, Mbuf};
+use iris_core::{CoreId, FiveTuple, L4Pdu, Mbuf};
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
@@ -311,7 +313,10 @@ fn tcp_window_size(pdu: &L4Pdu) -> Option<u16> {
 pub struct FlowWindows {
     /// Timestamp of the first packet (used to compute checkpoint offsets).
     pub start_ts: Instant,
-    completed: Vec<CheckpointRecord>,
+    /// Set once from the first packet's context; used to tag each streamed
+    /// checkpoint with a joinable identity (see `dispatch`), since `FlowWindows`
+    /// itself never sees `ConnLogger`'s already-anonymized fields.
+    ft: FiveTuple,
     curr: WindowAcc,
     curr_start: Instant,
     curr_idx: u32,
@@ -327,10 +332,7 @@ impl FlowWindows {
         let now = first_pkt.ts;
         Self {
             start_ts: now,
-            // Defer allocation: most connections are short-lived and never
-            // reach a checkpoint's byte threshold, so Vec::new() avoids
-            // allocating until the first close.
-            completed: Vec::new(),
+            ft: FiveTuple::from_ctxt(&first_pkt.ctxt),
             curr: WindowAcc::default(),
             curr_start: now,
             curr_idx: 0,
@@ -339,6 +341,20 @@ impl FlowWindows {
             is_tcp: first_pkt.ctxt.proto == TCP_PROTOCOL,
             orig_tcp: TcpDirState::default(),
             resp_tcp: TcpDirState::default(),
+        }
+    }
+
+    /// Dispatch a finalized checkpoint off the RX core instead of serializing
+    /// and writing it inline; see `checkpoint_dispatch`. A no-op if the
+    /// dispatcher hasn't been initialized (e.g. in unit tests).
+    fn dispatch(&self, checkpoint: CheckpointRecord, core: &CoreId) {
+        if let Some(dispatcher) = CHECKPOINT_DISPATCHER.get() {
+            let event = CheckpointOutRecord {
+                record_type: "checkpoint",
+                five_tuple: crate::anon_ft(&self.ft),
+                checkpoint,
+            };
+            let _ = dispatcher.dispatch(event, Some(core));
         }
     }
 
@@ -360,25 +376,44 @@ impl FlowWindows {
 
         let start_ms = self.curr_start.duration_since(self.start_ts).as_millis() as u64;
         let end_ms = now.duration_since(self.start_ts).as_millis() as u64;
-        self.completed
-            .push(self.curr.finalize(self.curr_idx, start_ms, end_ms, self.is_tcp));
+        let record = self
+            .curr
+            .finalize(self.curr_idx, start_ms, end_ms, self.is_tcp);
         self.curr_idx += 1;
         self.curr = WindowAcc::default();
         self.curr_start = now;
+
+        // `datatype_fn`s (unlike `callback_fn`s) only allow a single builtin
+        // parameter — `pdu` here — so `CoreId` can't be requested directly;
+        // derive it the same way the checkpoint workers do (see
+        // checkpoint_dispatch), since we're necessarily running on whichever
+        // RX core owns this connection.
+        let core = CoreId(unsafe { iris_core::rte_lcore_id() } as u32);
+        self.dispatch(record, &core);
     }
 
-    /// Return all completed checkpoints plus the current partial checkpoint.
-    /// Call at connection termination with `end_ts = Instant::now()`.
-    pub fn all_windows(&self, end_ts: Instant) -> Vec<CheckpointRecord> {
-        let mut all = self.completed.clone();
-        // Skip an empty trailing checkpoint, unless it would be the
-        // connection's only record.
-        if !self.curr.is_empty() || self.completed.is_empty() {
-            let start_ms = self.curr_start.duration_since(self.start_ts).as_millis() as u64;
-            let end_ms = end_ts.duration_since(self.start_ts).as_millis() as u64;
-            all.push(self.curr.finalize(self.curr_idx, start_ms, end_ms, self.is_tcp));
+    /// Whether the still-open partial checkpoint has anything worth
+    /// reporting. False only when it's both empty and at least one checkpoint
+    /// has already been dispatched for this connection — an empty checkpoint
+    /// immediately following a real one carries no information. A connection
+    /// that never closed any checkpoint always reports its (possibly empty)
+    /// sole one, so every connection gets at least one record.
+    fn should_emit_final(&self) -> bool {
+        !(self.curr.is_empty() && self.curr_idx > 0)
+    }
+
+    /// Dispatch the final, still-open partial checkpoint. Call at connection
+    /// termination with `end_ts = Instant::now()`.
+    pub fn flush_final(&self, end_ts: Instant, core: &CoreId) {
+        if !self.should_emit_final() {
+            return;
         }
-        all
+        let start_ms = self.curr_start.duration_since(self.start_ts).as_millis() as u64;
+        let end_ms = end_ts.duration_since(self.start_ts).as_millis() as u64;
+        let record = self
+            .curr
+            .finalize(self.curr_idx, start_ms, end_ms, self.is_tcp);
+        self.dispatch(record, core);
     }
 
     #[datatype_fn("FlowWindows,level=InL4Conn")]
@@ -458,11 +493,21 @@ mod tests {
 
     /// Build a `FlowWindows` directly (bypassing `new`/`update`, which
     /// require a live `L4Pdu`/mbuf) so checkpoint-closing logic can be
-    /// exercised with synthetic timestamps.
+    /// exercised with synthetic timestamps. `close_checkpoint`/`flush_final`
+    /// dispatch through `CHECKPOINT_DISPATCHER`, which is never initialized in
+    /// unit tests, so dispatch is a harmless no-op here — these tests only
+    /// check `FlowWindows`'s own bookkeeping (`curr`/`curr_idx`/`curr_start`).
+    /// Record-content behavior (TCP-stats inclusion, JSON shape) is tested
+    /// directly against `WindowAcc::finalize` below instead, since that's
+    /// unaffected by the dispatch change and doesn't need this scaffolding.
     fn empty_flow(start: Instant) -> FlowWindows {
         FlowWindows {
             start_ts: start,
-            completed: Vec::new(),
+            ft: FiveTuple {
+                orig: "10.0.0.1:1234".parse().unwrap(),
+                resp: "10.0.0.2:80".parse().unwrap(),
+                proto: TCP_PROTOCOL,
+            },
             curr: WindowAcc::default(),
             curr_start: start,
             curr_idx: 0,
@@ -483,9 +528,6 @@ mod tests {
 
         fw.close_checkpoint(start + Duration::from_millis(1));
 
-        assert_eq!(fw.completed.len(), 1);
-        assert_eq!(fw.completed[0].orig_pkts, 5);
-        assert_eq!(fw.completed[0].orig_pkt_bytes, CHECKPOINT_BYTES);
         assert_eq!(fw.curr_idx, 1);
         assert_eq!(fw.curr_start, start + Duration::from_millis(1));
         // curr resets to empty for the next checkpoint.
@@ -503,13 +545,22 @@ mod tests {
         let closed_at = start + IDLE_CHECKPOINT_CAP;
         fw.close_checkpoint(closed_at);
 
-        assert_eq!(fw.completed.len(), 1);
-        assert_eq!(fw.completed[0].orig_pkt_bytes, 64);
-        assert_eq!(fw.completed[0].end_ms, IDLE_CHECKPOINT_CAP.as_millis() as u64);
+        assert_eq!(fw.curr_idx, 1);
+        assert_eq!(fw.curr_start, closed_at);
+        assert!(fw.curr.is_empty());
     }
 
     #[test]
-    fn all_windows_omits_empty_trailing_window_when_data_exists() {
+    fn should_emit_final_is_true_when_nothing_closed_yet() {
+        let start = Instant::now();
+        let fw = empty_flow(start);
+        // No packets were ever recorded and nothing has been closed yet:
+        // every connection must get at least one record.
+        assert!(fw.should_emit_final());
+    }
+
+    #[test]
+    fn should_emit_final_is_false_for_empty_trailing_checkpoint_after_a_real_one() {
         let start = Instant::now();
         let mut fw = empty_flow(start);
         fw.curr.orig_pkts = 5;
@@ -518,57 +569,57 @@ mod tests {
         // curr is now empty (freshly reset); connection goes idle and terminates.
         assert!(fw.curr.is_empty());
 
-        let all = fw.all_windows(start + Duration::from_secs(3));
-        assert_eq!(all.len(), 1, "trailing empty checkpoint should be dropped");
+        assert!(
+            !fw.should_emit_final(),
+            "trailing empty checkpoint should be dropped"
+        );
     }
 
     #[test]
-    fn all_windows_keeps_sole_window_even_if_empty() {
-        let start = Instant::now();
-        let fw = empty_flow(start);
-        // No packets were ever recorded and nothing has been closed yet.
-        let all = fw.all_windows(start);
-        assert_eq!(all.len(), 1, "must always emit at least one record");
-    }
-
-    #[test]
-    fn udp_windows_omit_tcp_stats() {
+    fn should_emit_final_is_true_when_curr_has_data() {
         let start = Instant::now();
         let mut fw = empty_flow(start);
-        fw.is_tcp = false;
         fw.curr.orig_pkts = 5;
         fw.curr.orig_pkt_bytes = CHECKPOINT_BYTES;
-
         fw.close_checkpoint(start + Duration::from_secs(1));
+        fw.curr.orig_pkts = 1;
 
-        assert!(fw.completed[0].tcp.is_none());
+        assert!(fw.should_emit_final());
     }
 
     #[test]
-    fn tcp_windows_include_tcp_stats() {
-        let start = Instant::now();
-        let mut fw = empty_flow(start);
-        fw.is_tcp = true;
-        fw.curr.orig_pkts = 5;
-        fw.curr.orig_pkt_bytes = CHECKPOINT_BYTES;
-        fw.curr.orig_win.update(4096.0);
+    fn udp_finalize_omits_tcp_stats() {
+        let mut acc = WindowAcc::default();
+        acc.orig_pkts = 5;
 
-        fw.close_checkpoint(start + Duration::from_secs(1));
+        let record = acc.finalize(0, 0, 1000, false);
 
-        let tcp = fw.completed[0].tcp.as_ref().expect("TCP checkpoint must include tcp stats");
+        assert!(record.tcp.is_none());
+    }
+
+    #[test]
+    fn tcp_finalize_includes_tcp_stats() {
+        let mut acc = WindowAcc::default();
+        acc.orig_pkts = 5;
+        acc.orig_win.update(4096.0);
+
+        let record = acc.finalize(0, 0, 1000, true);
+
+        let tcp = record
+            .tcp
+            .as_ref()
+            .expect("TCP checkpoint must include tcp stats");
         assert_eq!(tcp.tcp_orig_win_max, 4096.0);
     }
 
     #[test]
-    fn udp_window_json_has_no_tcp_keys() {
-        let start = Instant::now();
-        let mut fw = empty_flow(start);
-        fw.is_tcp = false;
-        fw.curr.orig_pkts = 5;
-        fw.curr.orig_pkt_bytes = CHECKPOINT_BYTES;
-        fw.close_checkpoint(start + Duration::from_secs(1));
+    fn udp_finalize_json_has_no_tcp_keys() {
+        let mut acc = WindowAcc::default();
+        acc.orig_pkts = 5;
 
-        let json = serde_json::to_string(&fw.completed[0]).unwrap();
+        let record = acc.finalize(0, 0, 1000, false);
+
+        let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("tcp_orig_win"), "UDP checkpoint JSON: {json}");
         assert!(!json.contains("tcp_retransmissions"), "UDP checkpoint JSON: {json}");
     }

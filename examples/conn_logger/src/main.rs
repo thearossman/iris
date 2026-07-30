@@ -26,6 +26,7 @@
 /// Output: per-core JSONL files named conn_log_<N>.jsonl
 use clap::Parser;
 use iris_compiler::*;
+use iris_core::multicore::DedicatedWorkerThreadSpawner;
 use iris_core::subscription::StreamingCallback;
 use iris_core::{config::load_config, CoreId, FiveTuple, L4Pdu, Runtime};
 use iris_core::protocols::packet::tcp::TCP_PROTOCOL;
@@ -36,13 +37,15 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+mod checkpoint_dispatch;
 mod cryptopan;
 mod flow_windows;
 mod tcp_state;
 mod writer;
 
+use checkpoint_dispatch::CheckpointOutRecord;
 use cryptopan::CryptoPAN;
-use flow_windows::{CheckpointRecord, FlowWindows};
+use flow_windows::FlowWindows;
 use tcp_state::TcpFlowState;
 
 // ---------------------------------------------------------------------------
@@ -89,6 +92,24 @@ struct Args {
     /// plaintext. Defaults to 128, which anonymizes entire addresses.
     #[clap(long, default_value = "128")]
     anon_bits_v6: u32,
+
+    /// Cores to run dedicated checkpoint-serialization/write workers on. Must
+    /// not overlap with any RX/sink core in the runtime config, and must be
+    /// below writer.rs's ARR_LEN — see checkpoint_dispatch. Defaults assume a
+    /// config using cores up to 48 (two 24-core NICs); override for other
+    /// topologies.
+    #[clap(long, value_delimiter = ',', default_value = "49,50")]
+    checkpoint_worker_cores: Vec<u32>,
+
+    /// Bounded channel capacity (per RX core) for streaming checkpoints to
+    /// the worker pool. Checkpoints are dropped (see dispatcher stats) if
+    /// workers can't keep up and this fills.
+    #[clap(long, default_value = "32768")]
+    checkpoint_channel_size: usize,
+
+    /// Number of checkpoint events a worker pulls off its channel per batch.
+    #[clap(long, default_value = "16")]
+    checkpoint_batch_size: usize,
 }
 
 fn parse_hex_key(s: &str) -> [u8; 32] {
@@ -130,7 +151,6 @@ struct ConnLogRecord {
     end_reason: &'static str,
     /// Non-SYN/ACK TCP flags observed (URG, PSH, RST, FIN seen outside handshake).
     tcp_flags: Vec<&'static str>,
-    windows: Vec<CheckpointRecord>,
 }
 
 // Filter out CAPWAP traffic
@@ -169,11 +189,16 @@ impl ConnLogger {
         tcp: &TcpFlowState,
         core: &CoreId,
     ) -> bool {
-        // Capture the monotonic instant first so that all_windows and the
+        // Capture the monotonic instant first so that flush_final and the
         // wall-clock end_ms reflect the same point in time.
         let end_ts = Instant::now();
         let end_wall_ms = now_unix_ms();
         let duration_ms = end_wall_ms.saturating_sub(self.start_wall_ms);
+
+        // Dispatches the last partial checkpoint (if any) off the RX core,
+        // rather than bundling this connection's whole checkpoint history
+        // into one write here — see checkpoint_dispatch.
+        windows.flush_final(end_ts, core);
 
         let record = ConnLogRecord {
             record_type: "conn",
@@ -187,7 +212,6 @@ impl ConnLogger {
             duration_ms,
             end_reason: tcp.end_reason(),
             tcp_flags: tcp.flag_names(),
-            windows: windows.all_windows(end_ts),
         };
 
         writer::with_writer(core, |w| serde_json::to_writer(w, &record));
@@ -201,7 +225,7 @@ impl ConnLogger {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
-struct AnonFt {
+pub(crate) struct AnonFt {
     orig_ip: String,
     orig_port: u16,
     resp_ip: String,
@@ -209,7 +233,7 @@ struct AnonFt {
     proto: &'static str,
 }
 
-fn anon_ft(ft: &FiveTuple) -> AnonFt {
+pub(crate) fn anon_ft(ft: &FiveTuple) -> AnonFt {
     AnonFt {
         orig_ip: anonymize(ft.orig.ip()),
         orig_port: ft.orig.port(),
@@ -388,8 +412,36 @@ fn main() {
     writer::init_writers();
 
     let config = load_config(&args.config);
+    let rx_cores = config.get_all_rx_core_ids();
+
+    // Set up the checkpoint dispatcher/worker pool before the runtime starts,
+    // so FlowWindows::update (running on RX cores) can look up
+    // CHECKPOINT_DISPATCHER as soon as the first packet arrives. See
+    // checkpoint_dispatch and examples/basic_dispatching/src/bin/dedicated.rs,
+    // which this mirrors.
+    let checkpoint_dispatcher = checkpoint_dispatch::init(rx_cores, args.checkpoint_channel_size);
+    let checkpoint_worker_cores: Vec<CoreId> = args
+        .checkpoint_worker_cores
+        .iter()
+        .map(|&core| CoreId(core))
+        .collect();
+    let checkpoint_handler = DedicatedWorkerThreadSpawner::new()
+        .set_cores(checkpoint_worker_cores)
+        .set_batch_size(args.checkpoint_batch_size)
+        .set_dispatcher(checkpoint_dispatcher)
+        .set_handler(|event: CheckpointOutRecord| {
+            // Each handler thread is pinned to a fixed lcore, so this is a
+            // stable way to pick which per-core writer/output file it owns —
+            // see writer::with_writer.
+            let core = CoreId(unsafe { iris_core::rte_lcore_id() } as u32);
+            writer::with_writer(&core, |w| serde_json::to_writer(w, &event));
+        })
+        .run();
+
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config, filter).unwrap();
     runtime.run();
+
+    checkpoint_handler.shutdown(None);
 
     writer::flush_writers();
     writer::finalize_writers();

@@ -7,10 +7,13 @@ use std::sync::OnceLock;
 
 pub const COMBINED_FILE: &str = "conn_log.jsonl";
 
-/// One more than the maximum CoreId.raw() value.  Must match the number of
-/// RX cores configured in the runtime config file.  The +1 accounts for the
-/// main core that never processes packets.
-const ARR_LEN: usize = 33;
+/// One more than the maximum CoreId.raw() value in use — covers the main
+/// core, every RX/sink core configured in the runtime config file, *and*
+/// the checkpoint dispatcher's worker cores (see checkpoint_dispatch and
+/// main's `--checkpoint-worker-cores`), since those workers also call
+/// `with_writer`. Bump if any of those core lists are configured with ids
+/// at or above this value.
+const ARR_LEN: usize = 64;
 
 /// 64 KB per-core write buffer — amortises syscall overhead across ~100+
 /// records before a flush is needed.
