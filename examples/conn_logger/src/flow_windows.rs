@@ -1,14 +1,15 @@
 /// Per-10-second windowed connection features.
 ///
 /// Tracks, for each 10-second window within a connection:
-///   - Packet counts, packet bytes, payload bytes (per direction)
+///   - Packet counts, packet bytes (per direction)
 ///   - Jitter (std-dev of inter-packet delay in µs, per direction)
-///   - TCP: receive-window min/max/mean (per direction)
-///   - TCP: retransmission count, sequence-gap count
+///   - TCP only: receive-window min/max/mean (per direction)
+///   - TCP only: retransmission count, sequence-gap count
 ///
 /// Note: `orig_jitter_us` and `resp_jitter_us` are always 0.0 for `idx == 0`
 /// (there is no prior intra-window packet to measure a gap against).
-/// `tcp_*_win_*` fields are sampled starting from the very first packet.
+/// The TCP-only fields are omitted entirely (not serialized as zeros) for
+/// UDP connections, and are otherwise sampled starting from the first packet.
 ///
 /// Windows with zero packets are not emitted on their own: a run of idle
 /// 10-second windows is folded into the next (or final) window instead,
@@ -181,15 +182,12 @@ impl TcpDirState {
 // Per-window accumulator and serializable record
 // ---------------------------------------------------------------------------
 
-/// 192 bytes — fits in exactly 3 cache lines.
 #[derive(Debug, Clone, Default)]
 struct WindowAcc {
     orig_pkts: u64,
     resp_pkts: u64,
     orig_pkt_bytes: u64,
     resp_pkt_bytes: u64,
-    orig_payload_bytes: u64,
-    resp_payload_bytes: u64,
     orig_iat_us: IatStats,
     resp_iat_us: IatStats,
     orig_win: WelfordStats,
@@ -203,7 +201,10 @@ impl WindowAcc {
         self.orig_pkts == 0 && self.resp_pkts == 0
     }
 
-    fn finalize(&self, idx: u32, start_ms: u64, end_ms: u64) -> WindowRecord {
+    /// `is_tcp` controls whether `TcpWindowStats` is included at all: UDP
+    /// connections have no TCP receive-window/retransmission semantics, so
+    /// their windows omit those fields entirely rather than reporting zeros.
+    fn finalize(&self, idx: u32, start_ms: u64, end_ms: u64, is_tcp: bool) -> WindowRecord {
         WindowRecord {
             idx,
             start_ms,
@@ -212,20 +213,34 @@ impl WindowAcc {
             resp_pkts: self.resp_pkts,
             orig_pkt_bytes: self.orig_pkt_bytes,
             resp_pkt_bytes: self.resp_pkt_bytes,
-            orig_payload_bytes: self.orig_payload_bytes,
-            resp_payload_bytes: self.resp_payload_bytes,
             orig_jitter_us: self.orig_iat_us.stddev(),
             resp_jitter_us: self.resp_iat_us.stddev(),
-            tcp_orig_win_min: self.orig_win.min_or_zero(),
-            tcp_orig_win_max: self.orig_win.max_or_zero(),
-            tcp_orig_win_mean: self.orig_win.mean(),
-            tcp_resp_win_min: self.resp_win.min_or_zero(),
-            tcp_resp_win_max: self.resp_win.max_or_zero(),
-            tcp_resp_win_mean: self.resp_win.mean(),
-            tcp_retransmissions: self.tcp_retransmissions,
-            tcp_seq_gaps: self.tcp_seq_gaps,
+            tcp: is_tcp.then(|| TcpWindowStats {
+                tcp_orig_win_min: self.orig_win.min_or_zero(),
+                tcp_orig_win_max: self.orig_win.max_or_zero(),
+                tcp_orig_win_mean: self.orig_win.mean(),
+                tcp_resp_win_min: self.resp_win.min_or_zero(),
+                tcp_resp_win_max: self.resp_win.max_or_zero(),
+                tcp_resp_win_mean: self.resp_win.mean(),
+                tcp_retransmissions: self.tcp_retransmissions,
+                tcp_seq_gaps: self.tcp_seq_gaps,
+            }),
         }
     }
+}
+
+/// TCP-only per-window stats. Flattened into `WindowRecord`'s JSON output
+/// when present, and omitted entirely (not even as zeros) for UDP windows.
+#[derive(Debug, Clone, Serialize)]
+pub struct TcpWindowStats {
+    pub tcp_orig_win_min: f64,
+    pub tcp_orig_win_max: f64,
+    pub tcp_orig_win_mean: f64,
+    pub tcp_resp_win_min: f64,
+    pub tcp_resp_win_max: f64,
+    pub tcp_resp_win_mean: f64,
+    pub tcp_retransmissions: u64,
+    pub tcp_seq_gaps: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -239,19 +254,11 @@ pub struct WindowRecord {
     pub resp_pkts: u64,
     pub orig_pkt_bytes: u64,
     pub resp_pkt_bytes: u64,
-    pub orig_payload_bytes: u64,
-    pub resp_payload_bytes: u64,
     /// Std-dev of inter-arrival time in µs.
     pub orig_jitter_us: f64,
     pub resp_jitter_us: f64,
-    pub tcp_orig_win_min: f64,
-    pub tcp_orig_win_max: f64,
-    pub tcp_orig_win_mean: f64,
-    pub tcp_resp_win_min: f64,
-    pub tcp_resp_win_max: f64,
-    pub tcp_resp_win_mean: f64,
-    pub tcp_retransmissions: u64,
-    pub tcp_seq_gaps: u64,
+    #[serde(flatten)]
+    pub tcp: Option<TcpWindowStats>,
 }
 
 // ---------------------------------------------------------------------------
@@ -348,7 +355,7 @@ impl FlowWindows {
         let start_ms = self.curr_start.duration_since(self.start_ts).as_millis() as u64;
         let end_ms = boundary.duration_since(self.start_ts).as_millis() as u64;
         self.completed
-            .push(self.curr.finalize(self.curr_idx, start_ms, end_ms));
+            .push(self.curr.finalize(self.curr_idx, start_ms, end_ms, self.is_tcp));
         self.curr_idx += 1;
         self.curr = WindowAcc::default();
         self.curr_start = boundary;
@@ -363,7 +370,7 @@ impl FlowWindows {
         if !self.curr.is_empty() || self.completed.is_empty() {
             let start_ms = self.curr_start.duration_since(self.start_ts).as_millis() as u64;
             let end_ms = end_ts.duration_since(self.start_ts).as_millis() as u64;
-            all.push(self.curr.finalize(self.curr_idx, start_ms, end_ms));
+            all.push(self.curr.finalize(self.curr_idx, start_ms, end_ms, self.is_tcp));
         }
         all
     }
@@ -384,12 +391,10 @@ impl FlowWindows {
 
         let is_orig = pdu.dir;
         let pkt_bytes = pdu.mbuf_ref().data_len() as u64;
-        let payload_bytes = pdu.length() as u64;
 
         if is_orig {
             self.curr.orig_pkts += 1;
             self.curr.orig_pkt_bytes += pkt_bytes;
-            self.curr.orig_payload_bytes += payload_bytes;
             // Only compute jitter for flows that have crossed at least one
             // 10-second boundary.  orig_last_ts is reset by flush_window so
             // each window's jitter reflects intra-window IATs only.
@@ -404,7 +409,6 @@ impl FlowWindows {
         } else {
             self.curr.resp_pkts += 1;
             self.curr.resp_pkt_bytes += pkt_bytes;
-            self.curr.resp_payload_bytes += payload_bytes;
             if self.curr_idx > 0 {
                 if let Some(prev) = self.resp_last_ts {
                     self.curr
@@ -534,5 +538,44 @@ mod tests {
         // No packets were ever recorded and nothing has been flushed yet.
         let all = fw.all_windows(start);
         assert_eq!(all.len(), 1, "must always emit at least one record");
+    }
+
+    #[test]
+    fn udp_windows_omit_tcp_stats() {
+        let start = Instant::now();
+        let mut fw = empty_flow(start);
+        fw.is_tcp = false;
+        fw.curr.orig_pkts = 5;
+
+        fw.flush_window(start + WINDOW_DURATION);
+
+        assert!(fw.completed[0].tcp.is_none());
+    }
+
+    #[test]
+    fn tcp_windows_include_tcp_stats() {
+        let start = Instant::now();
+        let mut fw = empty_flow(start);
+        fw.is_tcp = true;
+        fw.curr.orig_pkts = 5;
+        fw.curr.orig_win.update(4096.0);
+
+        fw.flush_window(start + WINDOW_DURATION);
+
+        let tcp = fw.completed[0].tcp.as_ref().expect("TCP window must include tcp stats");
+        assert_eq!(tcp.tcp_orig_win_max, 4096.0);
+    }
+
+    #[test]
+    fn udp_window_json_has_no_tcp_keys() {
+        let start = Instant::now();
+        let mut fw = empty_flow(start);
+        fw.is_tcp = false;
+        fw.curr.orig_pkts = 5;
+        fw.flush_window(start + WINDOW_DURATION);
+
+        let json = serde_json::to_string(&fw.completed[0]).unwrap();
+        assert!(!json.contains("tcp_orig_win"), "UDP window JSON: {json}");
+        assert!(!json.contains("tcp_retransmissions"), "UDP window JSON: {json}");
     }
 }
