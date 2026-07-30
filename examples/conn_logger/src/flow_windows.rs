@@ -1,59 +1,49 @@
-/// Per-10-second windowed connection features.
+/// Per-connection traffic checkpoints, triggered by traffic volume rather
+/// than wall-clock time.
 ///
-/// Tracks, for each 10-second window within a connection:
+/// Tracks, for each checkpoint within a connection:
 ///   - Packet counts, packet bytes (per direction)
 ///   - Jitter (std-dev of inter-packet delay in µs, per direction)
 ///   - TCP only: receive-window min/max/mean (per direction)
 ///   - TCP only: retransmission count, sequence-gap count
 ///
+/// A checkpoint closes once `CHECKPOINT_BYTES` combined bytes have been seen
+/// since the last one, or (for sparse/idle connections that may never reach
+/// that threshold) once `IDLE_CHECKPOINT_CAP` has elapsed since the last one.
+/// Because the byte trigger depends only on this connection's own traffic,
+/// not a shared clock, different connections reach it at different real
+/// times: there's no wall-clock boundary for many connections to
+/// synchronize on. A byte-threshold checkpoint also has a roughly fixed
+/// "information budget," so its *duration* is a self-normalizing, directly
+/// comparable proxy for instantaneous bitrate across connections (a short
+/// duration to fill the same byte budget means higher throughput).
+///
 /// Note: `orig_jitter_us` and `resp_jitter_us` are always 0.0 for `idx == 0`
-/// (there is no prior intra-window packet to measure a gap against).
+/// (there is no prior intra-checkpoint packet to measure a gap against).
 /// The TCP-only fields are omitted entirely (not serialized as zeros) for
 /// UDP connections, and are otherwise sampled starting from the first packet.
-///
-/// Windows with zero packets are not emitted on their own: a run of idle
-/// 10-second windows is folded into the next (or final) window instead,
-/// producing one wider, longer-duration window rather than many empty
-/// records.
 use iris_compiler::*;
 use iris_core::protocols::packet::ethernet::Ethernet;
 use iris_core::protocols::packet::ipv4::Ipv4;
 use iris_core::protocols::packet::ipv6::Ipv6;
 use iris_core::protocols::packet::tcp::{Tcp, TCP_PROTOCOL};
 use iris_core::protocols::packet::Packet;
-use iris_core::{FiveTuple, L4Pdu, Mbuf};
+use iris_core::{L4Pdu, Mbuf};
 use serde::Serialize;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-pub const WINDOW_SECS: u64 = 10;
+/// Combined (orig + resp) bytes that trigger a checkpoint close. Tunable:
+/// smaller values give finer intra-connection resolution at the cost of
+/// more output records (rough guide: a 10 MB flow emits ~10 checkpoints at
+/// the default, a 1 GB flow ~1,000).
+const CHECKPOINT_BYTES: u64 = 1024 * 1024;
 
-// Pre-compute the Duration once so the per-packet comparison is a simple
-// 128-bit integer compare against a constant.
-const WINDOW_DURATION: Duration = Duration::from_secs(WINDOW_SECS);
-
-/// Deterministic per-connection offset into `[0, WINDOW_DURATION)`, used to
-/// phase-shift each connection's first window boundary.
-///
-/// Without this, every connection's first `next_boundary` is `first_pkt.ts +
-/// WINDOW_DURATION`, and `first_pkt.ts` is a batched RX-loop timestamp shared
-/// by many packets (see `L4Pdu::ts`), not a per-packet clock read. In live
-/// traffic, most connections are already in progress when capture starts, so
-/// a large fraction of them get *the same* `ts` and therefore the same
-/// boundary: all their windows finalize (Welford/TCP-window math + JSON
-/// serialization) in the same handful of RX-loop iterations, stalling
-/// `rte_eth_rx_burst` long enough to overflow the RX ring. Hashing the
-/// five-tuple spreads that population evenly across the window period; since
-/// `update()` advances `next_boundary` by a fixed `WINDOW_DURATION` each time,
-/// the phase offset persists for the life of the connection rather than
-/// resynchronizing on a later boundary.
-fn stagger_offset(pdu: &L4Pdu) -> Duration {
-    let five_tuple = FiveTuple::from_ctxt(&pdu.ctxt);
-    let mut hasher = DefaultHasher::new();
-    five_tuple.hash(&mut hasher);
-    Duration::from_millis(hasher.finish() % WINDOW_DURATION.as_millis() as u64)
-}
+/// Fallback trigger for sparse/idle connections that may never reach
+/// `CHECKPOINT_BYTES`: close the checkpoint anyway once this much time has
+/// elapsed since it opened. Long enough that it essentially never fires for
+/// active connections (which hit the byte trigger long before this), so it
+/// doesn't reintroduce a shared-clock synchronization risk across them.
+const IDLE_CHECKPOINT_CAP: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Welford online variance — min/max variant (TCP window stats)
@@ -203,7 +193,7 @@ impl TcpDirState {
 }
 
 // ---------------------------------------------------------------------------
-// Per-window accumulator and serializable record
+// Per-checkpoint accumulator and serializable record
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
@@ -225,11 +215,12 @@ impl WindowAcc {
         self.orig_pkts == 0 && self.resp_pkts == 0
     }
 
-    /// `is_tcp` controls whether `TcpWindowStats` is included at all: UDP
+    /// `is_tcp` controls whether `TcpCheckpointStats` is included at all: UDP
     /// connections have no TCP receive-window/retransmission semantics, so
-    /// their windows omit those fields entirely rather than reporting zeros.
-    fn finalize(&self, idx: u32, start_ms: u64, end_ms: u64, is_tcp: bool) -> WindowRecord {
-        WindowRecord {
+    /// their checkpoints omit those fields entirely rather than reporting
+    /// zeros.
+    fn finalize(&self, idx: u32, start_ms: u64, end_ms: u64, is_tcp: bool) -> CheckpointRecord {
+        CheckpointRecord {
             idx,
             start_ms,
             end_ms,
@@ -239,7 +230,7 @@ impl WindowAcc {
             resp_pkt_bytes: self.resp_pkt_bytes,
             orig_jitter_us: self.orig_iat_us.stddev(),
             resp_jitter_us: self.resp_iat_us.stddev(),
-            tcp: is_tcp.then(|| TcpWindowStats {
+            tcp: is_tcp.then(|| TcpCheckpointStats {
                 tcp_orig_win_min: self.orig_win.min_or_zero(),
                 tcp_orig_win_max: self.orig_win.max_or_zero(),
                 tcp_orig_win_mean: self.orig_win.mean(),
@@ -253,10 +244,11 @@ impl WindowAcc {
     }
 }
 
-/// TCP-only per-window stats. Flattened into `WindowRecord`'s JSON output
-/// when present, and omitted entirely (not even as zeros) for UDP windows.
+/// TCP-only per-checkpoint stats. Flattened into `CheckpointRecord`'s JSON
+/// output when present, and omitted entirely (not even as zeros) for UDP
+/// checkpoints.
 #[derive(Debug, Clone, Serialize)]
-pub struct TcpWindowStats {
+pub struct TcpCheckpointStats {
     pub tcp_orig_win_min: f64,
     pub tcp_orig_win_max: f64,
     pub tcp_orig_win_mean: f64,
@@ -268,7 +260,7 @@ pub struct TcpWindowStats {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct WindowRecord {
+pub struct CheckpointRecord {
     pub idx: u32,
     /// Milliseconds from connection start.
     pub start_ms: u64,
@@ -282,7 +274,7 @@ pub struct WindowRecord {
     pub orig_jitter_us: f64,
     pub resp_jitter_us: f64,
     #[serde(flatten)]
-    pub tcp: Option<TcpWindowStats>,
+    pub tcp: Option<TcpCheckpointStats>,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,20 +309,11 @@ fn tcp_window_size(pdu: &L4Pdu) -> Option<u16> {
 #[datatype]
 #[derive(Debug)]
 pub struct FlowWindows {
-    /// Timestamp of the first packet (used to compute window offsets).
+    /// Timestamp of the first packet (used to compute checkpoint offsets).
     pub start_ts: Instant,
-    completed: Vec<WindowRecord>,
+    completed: Vec<CheckpointRecord>,
     curr: WindowAcc,
     curr_start: Instant,
-    /// Next WINDOW_DURATION boundary to check against. Initialized to a
-    /// per-connection staggered offset (see `stagger_offset`) rather than
-    /// exactly `start_ts + WINDOW_DURATION`, so windows across connections
-    /// don't all close in the same RX-loop iterations. After that, it always
-    /// advances by exactly one WINDOW_DURATION per boundary crossing (which
-    /// preserves the stagger for the life of the connection), even when the
-    /// window at that boundary is idle and folded forward instead of flushed
-    /// (see `flush_window`).
-    next_boundary: Instant,
     curr_idx: u32,
     orig_last_ts: Option<Instant>,
     resp_last_ts: Option<Instant>,
@@ -345,16 +328,11 @@ impl FlowWindows {
         Self {
             start_ts: now,
             // Defer allocation: most connections are short-lived and never
-            // cross a window boundary, so Vec::new() avoids allocating until
-            // the first flush at 10 seconds.
+            // reach a checkpoint's byte threshold, so Vec::new() avoids
+            // allocating until the first close.
             completed: Vec::new(),
             curr: WindowAcc::default(),
             curr_start: now,
-            // See `stagger_offset`: the first window closes somewhere in
-            // [0, WINDOW_DURATION) rather than always at exactly
-            // WINDOW_DURATION, so connections' flush work spreads out over
-            // time instead of clustering on shared RX-loop timestamps.
-            next_boundary: now + stagger_offset(first_pkt),
             curr_idx: 0,
             orig_last_ts: None,
             resp_last_ts: None,
@@ -364,41 +342,37 @@ impl FlowWindows {
         }
     }
 
-    /// Close out the window ending at `boundary`.
+    /// Close out the checkpoint ending at `now`.
     ///
-    /// If the window accumulated no packets, it is *not* emitted as its own
-    /// record: `curr_start` is left in place so the idle span is folded into
-    /// whichever window eventually contains traffic (or into the final
-    /// partial window at connection termination), producing one wider window
-    /// instead of a run of empty ones. Per-direction timestamps are still
-    /// reset so a later packet's jitter isn't skewed by the gap.
-    fn flush_window(&mut self, boundary: Instant) {
-        // Reset per-direction timestamps so each window's jitter is computed
-        // from intra-window IATs only; a cross-boundary (or cross-idle-span)
-        // gap can be seconds long and would badly skew the stddev of the
-        // next window.
+    /// Only called from `update()` right after accounting for the current
+    /// packet (either because that pushed combined bytes past
+    /// `CHECKPOINT_BYTES`, or because `IDLE_CHECKPOINT_CAP` elapsed since the
+    /// checkpoint opened), so `curr` always has at least that one packet in
+    /// it — unlike the old wall-clock design, a checkpoint boundary can never
+    /// be reached without a packet driving it, so there's no empty-checkpoint
+    /// case to guard against here.
+    fn close_checkpoint(&mut self, now: Instant) {
+        // Reset per-direction timestamps so each checkpoint's jitter is
+        // computed from intra-checkpoint IATs only; a cross-checkpoint gap
+        // could otherwise skew the stddev of the next checkpoint.
         self.orig_last_ts = None;
         self.resp_last_ts = None;
 
-        if self.curr.is_empty() {
-            return;
-        }
-
         let start_ms = self.curr_start.duration_since(self.start_ts).as_millis() as u64;
-        let end_ms = boundary.duration_since(self.start_ts).as_millis() as u64;
+        let end_ms = now.duration_since(self.start_ts).as_millis() as u64;
         self.completed
             .push(self.curr.finalize(self.curr_idx, start_ms, end_ms, self.is_tcp));
         self.curr_idx += 1;
         self.curr = WindowAcc::default();
-        self.curr_start = boundary;
+        self.curr_start = now;
     }
 
-    /// Return all completed windows plus the current partial window.
+    /// Return all completed checkpoints plus the current partial checkpoint.
     /// Call at connection termination with `end_ts = Instant::now()`.
-    pub fn all_windows(&self, end_ts: Instant) -> Vec<WindowRecord> {
+    pub fn all_windows(&self, end_ts: Instant) -> Vec<CheckpointRecord> {
         let mut all = self.completed.clone();
-        // Skip an empty trailing window the same way flush_window does,
-        // unless it would be the connection's only record.
+        // Skip an empty trailing checkpoint, unless it would be the
+        // connection's only record.
         if !self.curr.is_empty() || self.completed.is_empty() {
             let start_ms = self.curr_start.duration_since(self.start_ts).as_millis() as u64;
             let end_ms = end_ts.duration_since(self.start_ts).as_millis() as u64;
@@ -410,17 +384,6 @@ impl FlowWindows {
     #[datatype_fn("FlowWindows,level=InL4Conn")]
     pub fn update(&mut self, pdu: &L4Pdu) {
         let now = pdu.ts;
-
-        // Advance one WINDOW_DURATION boundary at a time, not just once per
-        // arrival. A single `if` would produce a window wider than
-        // WINDOW_SECS whenever packets arrive more than 10 seconds apart.
-        // Idle boundaries fold forward into the current window rather than
-        // each producing their own empty WindowRecord (see flush_window).
-        while now >= self.next_boundary {
-            self.flush_window(self.next_boundary);
-            self.next_boundary += WINDOW_DURATION;
-        }
-
         let is_orig = pdu.dir;
         let pkt_bytes = pdu.mbuf_ref().data_len() as u64;
 
@@ -428,8 +391,8 @@ impl FlowWindows {
             self.curr.orig_pkts += 1;
             self.curr.orig_pkt_bytes += pkt_bytes;
             // Only compute jitter for flows that have crossed at least one
-            // 10-second boundary.  orig_last_ts is reset by flush_window so
-            // each window's jitter reflects intra-window IATs only.
+            // checkpoint.  orig_last_ts is reset by close_checkpoint so each
+            // checkpoint's jitter reflects intra-checkpoint IATs only.
             if self.curr_idx > 0 {
                 if let Some(prev) = self.orig_last_ts {
                     self.curr
@@ -474,6 +437,18 @@ impl FlowWindows {
                 self.curr.tcp_seq_gaps += 1;
             }
         }
+
+        // Close the checkpoint once enough traffic (or, for sparse
+        // connections, enough elapsed time) has accumulated. Unlike a
+        // wall-clock boundary, there's no shared "when" for two different
+        // connections to synchronize on: each reaches its own byte
+        // threshold at a different real time, driven by its own traffic.
+        let total_bytes = self.curr.orig_pkt_bytes + self.curr.resp_pkt_bytes;
+        if total_bytes >= CHECKPOINT_BYTES
+            || now.duration_since(self.curr_start) >= IDLE_CHECKPOINT_CAP
+        {
+            self.close_checkpoint(now);
+        }
     }
 }
 
@@ -482,7 +457,7 @@ mod tests {
     use super::*;
 
     /// Build a `FlowWindows` directly (bypassing `new`/`update`, which
-    /// require a live `L4Pdu`/mbuf) so the boundary-merging logic can be
+    /// require a live `L4Pdu`/mbuf) so checkpoint-closing logic can be
     /// exercised with synthetic timestamps.
     fn empty_flow(start: Instant) -> FlowWindows {
         FlowWindows {
@@ -490,7 +465,6 @@ mod tests {
             completed: Vec::new(),
             curr: WindowAcc::default(),
             curr_start: start,
-            next_boundary: start + WINDOW_DURATION,
             curr_idx: 0,
             orig_last_ts: None,
             resp_last_ts: None,
@@ -501,53 +475,37 @@ mod tests {
     }
 
     #[test]
-    fn idle_boundary_is_not_flushed_as_its_own_window() {
-        let start = Instant::now();
-        let mut fw = empty_flow(start);
-
-        // Cross one boundary with zero packets accumulated.
-        fw.flush_window(start + WINDOW_DURATION);
-
-        assert!(fw.completed.is_empty(), "empty window must not be emitted");
-        assert_eq!(fw.curr_idx, 0);
-        // curr_start stays put so the idle span folds into whatever comes next.
-        assert_eq!(fw.curr_start, start);
-    }
-
-    #[test]
-    fn multiple_idle_boundaries_merge_into_one_wide_window() {
-        let start = Instant::now();
-        let mut fw = empty_flow(start);
-
-        // Three idle boundaries pass with no traffic...
-        fw.flush_window(start + WINDOW_DURATION);
-        fw.flush_window(start + WINDOW_DURATION * 2);
-        fw.flush_window(start + WINDOW_DURATION * 3);
-        // ...then a packet arrives in the 4th window.
-        fw.curr.orig_pkts = 1;
-        fw.flush_window(start + WINDOW_DURATION * 4);
-
-        assert_eq!(fw.completed.len(), 1, "idle windows must collapse to one record");
-        let record = &fw.completed[0];
-        // The single emitted window spans all four window-durations
-        assert_eq!(record.start_ms, 0);
-        assert_eq!(record.end_ms, (WINDOW_DURATION * 4).as_millis() as u64);
-        assert_eq!(record.idx, 0);
-        assert_eq!(fw.curr_idx, 1);
-    }
-
-    #[test]
-    fn non_idle_boundary_flushes_normally() {
+    fn checkpoint_closes_after_byte_threshold() {
         let start = Instant::now();
         let mut fw = empty_flow(start);
         fw.curr.orig_pkts = 5;
+        fw.curr.orig_pkt_bytes = CHECKPOINT_BYTES;
 
-        fw.flush_window(start + WINDOW_DURATION);
+        fw.close_checkpoint(start + Duration::from_millis(1));
 
         assert_eq!(fw.completed.len(), 1);
         assert_eq!(fw.completed[0].orig_pkts, 5);
+        assert_eq!(fw.completed[0].orig_pkt_bytes, CHECKPOINT_BYTES);
         assert_eq!(fw.curr_idx, 1);
-        assert_eq!(fw.curr_start, start + WINDOW_DURATION);
+        assert_eq!(fw.curr_start, start + Duration::from_millis(1));
+        // curr resets to empty for the next checkpoint.
+        assert!(fw.curr.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_closes_after_idle_cap_even_under_byte_threshold() {
+        let start = Instant::now();
+        let mut fw = empty_flow(start);
+        // Well under CHECKPOINT_BYTES, but IDLE_CHECKPOINT_CAP has elapsed.
+        fw.curr.orig_pkts = 1;
+        fw.curr.orig_pkt_bytes = 64;
+
+        let closed_at = start + IDLE_CHECKPOINT_CAP;
+        fw.close_checkpoint(closed_at);
+
+        assert_eq!(fw.completed.len(), 1);
+        assert_eq!(fw.completed[0].orig_pkt_bytes, 64);
+        assert_eq!(fw.completed[0].end_ms, IDLE_CHECKPOINT_CAP.as_millis() as u64);
     }
 
     #[test]
@@ -555,19 +513,20 @@ mod tests {
         let start = Instant::now();
         let mut fw = empty_flow(start);
         fw.curr.orig_pkts = 5;
-        fw.flush_window(start + WINDOW_DURATION);
+        fw.curr.orig_pkt_bytes = CHECKPOINT_BYTES;
+        fw.close_checkpoint(start + Duration::from_secs(1));
         // curr is now empty (freshly reset); connection goes idle and terminates.
         assert!(fw.curr.is_empty());
 
-        let all = fw.all_windows(start + WINDOW_DURATION * 3);
-        assert_eq!(all.len(), 1, "trailing idle window should be dropped");
+        let all = fw.all_windows(start + Duration::from_secs(3));
+        assert_eq!(all.len(), 1, "trailing empty checkpoint should be dropped");
     }
 
     #[test]
     fn all_windows_keeps_sole_window_even_if_empty() {
         let start = Instant::now();
         let fw = empty_flow(start);
-        // No packets were ever recorded and nothing has been flushed yet.
+        // No packets were ever recorded and nothing has been closed yet.
         let all = fw.all_windows(start);
         assert_eq!(all.len(), 1, "must always emit at least one record");
     }
@@ -578,8 +537,9 @@ mod tests {
         let mut fw = empty_flow(start);
         fw.is_tcp = false;
         fw.curr.orig_pkts = 5;
+        fw.curr.orig_pkt_bytes = CHECKPOINT_BYTES;
 
-        fw.flush_window(start + WINDOW_DURATION);
+        fw.close_checkpoint(start + Duration::from_secs(1));
 
         assert!(fw.completed[0].tcp.is_none());
     }
@@ -590,11 +550,12 @@ mod tests {
         let mut fw = empty_flow(start);
         fw.is_tcp = true;
         fw.curr.orig_pkts = 5;
+        fw.curr.orig_pkt_bytes = CHECKPOINT_BYTES;
         fw.curr.orig_win.update(4096.0);
 
-        fw.flush_window(start + WINDOW_DURATION);
+        fw.close_checkpoint(start + Duration::from_secs(1));
 
-        let tcp = fw.completed[0].tcp.as_ref().expect("TCP window must include tcp stats");
+        let tcp = fw.completed[0].tcp.as_ref().expect("TCP checkpoint must include tcp stats");
         assert_eq!(tcp.tcp_orig_win_max, 4096.0);
     }
 
@@ -604,10 +565,11 @@ mod tests {
         let mut fw = empty_flow(start);
         fw.is_tcp = false;
         fw.curr.orig_pkts = 5;
-        fw.flush_window(start + WINDOW_DURATION);
+        fw.curr.orig_pkt_bytes = CHECKPOINT_BYTES;
+        fw.close_checkpoint(start + Duration::from_secs(1));
 
         let json = serde_json::to_string(&fw.completed[0]).unwrap();
-        assert!(!json.contains("tcp_orig_win"), "UDP window JSON: {json}");
-        assert!(!json.contains("tcp_retransmissions"), "UDP window JSON: {json}");
+        assert!(!json.contains("tcp_orig_win"), "UDP checkpoint JSON: {json}");
+        assert!(!json.contains("tcp_retransmissions"), "UDP checkpoint JSON: {json}");
     }
 }

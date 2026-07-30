@@ -42,7 +42,7 @@ mod tcp_state;
 mod writer;
 
 use cryptopan::CryptoPAN;
-use flow_windows::{FlowWindows, WindowRecord};
+use flow_windows::{CheckpointRecord, FlowWindows};
 use tcp_state::TcpFlowState;
 
 // ---------------------------------------------------------------------------
@@ -130,7 +130,7 @@ struct ConnLogRecord {
     end_reason: &'static str,
     /// Non-SYN/ACK TCP flags observed (URG, PSH, RST, FIN seen outside handshake).
     tcp_flags: Vec<&'static str>,
-    windows: Vec<WindowRecord>,
+    windows: Vec<CheckpointRecord>,
 }
 
 // Filter out CAPWAP traffic
