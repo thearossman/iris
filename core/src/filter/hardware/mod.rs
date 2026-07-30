@@ -416,6 +416,8 @@ fn create_rule(
             action.rss[0].queue_num = port.queue_map.len() as u32;
             action.rss[0].queue = reta_raw.as_ptr();
             a.conf = &action.rss[0] as *const _ as *const c_void;
+        } else if let dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_JUMP = a.type_ {
+            a.conf = &action.jump[0] as *const _ as *const c_void;
         }
     }
 
