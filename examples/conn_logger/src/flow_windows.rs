@@ -6,9 +6,14 @@
 ///   - TCP: receive-window min/max/mean (per direction)
 ///   - TCP: retransmission count, sequence-gap count
 ///
-/// Note: `orig_jitter_us`, `resp_jitter_us`, and all `tcp_*_win_*` fields
-/// are always 0.0 for `idx == 0`.  Detailed stats begin at `idx == 1`
-/// (i.e., only for connections that have been active for at least 10 seconds).
+/// Note: `orig_jitter_us` and `resp_jitter_us` are always 0.0 for `idx == 0`
+/// (there is no prior intra-window packet to measure a gap against).
+/// `tcp_*_win_*` fields are sampled starting from the very first packet.
+///
+/// Windows with zero packets are not emitted on their own: a run of idle
+/// 10-second windows is folded into the next (or final) window instead,
+/// producing one wider, longer-duration window rather than many empty
+/// records.
 use iris_compiler::*;
 use iris_core::protocols::packet::ethernet::Ethernet;
 use iris_core::protocols::packet::ipv4::Ipv4;
@@ -194,6 +199,10 @@ struct WindowAcc {
 }
 
 impl WindowAcc {
+    fn is_empty(&self) -> bool {
+        self.orig_pkts == 0 && self.resp_pkts == 0
+    }
+
     fn finalize(&self, idx: u32, start_ms: u64, end_ms: u64) -> WindowRecord {
         WindowRecord {
             idx,
@@ -282,6 +291,11 @@ pub struct FlowWindows {
     completed: Vec<WindowRecord>,
     curr: WindowAcc,
     curr_start: Instant,
+    /// Next WINDOW_DURATION boundary to check against. Unlike `curr_start`,
+    /// this always advances by exactly one WINDOW_DURATION per boundary
+    /// crossing, even when the window at that boundary is idle and folded
+    /// forward instead of flushed (see `flush_window`).
+    next_boundary: Instant,
     curr_idx: u32,
     orig_last_ts: Option<Instant>,
     resp_last_ts: Option<Instant>,
@@ -301,6 +315,7 @@ impl FlowWindows {
             completed: Vec::new(),
             curr: WindowAcc::default(),
             curr_start: now,
+            next_boundary: now + WINDOW_DURATION,
             curr_idx: 0,
             orig_last_ts: None,
             resp_last_ts: None,
@@ -310,29 +325,46 @@ impl FlowWindows {
         }
     }
 
-    /// Flush the current window and start a new one anchored at `now`.
-    fn flush_window(&mut self, now: Instant) {
+    /// Close out the window ending at `boundary`.
+    ///
+    /// If the window accumulated no packets, it is *not* emitted as its own
+    /// record: `curr_start` is left in place so the idle span is folded into
+    /// whichever window eventually contains traffic (or into the final
+    /// partial window at connection termination), producing one wider window
+    /// instead of a run of empty ones. Per-direction timestamps are still
+    /// reset so a later packet's jitter isn't skewed by the gap.
+    fn flush_window(&mut self, boundary: Instant) {
+        // Reset per-direction timestamps so each window's jitter is computed
+        // from intra-window IATs only; a cross-boundary (or cross-idle-span)
+        // gap can be seconds long and would badly skew the stddev of the
+        // next window.
+        self.orig_last_ts = None;
+        self.resp_last_ts = None;
+
+        if self.curr.is_empty() {
+            return;
+        }
+
         let start_ms = self.curr_start.duration_since(self.start_ts).as_millis() as u64;
-        let end_ms = now.duration_since(self.start_ts).as_millis() as u64;
+        let end_ms = boundary.duration_since(self.start_ts).as_millis() as u64;
         self.completed
             .push(self.curr.finalize(self.curr_idx, start_ms, end_ms));
         self.curr_idx += 1;
         self.curr = WindowAcc::default();
-        self.curr_start = now;
-        // Reset per-direction timestamps so each window's jitter is computed
-        // from intra-window IATs only; a cross-boundary gap can be seconds
-        // long and would badly skew the stddev of the new window.
-        self.orig_last_ts = None;
-        self.resp_last_ts = None;
+        self.curr_start = boundary;
     }
 
     /// Return all completed windows plus the current partial window.
     /// Call at connection termination with `end_ts = Instant::now()`.
     pub fn all_windows(&self, end_ts: Instant) -> Vec<WindowRecord> {
         let mut all = self.completed.clone();
-        let start_ms = self.curr_start.duration_since(self.start_ts).as_millis() as u64;
-        let end_ms = end_ts.duration_since(self.start_ts).as_millis() as u64;
-        all.push(self.curr.finalize(self.curr_idx, start_ms, end_ms));
+        // Skip an empty trailing window the same way flush_window does,
+        // unless it would be the connection's only record.
+        if !self.curr.is_empty() || self.completed.is_empty() {
+            let start_ms = self.curr_start.duration_since(self.start_ts).as_millis() as u64;
+            let end_ms = end_ts.duration_since(self.start_ts).as_millis() as u64;
+            all.push(self.curr.finalize(self.curr_idx, start_ms, end_ms));
+        }
         all
     }
 
@@ -340,11 +372,14 @@ impl FlowWindows {
     pub fn update(&mut self, pdu: &L4Pdu) {
         let now = pdu.ts;
 
-        // Flush one window per WINDOW_DURATION boundary, not just once per
-        // arrival.  A single `if` would produce a window wider than
+        // Advance one WINDOW_DURATION boundary at a time, not just once per
+        // arrival. A single `if` would produce a window wider than
         // WINDOW_SECS whenever packets arrive more than 10 seconds apart.
-        while now.duration_since(self.curr_start) >= WINDOW_DURATION {
-            self.flush_window(self.curr_start + WINDOW_DURATION);
+        // Idle boundaries fold forward into the current window rather than
+        // each producing their own empty WindowRecord (see flush_window).
+        while now >= self.next_boundary {
+            self.flush_window(self.next_boundary);
+            self.next_boundary += WINDOW_DURATION;
         }
 
         let is_orig = pdu.dir;
@@ -381,15 +416,11 @@ impl FlowWindows {
         }
 
         if self.is_tcp {
-            // TCP window-size parsing (L2→L3→L4 re-parse) is skipped for the
-            // first window; only collected once the flow is confirmed long-lived.
-            if self.curr_idx > 0 {
-                if let Some(win) = tcp_window_size(pdu) {
-                    if is_orig {
-                        self.curr.orig_win.update(win as f64);
-                    } else {
-                        self.curr.resp_win.update(win as f64);
-                    }
+            if let Some(win) = tcp_window_size(pdu) {
+                if is_orig {
+                    self.curr.orig_win.update(win as f64);
+                } else {
+                    self.curr.resp_win.update(win as f64);
                 }
             }
 
@@ -407,5 +438,101 @@ impl FlowWindows {
                 self.curr.tcp_seq_gaps += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `FlowWindows` directly (bypassing `new`/`update`, which
+    /// require a live `L4Pdu`/mbuf) so the boundary-merging logic can be
+    /// exercised with synthetic timestamps.
+    fn empty_flow(start: Instant) -> FlowWindows {
+        FlowWindows {
+            start_ts: start,
+            completed: Vec::new(),
+            curr: WindowAcc::default(),
+            curr_start: start,
+            next_boundary: start + WINDOW_DURATION,
+            curr_idx: 0,
+            orig_last_ts: None,
+            resp_last_ts: None,
+            is_tcp: false,
+            orig_tcp: TcpDirState::default(),
+            resp_tcp: TcpDirState::default(),
+        }
+    }
+
+    #[test]
+    fn idle_boundary_is_not_flushed_as_its_own_window() {
+        let start = Instant::now();
+        let mut fw = empty_flow(start);
+
+        // Cross one boundary with zero packets accumulated.
+        fw.flush_window(start + WINDOW_DURATION);
+
+        assert!(fw.completed.is_empty(), "empty window must not be emitted");
+        assert_eq!(fw.curr_idx, 0);
+        // curr_start stays put so the idle span folds into whatever comes next.
+        assert_eq!(fw.curr_start, start);
+    }
+
+    #[test]
+    fn multiple_idle_boundaries_merge_into_one_wide_window() {
+        let start = Instant::now();
+        let mut fw = empty_flow(start);
+
+        // Three idle boundaries pass with no traffic...
+        fw.flush_window(start + WINDOW_DURATION);
+        fw.flush_window(start + WINDOW_DURATION * 2);
+        fw.flush_window(start + WINDOW_DURATION * 3);
+        // ...then a packet arrives in the 4th window.
+        fw.curr.orig_pkts = 1;
+        fw.flush_window(start + WINDOW_DURATION * 4);
+
+        assert_eq!(fw.completed.len(), 1, "idle windows must collapse to one record");
+        let record = &fw.completed[0];
+        // The single emitted window spans all four window-durations
+        assert_eq!(record.start_ms, 0);
+        assert_eq!(record.end_ms, (WINDOW_DURATION * 4).as_millis() as u64);
+        assert_eq!(record.idx, 0);
+        assert_eq!(fw.curr_idx, 1);
+    }
+
+    #[test]
+    fn non_idle_boundary_flushes_normally() {
+        let start = Instant::now();
+        let mut fw = empty_flow(start);
+        fw.curr.orig_pkts = 5;
+
+        fw.flush_window(start + WINDOW_DURATION);
+
+        assert_eq!(fw.completed.len(), 1);
+        assert_eq!(fw.completed[0].orig_pkts, 5);
+        assert_eq!(fw.curr_idx, 1);
+        assert_eq!(fw.curr_start, start + WINDOW_DURATION);
+    }
+
+    #[test]
+    fn all_windows_omits_empty_trailing_window_when_data_exists() {
+        let start = Instant::now();
+        let mut fw = empty_flow(start);
+        fw.curr.orig_pkts = 5;
+        fw.flush_window(start + WINDOW_DURATION);
+        // curr is now empty (freshly reset); connection goes idle and terminates.
+        assert!(fw.curr.is_empty());
+
+        let all = fw.all_windows(start + WINDOW_DURATION * 3);
+        assert_eq!(all.len(), 1, "trailing idle window should be dropped");
+    }
+
+    #[test]
+    fn all_windows_keeps_sole_window_even_if_empty() {
+        let start = Instant::now();
+        let fw = empty_flow(start);
+        // No packets were ever recorded and nothing has been flushed yet.
+        let all = fw.all_windows(start);
+        assert_eq!(all.len(), 1, "must always emit at least one record");
     }
 }
