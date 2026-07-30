@@ -285,7 +285,7 @@ struct DnsRecord {
     answers: Vec<String>,
 }
 
-#[callback("dns")]
+#[callback("dns and udp.port != 5247 and udp.port != 5246")]
 fn log_dns(dns: &DnsTransaction, ft: &FiveTuple, core: &CoreId) {
     use dns_parser::ResponseCode;
     use iris_core::protocols::stream::dns::Data;
