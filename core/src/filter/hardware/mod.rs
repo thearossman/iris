@@ -22,13 +22,19 @@ use anyhow::{bail, Result};
 use log::{debug, error, info, warn};
 use thiserror::Error;
 
-// priority levels for ingress rules
-const HIGH_PRIORITY: u32 = 0;
+// priority levels for ingress rules (lower number = checked first)
+const EXCLUDE_PRIORITY: u32 = 0;
+const HIGH_PRIORITY: u32 = 1;
 const LOW_PRIORITY: u32 = 3;
 
 #[derive(Debug)]
 pub(crate) struct HardwareFilter<'a> {
     patterns: Vec<LayeredPattern>,
+    // `!=` predicates realized as redirect rules: exact-match on the
+    // excluded value, jumping to the default drop table instead of RSS.
+    // Installed ahead of `patterns` (see `install`), since a NIC can't
+    // match a negation directly.
+    exclude_patterns: Vec<LayeredPattern>,
     port: &'a Port,
 }
 
@@ -36,8 +42,9 @@ impl<'a> HardwareFilter<'a> {
     // Creates a new HardwareFilter for port given a filter.
     // Prunes all predicates not supported by the device.
     pub(crate) fn new(filter: &Filter, port: &'a Port) -> Self {
-        let hw_patterns = filter
-            .get_patterns_flat()
+        let original_patterns = filter.get_patterns_flat();
+
+        let hw_patterns = original_patterns
             .iter()
             .map(|p| p.retain_hardware_predicates(port))
             .collect::<Vec<_>>();
@@ -66,8 +73,44 @@ impl<'a> HardwareFilter<'a> {
         layered.sort();
         layered.dedup();
 
+        // `retain_hardware_predicates` drops `!=` predicates above, since a
+        // NIC can't match a negation directly. Build a redirect rule for
+        // each one instead -- see `hw_excludable`/`install`.
+        let mut exclude_patterns = vec![];
+        for pattern in original_patterns.iter() {
+            for pred in pattern.predicates.iter() {
+                let Some(excl_pred) = hw_excludable(pred, port) else {
+                    continue;
+                };
+                // Only safe if no other disjunct in the filter would still
+                // accept this value -- e.g. "udp and udp.port != 1234" next
+                // to "udp and udp.port != 5246" from another subscription.
+                // Neither pattern subsumes the other, so both stick around
+                // as separate disjuncts, and the second one still wants
+                // port 1234 traffic.
+                if !globally_excludable(&excl_pred, &original_patterns) {
+                    continue;
+                }
+                let excl_pattern = FlatPattern {
+                    predicates: vec![
+                        Predicate::Unary {
+                            protocol: excl_pred.get_protocol().clone(),
+                        },
+                        excl_pred,
+                    ],
+                    as_str: None,
+                };
+                if let Ok(fq) = excl_pattern.to_fully_qualified() {
+                    exclude_patterns.extend(fq);
+                }
+            }
+        }
+        exclude_patterns.sort();
+        exclude_patterns.dedup();
+
         HardwareFilter {
             patterns: layered,
+            exclude_patterns,
             port,
         }
     }
@@ -75,12 +118,19 @@ impl<'a> HardwareFilter<'a> {
     // Installs the hardware filter to the port.
     pub(crate) fn install(&self) -> Result<()> {
         debug!("{}", self);
-        if self.patterns.iter().all(|p| p.is_empty()) {
+        if self.patterns.iter().all(|p| p.is_empty())
+            && self.exclude_patterns.iter().all(|p| p.is_empty())
+        {
             info!("Empty filter, skipping.");
             return Ok(());
         }
 
         info!("Applying hardware filter rules on Port {}...", self.port.id);
+        // Exclusions go in first, ahead of the accept patterns they carve
+        // exceptions out of.
+        for pattern in self.exclude_patterns.iter() {
+            install_redirect_pattern(pattern, self.port, 0, EXCLUDE_PRIORITY, 1)?;
+        }
         for pattern in self.patterns.iter() {
             install_pattern(pattern, self.port, 0, HIGH_PRIORITY)?;
         }
@@ -96,6 +146,9 @@ impl<'a> HardwareFilter<'a> {
 impl fmt::Display for HardwareFilter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         writeln!(f, "[HardwareFilter]: ")?;
+        for pattern in self.exclude_patterns.iter() {
+            writeln!(f, "REDIRECT (!=) {}", pattern.to_flat_pattern())?;
+        }
         for pattern in self.patterns.iter() {
             writeln!(f, "{}", pattern.to_flat_pattern())?;
         }
@@ -171,6 +224,55 @@ pub(crate) fn device_supported(pred: &Predicate, port: &Port) -> bool {
         return false;
     }
     true
+}
+
+// NICs can't match a `!=` directly -- MLX5 only has equality/masked
+// matches, no "not equal" primitive. If `pred` is a `!=` on a hardware
+// protocol, this returns the equivalent `Eq` predicate on the excluded
+// value, which `HardwareFilter::new` turns into a higher-priority redirect
+// rule instead (see `install`).
+fn hw_excludable(pred: &Predicate, port: &Port) -> Option<Predicate> {
+    let Predicate::Binary {
+        protocol,
+        field,
+        op: BinOp::Ne,
+        value,
+    } = pred
+    else {
+        return None;
+    };
+    let hw_filterable_protos = hashset! {
+        protocol!("ipv4"),
+        protocol!("ipv6"),
+        protocol!("tcp"),
+        protocol!("udp"),
+    };
+    if !hw_filterable_protos.contains(protocol) {
+        return None;
+    }
+    let eq_pred = Predicate::Binary {
+        protocol: protocol.clone(),
+        field: field.clone(),
+        op: BinOp::Eq,
+        value: value.clone(),
+    };
+    predicate_supported(&eq_pred, port, 0, EXCLUDE_PRIORITY).then_some(eq_pred)
+}
+
+// True if no disjunct of the filter would accept `excl_pred`'s value (the
+// disjunct `excl_pred` came from doesn't count -- it trivially excludes its
+// own value). Two disjuncts excluding different values, e.g. "udp.port !=
+// 1234" next to "udp.port != 5246" from another subscription, don't
+// collapse into each other, so the second one still wants port 1234
+// traffic; dropping it in hardware would disagree with the software
+// filter. `FlatPattern::is_excl` already answers "can these two patterns
+// ever both match the same packet", so just reuse it.
+fn globally_excludable(excl_pred: &Predicate, all_patterns: &[FlatPattern]) -> bool {
+    let singleton = FlatPattern {
+        predicates: vec![excl_pred.clone()],
+        as_str: None,
+    };
+    all_patterns.iter().all(|p| p.is_excl(&singleton))
 }
 
 fn predicate_supported(predicate: &Predicate, port: &Port, group: u32, priority: u32) -> bool {
@@ -257,6 +359,29 @@ fn install_pattern(
         // action.append_mark(tag as u32);
 
         action.append_rss();
+        action.finish();
+
+        create_rule(lpattern, port, attr, &mut pattern, &mut action)
+    } else {
+        bail!(HardwareFilterError::InvalidRule(lpattern.to_owned()));
+    }
+}
+
+// Same as `install_pattern`, but jumps to `to_group` instead of RSS-ing.
+// For `!=` exclusions, `to_group` is the same drop table that unmatched
+// traffic already falls into via `add_redirect`, so this gets the effect
+// of a DROP action without actually using one.
+fn install_redirect_pattern(
+    lpattern: &LayeredPattern,
+    port: &Port,
+    group: u32,
+    priority: u32,
+    to_group: u32,
+) -> Result<()> {
+    let attr = FlowAttribute::new(group, priority);
+    if let Ok(mut pattern) = FlowPattern::from_layered_pattern(lpattern) {
+        let mut action = FlowAction::new(port.id);
+        action.append_jump(to_group);
         action.finish();
 
         create_rule(lpattern, port, attr, &mut pattern, &mut action)
@@ -464,5 +589,159 @@ pub(crate) fn flush_rules(port: &Port) {
                 msg.to_str().unwrap()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn udp_ne_port(field: &str, value: u64) -> Predicate {
+        Predicate::Binary {
+            protocol: protocol!("udp"),
+            field: field!(field),
+            op: BinOp::Ne,
+            value: Value::Int(value),
+        }
+    }
+
+    fn udp_eq_port(field: &str, value: u64) -> Predicate {
+        Predicate::Binary {
+            protocol: protocol!("udp"),
+            field: field!(field),
+            op: BinOp::Eq,
+            value: Value::Int(value),
+        }
+    }
+
+    #[test]
+    fn excludable_alone_is_safe() {
+        // "udp and udp.src_port != 1234 and udp.dst_port != 1234" is the
+        // only disjunct: nothing else in the filter could accept port 1234,
+        // so it's safe to redirect it in hardware.
+        let excluding = FlatPattern {
+            predicates: vec![
+                Predicate::Unary {
+                    protocol: protocol!("udp"),
+                },
+                udp_ne_port("src_port", 1234),
+                udp_ne_port("dst_port", 1234),
+            ],
+            as_str: None,
+        };
+        let excl_pred = udp_eq_port("dst_port", 1234);
+        assert!(globally_excludable(&excl_pred, &[excluding]));
+    }
+
+    #[test]
+    fn bare_protocol_sibling_blocks_exclusion() {
+        // "udp and udp.port != 1234" alongside a bare "udp" disjunct: the
+        // bare pattern accepts port 1234 too, so it must NOT be dropped in
+        // hardware even though one disjunct excludes it.
+        let excluding = FlatPattern {
+            predicates: vec![
+                Predicate::Unary {
+                    protocol: protocol!("udp"),
+                },
+                udp_ne_port("src_port", 1234),
+                udp_ne_port("dst_port", 1234),
+            ],
+            as_str: None,
+        };
+        let bare_udp = FlatPattern {
+            predicates: vec![Predicate::Unary {
+                protocol: protocol!("udp"),
+            }],
+            as_str: None,
+        };
+        let excl_pred = udp_eq_port("dst_port", 1234);
+        assert!(!globally_excludable(&excl_pred, &[excluding, bare_udp]));
+    }
+
+    #[test]
+    fn disjoint_protocol_sibling_is_safe() {
+        // "tcp" as a sibling disjunct can never match a udp-specific
+        // exclusion, so it shouldn't block hardware-dropping the port.
+        let excluding = FlatPattern {
+            predicates: vec![
+                Predicate::Unary {
+                    protocol: protocol!("udp"),
+                },
+                udp_ne_port("src_port", 1234),
+                udp_ne_port("dst_port", 1234),
+            ],
+            as_str: None,
+        };
+        let tcp_only = FlatPattern {
+            predicates: vec![Predicate::Unary {
+                protocol: protocol!("tcp"),
+            }],
+            as_str: None,
+        };
+        let excl_pred = udp_eq_port("dst_port", 1234);
+        assert!(globally_excludable(&excl_pred, &[excluding, tcp_only]));
+    }
+
+    #[test]
+    fn sibling_excluding_different_value_blocks_exclusion() {
+        // A sibling that excludes a *different* port (5246) doesn't
+        // restrict 1234 at all, so it would still accept port 1234 traffic
+        // -- must not be dropped in hardware.
+        let excluding = FlatPattern {
+            predicates: vec![
+                Predicate::Unary {
+                    protocol: protocol!("udp"),
+                },
+                udp_ne_port("src_port", 1234),
+                udp_ne_port("dst_port", 1234),
+            ],
+            as_str: None,
+        };
+        let other_exclusion = FlatPattern {
+            predicates: vec![
+                Predicate::Unary {
+                    protocol: protocol!("udp"),
+                },
+                udp_ne_port("src_port", 5246),
+                udp_ne_port("dst_port", 5246),
+            ],
+            as_str: None,
+        };
+        let excl_pred = udp_eq_port("dst_port", 1234);
+        assert!(!globally_excludable(
+            &excl_pred,
+            &[excluding, other_exclusion]
+        ));
+    }
+
+    #[test]
+    fn sibling_excluding_same_value_is_safe() {
+        // A sibling that excludes the *same* port is consistent -- both
+        // disjuncts agree port 1234 should never reach software, so it's
+        // still safe to drop in hardware.
+        let excluding = FlatPattern {
+            predicates: vec![
+                Predicate::Unary {
+                    protocol: protocol!("udp"),
+                },
+                udp_ne_port("src_port", 1234),
+                udp_ne_port("dst_port", 1234),
+            ],
+            as_str: None,
+        };
+        let other_excluding_same = FlatPattern {
+            predicates: vec![
+                Predicate::Unary {
+                    protocol: protocol!("udp"),
+                },
+                udp_ne_port("dst_port", 1234),
+            ],
+            as_str: None,
+        };
+        let excl_pred = udp_eq_port("dst_port", 1234);
+        assert!(globally_excludable(
+            &excl_pred,
+            &[excluding, other_excluding_same]
+        ));
     }
 }
