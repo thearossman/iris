@@ -21,8 +21,10 @@ use iris_core::protocols::packet::ipv4::Ipv4;
 use iris_core::protocols::packet::ipv6::Ipv6;
 use iris_core::protocols::packet::tcp::{Tcp, TCP_PROTOCOL};
 use iris_core::protocols::packet::Packet;
-use iris_core::{L4Pdu, Mbuf};
+use iris_core::{FiveTuple, L4Pdu, Mbuf};
 use serde::Serialize;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 pub const WINDOW_SECS: u64 = 10;
@@ -30,6 +32,28 @@ pub const WINDOW_SECS: u64 = 10;
 // Pre-compute the Duration once so the per-packet comparison is a simple
 // 128-bit integer compare against a constant.
 const WINDOW_DURATION: Duration = Duration::from_secs(WINDOW_SECS);
+
+/// Deterministic per-connection offset into `[0, WINDOW_DURATION)`, used to
+/// phase-shift each connection's first window boundary.
+///
+/// Without this, every connection's first `next_boundary` is `first_pkt.ts +
+/// WINDOW_DURATION`, and `first_pkt.ts` is a batched RX-loop timestamp shared
+/// by many packets (see `L4Pdu::ts`), not a per-packet clock read. In live
+/// traffic, most connections are already in progress when capture starts, so
+/// a large fraction of them get *the same* `ts` and therefore the same
+/// boundary: all their windows finalize (Welford/TCP-window math + JSON
+/// serialization) in the same handful of RX-loop iterations, stalling
+/// `rte_eth_rx_burst` long enough to overflow the RX ring. Hashing the
+/// five-tuple spreads that population evenly across the window period; since
+/// `update()` advances `next_boundary` by a fixed `WINDOW_DURATION` each time,
+/// the phase offset persists for the life of the connection rather than
+/// resynchronizing on a later boundary.
+fn stagger_offset(pdu: &L4Pdu) -> Duration {
+    let five_tuple = FiveTuple::from_ctxt(&pdu.ctxt);
+    let mut hasher = DefaultHasher::new();
+    five_tuple.hash(&mut hasher);
+    Duration::from_millis(hasher.finish() % WINDOW_DURATION.as_millis() as u64)
+}
 
 // ---------------------------------------------------------------------------
 // Welford online variance — min/max variant (TCP window stats)
@@ -298,10 +322,14 @@ pub struct FlowWindows {
     completed: Vec<WindowRecord>,
     curr: WindowAcc,
     curr_start: Instant,
-    /// Next WINDOW_DURATION boundary to check against. Unlike `curr_start`,
-    /// this always advances by exactly one WINDOW_DURATION per boundary
-    /// crossing, even when the window at that boundary is idle and folded
-    /// forward instead of flushed (see `flush_window`).
+    /// Next WINDOW_DURATION boundary to check against. Initialized to a
+    /// per-connection staggered offset (see `stagger_offset`) rather than
+    /// exactly `start_ts + WINDOW_DURATION`, so windows across connections
+    /// don't all close in the same RX-loop iterations. After that, it always
+    /// advances by exactly one WINDOW_DURATION per boundary crossing (which
+    /// preserves the stagger for the life of the connection), even when the
+    /// window at that boundary is idle and folded forward instead of flushed
+    /// (see `flush_window`).
     next_boundary: Instant,
     curr_idx: u32,
     orig_last_ts: Option<Instant>,
@@ -322,7 +350,11 @@ impl FlowWindows {
             completed: Vec::new(),
             curr: WindowAcc::default(),
             curr_start: now,
-            next_boundary: now + WINDOW_DURATION,
+            // See `stagger_offset`: the first window closes somewhere in
+            // [0, WINDOW_DURATION) rather than always at exactly
+            // WINDOW_DURATION, so connections' flush work spreads out over
+            // time instead of clustering on shared RX-loop timestamps.
+            next_boundary: now + stagger_offset(first_pkt),
             curr_idx: 0,
             orig_last_ts: None,
             resp_last_ts: None,
