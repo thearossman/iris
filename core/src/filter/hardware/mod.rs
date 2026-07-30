@@ -30,10 +30,9 @@ const LOW_PRIORITY: u32 = 3;
 #[derive(Debug)]
 pub(crate) struct HardwareFilter<'a> {
     patterns: Vec<LayeredPattern>,
-    // `!=` predicates realized as redirect rules: exact-match on the
-    // excluded value, jumping to the default drop table instead of RSS.
-    // Installed ahead of `patterns` (see `install`), since a NIC can't
-    // match a negation directly.
+    // `!=` predicates realized as drop rules: exact-match on the excluded
+    // value, dropped instead of RSS'd. Installed ahead of `patterns` (see
+    // `install`), since a NIC can't match a negation directly.
     exclude_patterns: Vec<LayeredPattern>,
     port: &'a Port,
 }
@@ -74,8 +73,8 @@ impl<'a> HardwareFilter<'a> {
         layered.dedup();
 
         // `retain_hardware_predicates` drops `!=` predicates above, since a
-        // NIC can't match a negation directly. Build a redirect rule for
-        // each one instead -- see `hw_excludable`/`install`.
+        // NIC can't match a negation directly. Build a drop rule for each
+        // one instead -- see `hw_excludable`/`install`.
         let mut exclude_patterns = vec![];
         for pattern in original_patterns.iter() {
             for pred in pattern.predicates.iter() {
@@ -129,7 +128,7 @@ impl<'a> HardwareFilter<'a> {
         // Exclusions go in first, ahead of the accept patterns they carve
         // exceptions out of.
         for pattern in self.exclude_patterns.iter() {
-            install_redirect_pattern(pattern, self.port, 0, EXCLUDE_PRIORITY, 1)?;
+            install_drop_pattern(pattern, self.port, 0, EXCLUDE_PRIORITY)?;
         }
         for pattern in self.patterns.iter() {
             install_pattern(pattern, self.port, 0, HIGH_PRIORITY)?;
@@ -147,7 +146,7 @@ impl fmt::Display for HardwareFilter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         writeln!(f, "[HardwareFilter]: ")?;
         for pattern in self.exclude_patterns.iter() {
-            writeln!(f, "REDIRECT (!=) {}", pattern.to_flat_pattern())?;
+            writeln!(f, "DROP (!=) {}", pattern.to_flat_pattern())?;
         }
         for pattern in self.patterns.iter() {
             writeln!(f, "{}", pattern.to_flat_pattern())?;
@@ -218,7 +217,7 @@ pub(crate) fn device_supported(pred: &Predicate, port: &Port) -> bool {
     // For example, a collision detected or device resource limitations.
     // Hardware Rules are created on table 0 (group 0) with high priority
     // matching.
-    let pred_supported = predicate_supported(pred, port, 0, HIGH_PRIORITY);
+    let pred_supported = predicate_supported(pred, port, 0, HIGH_PRIORITY, false);
     if !pred_supported {
         info!("Hardware filter does not support predicate: [{}]", pred);
         return false;
@@ -229,7 +228,7 @@ pub(crate) fn device_supported(pred: &Predicate, port: &Port) -> bool {
 // NICs can't match a `!=` directly -- MLX5 only has equality/masked
 // matches, no "not equal" primitive. If `pred` is a `!=` on a hardware
 // protocol, this returns the equivalent `Eq` predicate on the excluded
-// value, which `HardwareFilter::new` turns into a higher-priority redirect
+// value, which `HardwareFilter::new` turns into a higher-priority drop
 // rule instead (see `install`).
 fn hw_excludable(pred: &Predicate, port: &Port) -> Option<Predicate> {
     let Predicate::Binary {
@@ -256,7 +255,7 @@ fn hw_excludable(pred: &Predicate, port: &Port) -> Option<Predicate> {
         op: BinOp::Eq,
         value: value.clone(),
     };
-    predicate_supported(&eq_pred, port, 0, EXCLUDE_PRIORITY).then_some(eq_pred)
+    predicate_supported(&eq_pred, port, 0, EXCLUDE_PRIORITY, true).then_some(eq_pred)
 }
 
 // True if no disjunct of the filter would accept `excl_pred`'s value (the
@@ -275,7 +274,17 @@ fn globally_excludable(excl_pred: &Predicate, all_patterns: &[FlatPattern]) -> b
     all_patterns.iter().all(|p| p.is_excl(&singleton))
 }
 
-fn predicate_supported(predicate: &Predicate, port: &Port, group: u32, priority: u32) -> bool {
+// `as_drop` selects which action the dry-run validates against, so it
+// matches whatever `HardwareFilter::install` will actually install --
+// validating one action shape and installing a different one is exactly
+// how the missing-jump-conf bug slipped through before.
+fn predicate_supported(
+    predicate: &Predicate,
+    port: &Port,
+    group: u32,
+    priority: u32,
+    as_drop: bool,
+) -> bool {
     let pattern = FlatPattern {
         predicates: vec![predicate.to_owned()],
         as_str: None,
@@ -283,10 +292,16 @@ fn predicate_supported(predicate: &Predicate, port: &Port, group: u32, priority:
     let fq_patterns = pattern.to_fully_qualified().expect("fully qualified");
     fq_patterns
         .iter()
-        .all(|p| pattern_supported(p, port, group, priority))
+        .all(|p| pattern_supported(p, port, group, priority, as_drop))
 }
 
-fn pattern_supported(lpattern: &LayeredPattern, port: &Port, group: u32, priority: u32) -> bool {
+fn pattern_supported(
+    lpattern: &LayeredPattern,
+    port: &Port,
+    group: u32,
+    priority: u32,
+    as_drop: bool,
+) -> bool {
     let attr = FlowAttribute::new(group, priority);
     let pattern = FlowPattern::from_layered_pattern(lpattern);
     // debug!("lpattern: {}", lpattern);
@@ -294,7 +309,11 @@ fn pattern_supported(lpattern: &LayeredPattern, port: &Port, group: u32, priorit
         Ok(mut pattern) => {
             let mut action = FlowAction::new(port.id);
 
-            action.append_rss();
+            if as_drop {
+                action.append_drop();
+            } else {
+                action.append_rss();
+            }
             action.finish();
 
             validate_rule(port, attr, &mut pattern, &mut action)
@@ -367,21 +386,21 @@ fn install_pattern(
     }
 }
 
-// Same as `install_pattern`, but jumps to `to_group` instead of RSS-ing.
-// For `!=` exclusions, `to_group` is the same drop table that unmatched
-// traffic already falls into via `add_redirect`, so this gets the effect
-// of a DROP action without actually using one.
-fn install_redirect_pattern(
+// Same as `install_pattern`, but drops matching traffic instead of RSS-ing
+// it. Used for `!=` exclusions -- redirecting to the same table unmatched
+// traffic falls into doesn't actually drop anything on this hardware
+// without isolated mode enabled, which nothing here turns on, so this
+// drops the excluded value outright instead.
+fn install_drop_pattern(
     lpattern: &LayeredPattern,
     port: &Port,
     group: u32,
     priority: u32,
-    to_group: u32,
 ) -> Result<()> {
     let attr = FlowAttribute::new(group, priority);
     if let Ok(mut pattern) = FlowPattern::from_layered_pattern(lpattern) {
         let mut action = FlowAction::new(port.id);
-        action.append_jump(to_group);
+        action.append_drop();
         action.finish();
 
         create_rule(lpattern, port, attr, &mut pattern, &mut action)
@@ -416,8 +435,6 @@ fn create_rule(
             action.rss[0].queue_num = port.queue_map.len() as u32;
             action.rss[0].queue = reta_raw.as_ptr();
             a.conf = &action.rss[0] as *const _ as *const c_void;
-        } else if let dpdk::rte_flow_action_type_RTE_FLOW_ACTION_TYPE_JUMP = a.type_ {
-            a.conf = &action.jump[0] as *const _ as *const c_void;
         }
     }
 
@@ -620,7 +637,7 @@ mod tests {
     fn excludable_alone_is_safe() {
         // "udp and udp.src_port != 1234 and udp.dst_port != 1234" is the
         // only disjunct: nothing else in the filter could accept port 1234,
-        // so it's safe to redirect it in hardware.
+        // so it's safe to drop it in hardware.
         let excluding = FlatPattern {
             predicates: vec![
                 Predicate::Unary {
