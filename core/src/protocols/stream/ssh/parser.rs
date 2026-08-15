@@ -239,55 +239,169 @@ impl Ssh {
     }
 
     pub(crate) fn process(&mut self, data: &[u8], dir: bool) -> ParseResult {
-        let mut status = ParseResult::Continue(0);
         log::trace!("process ({} bytes)", data.len());
 
+        let mut rest = data;
+        let mut parsed_any = false;
+
+        // The identification string ("SSH-...\r\n") opens the connection, and peers
+        // routinely coalesce it with the binary key-exchange packets that follow. Consume
+        // it off the front and keep going, rather than treating the whole segment as
+        // version data and discarding whatever came with it.
         let ssh_identifier = b"SSH-";
-        if data
+        if let Some(pos) = rest
             .windows(ssh_identifier.len())
             .position(|window| window == ssh_identifier)
-            .map(|p| &data[p..])
-            .is_some()
         {
-            self.parse_version_exchange(data, dir);
-            status = ParseResult::Continue(0);
-        } else {
-            match ssh_parser::parse_ssh_packet(data) {
-                Ok((_, (pkt, _))) => {
-                    match pkt {
-                        SshPacket::KeyExchange(_) => {
-                            self.parse_key_exchange(data);
-                            status = ParseResult::Continue(0);
-                        }
-                        SshPacket::DiffieHellmanInit(_) => {
-                            self.parse_dh_client_init(data);
-                            status = ParseResult::Continue(0);
-                        }
-                        SshPacket::DiffieHellmanReply(_) => {
-                            self.parse_dh_server_response(data);
-                            status = ParseResult::Continue(0);
-                        }
-                        SshPacket::NewKeys => {
-                            let remaining = self.parse_new_keys(data, dir);
-
-                            // finish parsing when client and server have both sent a NewKeys packet
-                            if self.client_new_keys.is_some() && self.server_new_keys.is_some() {
-                                if remaining > 0 && remaining < data.len() {
-                                    self.last_body_offset = Some(data.len() - remaining - 1);
-                                }
-                                return ParseResult::HeadersDone(0);
-                            }
-                            status = ParseResult::Continue(0);
-                        }
-                        _ => (),
-                    }
+            self.parse_version_exchange(&rest[pos..], dir);
+            match ssh_parser::parse_ssh_identification(&rest[pos..]) {
+                Ok((remaining, _)) => {
+                    parsed_any = true;
+                    rest = remaining;
                 }
-                e => {
-                    log::debug!("parse error: {:?}", e);
-                    status = ParseResult::Skipped;
+                // Identification line is incomplete (split across segments); nothing
+                // reliable follows it in this segment.
+                Err(e) => {
+                    log::debug!("incomplete SSH identification: {:?}", e);
+                    return ParseResult::Continue(0);
                 }
             }
         }
-        status
+
+        // A single TCP segment routinely carries several SSH packets back-to-back -- most
+        // importantly a server's final key-exchange packet immediately followed by
+        // NEWKEYS. `parse_ssh_packet` consumes only the first packet and returns the rest,
+        // so drain the whole segment; inspecting just the first packet would miss the
+        // NEWKEYS that ends the cleartext handshake.
+        while !rest.is_empty() {
+            let (remaining, pkt) = match ssh_parser::parse_ssh_packet(rest) {
+                Ok((remaining, (pkt, _))) => (remaining, pkt),
+                Err(e) => {
+                    log::debug!("parse error: {:?}", e);
+                    break;
+                }
+            };
+            parsed_any = true;
+
+            match pkt {
+                SshPacket::KeyExchange(_) => self.parse_key_exchange(rest),
+                SshPacket::DiffieHellmanInit(_) => self.parse_dh_client_init(rest),
+                SshPacket::DiffieHellmanReply(_) => self.parse_dh_server_response(rest),
+                SshPacket::NewKeys => {
+                    self.parse_new_keys(rest, dir);
+
+                    // Handshake is over once both peers have sent NEWKEYS.
+                    if self.client_new_keys.is_some() && self.server_new_keys.is_some() {
+                        // Anything trailing NEWKEYS in this segment is encrypted payload.
+                        if !remaining.is_empty() {
+                            self.last_body_offset = Some(data.len() - remaining.len());
+                        }
+                        return ParseResult::HeadersDone(0);
+                    }
+                }
+                _ => {}
+            }
+
+            rest = remaining;
+        }
+
+        if parsed_any {
+            ParseResult::Continue(0)
+        } else {
+            ParseResult::Skipped
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds one SSH binary packet (RFC 4253 §6) wrapping `payload`:
+    /// `uint32 packet_length | byte padding_length | payload | padding`,
+    /// where `packet_length` covers everything after itself.
+    fn ssh_packet(payload: &[u8]) -> Vec<u8> {
+        let padding_len: u8 = 8;
+        let packet_len = 1 + payload.len() + padding_len as usize;
+        let mut out = Vec::new();
+        out.extend_from_slice(&(packet_len as u32).to_be_bytes());
+        out.push(padding_len);
+        out.extend_from_slice(payload);
+        out.extend(std::iter::repeat_n(0u8, padding_len as usize));
+        out
+    }
+
+    /// SSH_MSG_NEWKEYS (21) -- the message that ends the cleartext handshake.
+    fn newkeys() -> Vec<u8> {
+        ssh_packet(&[21])
+    }
+
+    /// SSH_MSG_IGNORE (2) with an empty string payload -- stands in for any
+    /// handshake packet that a server may send immediately before NEWKEYS.
+    fn ignore_msg() -> Vec<u8> {
+        ssh_packet(&[2, 0, 0, 0, 0])
+    }
+
+    #[test]
+    fn newkeys_alone_in_each_segment_ends_the_handshake() {
+        let mut ssh = Ssh::new();
+        assert_eq!(ssh.process(&newkeys(), true), ParseResult::Continue(0));
+        assert!(ssh.client_new_keys.is_some());
+        assert_eq!(ssh.process(&newkeys(), false), ParseResult::HeadersDone(0));
+        assert!(ssh.server_new_keys.is_some());
+    }
+
+    #[test]
+    fn version_string_coalesced_with_binary_packets_does_not_hide_them() {
+        let mut ssh = Ssh::new();
+        assert_eq!(ssh.process(&newkeys(), true), ParseResult::Continue(0));
+
+        // Server sends its identification line and immediately follows it with binary
+        // key-exchange traffic in the same segment.
+        let mut segment = b"SSH-2.0-OpenSSH_8.9\r\n".to_vec();
+        segment.extend_from_slice(&newkeys());
+
+        assert_eq!(ssh.process(&segment, false), ParseResult::HeadersDone(0));
+        assert!(ssh.server_version_exchange.is_some());
+        assert!(
+            ssh.server_new_keys.is_some(),
+            "binary packet coalesced behind the identification string was missed"
+        );
+    }
+
+    #[test]
+    fn trailing_payload_after_newkeys_sets_body_offset() {
+        let mut ssh = Ssh::new();
+        assert_eq!(ssh.process(&newkeys(), true), ParseResult::Continue(0));
+
+        let mut segment = newkeys();
+        let body_start = segment.len();
+        segment.extend_from_slice(&[0xAA; 32]); // encrypted payload riding along
+
+        assert_eq!(ssh.process(&segment, false), ParseResult::HeadersDone(0));
+        assert_eq!(ssh.last_body_offset, Some(body_start));
+    }
+
+    #[test]
+    fn non_ssh_data_is_skipped() {
+        let mut ssh = Ssh::new();
+        assert_eq!(ssh.process(&[0xFF; 24], true), ParseResult::Skipped);
+    }
+
+    #[test]
+    fn newkeys_coalesced_behind_another_packet_still_ends_the_handshake() {
+        let mut ssh = Ssh::new();
+        assert_eq!(ssh.process(&newkeys(), true), ParseResult::Continue(0));
+
+        // A real server commonly writes its final key-exchange packet and NEWKEYS
+        // back-to-back, so TCP delivers them in one segment.
+        let mut segment = ignore_msg();
+        segment.extend_from_slice(&newkeys());
+
+        assert_eq!(ssh.process(&segment, false), ParseResult::HeadersDone(0));
+        assert!(
+            ssh.server_new_keys.is_some(),
+            "NEWKEYS coalesced behind another packet in the same segment was missed"
+        );
     }
 }
