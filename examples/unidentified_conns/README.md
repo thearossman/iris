@@ -32,6 +32,18 @@ connections and shows no lockstep on sequential ephemeral ports.
 pins a connection to a single core for its lifetime, so no connection is split across files, and
 the writer is touched once per *written connection* rather than once per packet.
 
+**Unanswered SYNs are excluded.** A TCP connection whose responder never sends a single packet
+is a scan, backscatter, or a failed connect. It has no payload to identify by definition, so
+recording it says nothing about parser coverage while burying the genuinely unknown traffic —
+on a real link this class can be three quarters of everything unidentified. These are dropped at
+teardown, which is the earliest point at which "no response ever arrived" is knowable.
+
+The rule is deliberately narrow: it drops connections with *no responder packet at all*, not all
+zero-payload connections. A refused connect (SYN → RST) and a connection that completes its
+handshake but exchanges no data were both answered, so both are kept and still appear as
+`tcp-no-payload`. Verified on `small_flows.pcap`: of 29 unanswered TCP streams, none carried any
+payload, and excluding them left the count of every other protocol bucket exactly unchanged.
+
 **A frame cap bounds each connection.** Sampled connections buffer frames until teardown, so a
 single long-lived connection could otherwise grow without limit. `--max-frames` (default 128)
 caps what is kept; a connection that hits it stays subscribed and simply stops buffering, since
@@ -63,6 +75,7 @@ This writes one `unidentified_core<N>.pcap` per core and reports what it kept:
 
 ```
 Sampled 1 in 1 connections. Of those, identified 349 by parsing and wrote 283 unidentified ones to unidentified_core*.pcap
+Skipped 29 unanswered SYNs (TCP connections the responder never answered).
 ```
 
 Both counts cover sampled connections only — unsampled ones unsubscribe on their first packet and
@@ -89,7 +102,7 @@ Three labels come from the script rather than from a protocol name:
 
 | Label | Meaning |
 |-------|---------|
-| `<transport>-no-payload` | The connection carried no payload at all (e.g. an unanswered SYN) |
+| `<transport>-no-payload` | The connection carried no payload (e.g. a refused connect, or a handshake with no data). Unanswered SYNs are excluded upstream and never appear |
 | `data-unparsed` | Payload was present but opaque to every dissector `tshark` tried |
 | anything else | The protocol `tshark` dissected directly above the transport layer |
 

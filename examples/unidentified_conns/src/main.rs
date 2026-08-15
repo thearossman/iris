@@ -21,6 +21,7 @@
 
 use clap::Parser;
 use iris_compiler::{callback, callback_fn, input_files, iris_end_macros};
+use iris_core::protocols::packet::tcp::TCP_PROTOCOL;
 use iris_core::protocols::stream::SessionProto;
 use iris_core::subscription::StreamingCallback;
 use iris_core::{config::load_config, CoreId, FiveTuple, L4Pdu, Runtime};
@@ -74,6 +75,8 @@ static CONNS_IDENTIFIED: AtomicUsize = AtomicUsize::new(0);
 static CONNS_WRITTEN: AtomicUsize = AtomicUsize::new(0);
 /// Written connections that hit [`MAX_FRAMES`] and so appear truncated in the capture.
 static CONNS_TRUNCATED: AtomicUsize = AtomicUsize::new(0);
+/// TCP connections dropped because the responder never sent anything (unanswered SYNs).
+static CONNS_UNANSWERED: AtomicUsize = AtomicUsize::new(0);
 
 /// Decides whether a connection joins the sample, purely from its five-tuple.
 ///
@@ -120,6 +123,12 @@ struct SampledConn {
     sampled: bool,
     frames: Vec<Vec<u8>>,
     truncated: bool,
+    /// TCP connections that never draw a single packet from the responder are unanswered SYNs:
+    /// scans, backscatter, and failed connects. They have no payload to identify by definition,
+    /// so recording them buries the genuinely unknown traffic. Tracked here and dropped at
+    /// teardown -- whether a response ever arrives is not knowable until then.
+    is_tcp: bool,
+    saw_responder: bool,
 }
 
 impl StreamingCallback for SampledConn {
@@ -130,6 +139,8 @@ impl StreamingCallback for SampledConn {
             sampled: should_sample(&FiveTuple::from_ctxt(&first_pkt.ctxt)),
             frames: Vec::new(),
             truncated: false,
+            is_tcp: first_pkt.ctxt.proto == TCP_PROTOCOL,
+            saw_responder: false,
         }
     }
 
@@ -157,6 +168,8 @@ impl SampledConn {
         if !self.sampled {
             return false;
         }
+        // `dir` is true for orig -> resp, so anything else is the responder answering.
+        self.saw_responder |= !pdu.dir;
         if self.frames.len() < MAX_FRAMES.load(Ordering::Relaxed) {
             self.frames.push(pdu.mbuf_ref().data().to_vec());
         } else {
@@ -170,6 +183,13 @@ impl SampledConn {
     /// finished either way and there is nothing further to receive.
     #[callback_fn("SampledConn,level=L4Terminated")]
     fn finalize(&mut self, proto: &SessionProto, core_id: &CoreId) -> bool {
+        // Checked before anything else: an unanswered SYN is not evidence about parser
+        // coverage either way, so it should not land in the capture or in the counts.
+        if self.is_tcp && !self.saw_responder {
+            CONNS_UNANSWERED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
         // `Null` means every registered parser rejected the connection; `Probing` means
         // discovery never concluded (e.g. a connection too short to classify).
         if !matches!(proto, SessionProto::Null | SessionProto::Probing) {
@@ -309,6 +329,11 @@ fn main() {
         CONNS_WRITTEN.load(Ordering::Relaxed),
         args.outfile_prefix,
     );
+    println!(
+        "Skipped {} unanswered SYNs (TCP connections the responder never answered).",
+        CONNS_UNANSWERED.load(Ordering::Relaxed)
+    );
+
     let truncated = CONNS_TRUNCATED.load(Ordering::Relaxed);
     if truncated > 0 {
         println!(
