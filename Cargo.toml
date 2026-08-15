@@ -11,6 +11,7 @@ members = [
     "examples/open_vpn",
     "examples/combined",
     "examples/websites",
+    "examples/unidentified_conns",
     "tests/functionality/basic_test",
     "tests/functionality/basic_streaming",
     "tests/functionality/basic_tracked", "tests/functionality/weird_combos", "tests/functionality/filter_test",
