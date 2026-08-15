@@ -55,6 +55,38 @@ identified from the start of a connection. Measured on `small_flows.pcap`, cappi
 drops 13% of frames and produces a byte-identical protocol ranking; even an aggressive cap of 8
 frames drops 74% of frames and moves just one connection out of 632.
 
+## IP anonymization
+
+Pass `--anon-key` to rewrite every frame's source and destination IP with
+[Crypto-PAn](https://en.wikipedia.org/wiki/Crypto-PAn) (Xu, Fan, Ammar & Moore, 2002) before it's
+written, so a capture meant to leave a trusted network doesn't carry real addresses:
+
+```
+openssl rand -out anon.key 32
+./target/release/unidentified_conns --config configs/offline.toml --anon-key anon.key
+```
+
+Anonymization is **prefix-preserving** — two hosts sharing a real `/24` still share an anonymized
+one, so subnet-level structure survives even though individual addresses don't. It runs once per
+*written* connection, in `finalize`, right before the frames hit disk, so identified and unsampled
+connections never pay for it. It applies to IPv4 and IPv6; MAC addresses and everything above the
+IP layer (ports, payload) are untouched.
+
+`--anon-bits-v4`/`--anon-bits-v6` (default: full address, 32/128) restrict anonymization to the
+trailing N bits, leaving the leading bits — and therefore coarse subnet/geo/ASN information — in
+plaintext. `--anon-bits-v4 8` anonymizes only the last octet of every IPv4 address, for example.
+
+The same key always produces the same mapping, so running the app twice against the same traffic
+with the same keyfile yields comparable output — useful for correlating captures taken on
+different days. Anyone with the keyfile can reverse the mapping for a *known* address (Crypto-PAn
+is prefix-preserving, not one-way), so treat it like any other secret and don't ship it alongside
+the capture.
+
+Only the IPv4 header checksum is recomputed after rewriting. TCP/UDP checksums, which also cover
+the addresses via the pseudo-header, are left stale — this matches most captures already, since
+checksum offload means on-the-wire transport checksums are frequently invalid before anonymization
+even runs, and `tshark` does not validate them by default. IPv6 has no header checksum to fix.
+
 ## Usage
 
 Build from the repo root:
@@ -76,6 +108,7 @@ This writes one `unidentified_core<N>.pcap` per core and reports what it kept:
 ```
 Sampled 1 in 1 connections. Of those, identified 349 by parsing and wrote 283 unidentified ones to unidentified_core*.pcap
 Skipped 29 unanswered SYNs (TCP connections the responder never answered).
+IP addresses in the capture were anonymized with Crypto-PAn.
 ```
 
 Both counts cover sampled connections only — unsampled ones unsubscribe on their first packet and
@@ -116,6 +149,9 @@ Three labels come from the script rather than from a protocol name:
 | `--outfile-prefix` | `unidentified` | Per-core captures are written as `<prefix>_core<N>.pcap` |
 | `--sample-rate` | `100` | Record one in every N connections; `1` records all of them |
 | `--max-frames` | `128` | Keep at most N frames per sampled connection; `0` for no limit |
+| `--anon-key` | (none) | Path to a 32-byte key file; if given, IPs are anonymized with Crypto-PAn |
+| `--anon-bits-v4` | `32` | Trailing IPv4 bits to anonymize (only meaningful with `--anon-key`) |
+| `--anon-bits-v6` | `128` | Trailing IPv6 bits to anonymize (only meaningful with `--anon-key`) |
 
 ### Script
 
@@ -142,3 +178,5 @@ directory. The script requires `tshark` (`sudo apt install tshark`).
 - The `parsers=` key on the callback filter is what registers all seven Iris parsers. Iris only
   compiles in the parsers some filter or datatype actually needs, so without it no parsing would
   happen and *every* connection would look unidentified.
+- **Without `--anon-key`, captures carry real IP addresses.** The run summary states which mode
+  was used on every run, so it's visible rather than silent.

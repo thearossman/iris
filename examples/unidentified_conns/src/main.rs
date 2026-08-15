@@ -18,8 +18,18 @@
 //! `identify_protocols.sh` script reads the whole set back and post-processes it with `tshark`,
 //! whose independent dissectors work out what the leftover traffic actually is -- again by
 //! parsing, not by assuming a port number implies a protocol.
+//!
+//! ## IP anonymization
+//! Passing `--anon-key` rewrites the source and destination IP address of every frame with
+//! Crypto-PAn (`cryptopan` module) before it is written, so a capture meant to leave a trusted
+//! network does not carry real addresses. Anonymization is prefix-preserving -- two hosts that
+//! share a real subnet still share an anonymized one -- and runs once per written connection,
+//! in `finalize`, so connections that turn out to be identified or unsampled never pay for it.
+
+mod cryptopan;
 
 use clap::Parser;
+use cryptopan::CryptoPAN;
 use iris_compiler::{callback, callback_fn, input_files, iris_end_macros};
 use iris_core::protocols::packet::tcp::TCP_PROTOCOL;
 use iris_core::protocols::stream::SessionProto;
@@ -27,7 +37,7 @@ use iris_core::subscription::StreamingCallback;
 use iris_core::{config::load_config, CoreId, FiveTuple, L4Pdu, Runtime};
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -57,6 +67,22 @@ struct Args {
     /// a single long-lived connection can hold before it terminates.
     #[clap(short, long, value_name = "N", default_value_t = 128)]
     max_frames: usize,
+
+    /// Path to a 32-byte binary key file. If given, every frame's source and destination IP
+    /// is rewritten with Crypto-PAn before being written out. Generate one with:
+    /// `openssl rand -out anon.key 32`. If omitted, captures carry real IP addresses.
+    #[clap(short, long, parse(from_os_str), value_name = "FILE")]
+    anon_key: Option<PathBuf>,
+
+    /// Trailing bits of each IPv4 address to anonymize; leading bits are left in plaintext.
+    /// Only meaningful with --anon-key.
+    #[clap(long, value_name = "N", default_value_t = 32)]
+    anon_bits_v4: u32,
+
+    /// Trailing bits of each IPv6 address to anonymize; leading bits are left in plaintext.
+    /// Only meaningful with --anon-key.
+    #[clap(long, value_name = "N", default_value_t = 128)]
+    anon_bits_v6: u32,
 }
 
 /// Sampling denominator, read once per connection by [`SampledConn::new`].
@@ -77,6 +103,10 @@ static CONNS_WRITTEN: AtomicUsize = AtomicUsize::new(0);
 static CONNS_TRUNCATED: AtomicUsize = AtomicUsize::new(0);
 /// TCP connections dropped because the responder never sent anything (unanswered SYNs).
 static CONNS_UNANSWERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Set only when `--anon-key` is given; `finalize` anonymizes a connection's frames iff this
+/// is populated, so omitting the flag costs nothing beyond the `Option` check.
+static CRYPTOPAN: OnceLock<CryptoPAN> = OnceLock::new();
 
 /// Decides whether a connection joins the sample, purely from its five-tuple.
 ///
@@ -197,6 +227,12 @@ impl SampledConn {
             return false;
         }
 
+        if let Some(cp) = CRYPTOPAN.get() {
+            for frame in &mut self.frames {
+                anonymize_frame(frame, cp);
+            }
+        }
+
         writer(core_id)
             .lock()
             .unwrap()
@@ -273,6 +309,104 @@ impl PcapWriter {
     }
 }
 
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const ETHERTYPE_IPV6: u16 = 0x86DD;
+const ETHERTYPE_VLAN: u16 = 0x8100;
+const ETHERTYPE_QINQ: u16 = 0x88A8;
+
+/// Rewrites the source and destination IP address of one Ethernet frame in place, using `cp`.
+///
+/// Frames Iris hands to subscribers are always carried over IPv4 or IPv6 -- its conntrack is
+/// scoped to IP-layer connections -- so only those two ethertypes are handled. Anything else
+/// (or a frame too short to hold a full header at the expected offset) is left untouched;
+/// that should not happen for frames this app buffers, but silently skipping rather than
+/// panicking means a malformed frame degrades to "not anonymized" instead of crashing the run.
+///
+/// VLAN tags (802.1Q and QinQ) are unwrapped first so the real ethertype is used.
+fn anonymize_frame(frame: &mut [u8], cp: &CryptoPAN) {
+    let mut offset = 14usize; // past dst MAC, src MAC, ethertype
+    if frame.len() < offset {
+        return;
+    }
+    let mut ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    while ethertype == ETHERTYPE_VLAN || ethertype == ETHERTYPE_QINQ {
+        if frame.len() < offset + 4 {
+            return;
+        }
+        ethertype = u16::from_be_bytes([frame[offset + 2], frame[offset + 3]]);
+        offset += 4;
+    }
+
+    match ethertype {
+        ETHERTYPE_IPV4 => anonymize_ipv4_header(frame, offset, cp),
+        ETHERTYPE_IPV6 => anonymize_ipv6_header(frame, offset, cp),
+        _ => {}
+    }
+}
+
+/// Rewrites the src/dst addresses of the IPv4 header at `frame[ip_off..]` and recomputes the
+/// header checksum over it.
+///
+/// The TCP/UDP checksum, which also covers the addresses via the pseudo-header, is
+/// deliberately left stale rather than recomputed. This matches most captures already:
+/// checksum offload means on-the-wire transport checksums are frequently invalid before this
+/// even runs, and `tshark` does not validate them by default (see the script's caveat note).
+/// Recomputing them would mean walking IPv4 options and the full payload for comparatively
+/// little benefit.
+fn anonymize_ipv4_header(frame: &mut [u8], ip_off: usize, cp: &CryptoPAN) {
+    if frame.len() < ip_off + 20 {
+        return;
+    }
+    let src = Ipv4Addr::new(
+        frame[ip_off + 12],
+        frame[ip_off + 13],
+        frame[ip_off + 14],
+        frame[ip_off + 15],
+    );
+    let dst = Ipv4Addr::new(
+        frame[ip_off + 16],
+        frame[ip_off + 17],
+        frame[ip_off + 18],
+        frame[ip_off + 19],
+    );
+    frame[ip_off + 12..ip_off + 16].copy_from_slice(&cp.anonymize_ipv4(src).octets());
+    frame[ip_off + 16..ip_off + 20].copy_from_slice(&cp.anonymize_ipv4(dst).octets());
+
+    // RFC 791 SS3.1: ones'-complement sum of all 16-bit header words, checksum field zeroed
+    // during the sum, complemented at the end.
+    let ihl = (frame[ip_off] & 0x0F) as usize * 4;
+    if ihl < 20 || frame.len() < ip_off + ihl {
+        return;
+    }
+    frame[ip_off + 10] = 0;
+    frame[ip_off + 11] = 0;
+    let mut sum: u32 = frame[ip_off..ip_off + ihl]
+        .chunks_exact(2)
+        .map(|w| u16::from_be_bytes([w[0], w[1]]) as u32)
+        .sum();
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    frame[ip_off + 10..ip_off + 12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+}
+
+/// Rewrites the src/dst addresses of the fixed 40-byte IPv6 header at `frame[ip_off..]`.
+/// IPv6 has no header checksum, unlike IPv4, so there is nothing to recompute here; the same
+/// stale-transport-checksum tradeoff described in `anonymize_ipv4_header` still applies.
+fn anonymize_ipv6_header(frame: &mut [u8], ip_off: usize, cp: &CryptoPAN) {
+    if frame.len() < ip_off + 40 {
+        return;
+    }
+    let mut src = [0u8; 16];
+    let mut dst = [0u8; 16];
+    src.copy_from_slice(&frame[ip_off + 8..ip_off + 24]);
+    dst.copy_from_slice(&frame[ip_off + 24..ip_off + 40]);
+    frame[ip_off + 8..ip_off + 24]
+        .copy_from_slice(&cp.anonymize_ipv6(Ipv6Addr::from(src)).octets());
+    frame[ip_off + 24..ip_off + 40]
+        .copy_from_slice(&cp.anonymize_ipv6(Ipv6Addr::from(dst)).octets());
+}
+
 #[input_files("$IRIS_HOME/datatypes/data.txt")]
 #[iris_end_macros]
 fn main() {
@@ -290,6 +424,22 @@ fn main() {
         },
         Ordering::Relaxed,
     );
+
+    if let Some(key_path) = &args.anon_key {
+        let key_bytes = std::fs::read(key_path)
+            .unwrap_or_else(|e| panic!("Failed to read {}: {}", key_path.display(), e));
+        let key: [u8; 32] = key_bytes.as_slice().try_into().unwrap_or_else(|_| {
+            panic!(
+                "{} must be exactly 32 bytes (got {}); generate one with `openssl rand -out {} 32`",
+                key_path.display(),
+                key_bytes.len(),
+                key_path.display()
+            )
+        });
+        CRYPTOPAN
+            .set(CryptoPAN::new(&key, args.anon_bits_v4, args.anon_bits_v6))
+            .expect("cryptopan already initialized");
+    }
 
     let config = load_config(&args.config);
 
@@ -333,6 +483,11 @@ fn main() {
         "Skipped {} unanswered SYNs (TCP connections the responder never answered).",
         CONNS_UNANSWERED.load(Ordering::Relaxed)
     );
+    if CRYPTOPAN.get().is_some() {
+        println!("IP addresses in the capture were anonymized with Crypto-PAn.");
+    } else {
+        println!("IP addresses in the capture are NOT anonymized (pass --anon-key to enable).");
+    }
 
     let truncated = CONNS_TRUNCATED.load(Ordering::Relaxed);
     if truncated > 0 {
