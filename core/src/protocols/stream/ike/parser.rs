@@ -119,9 +119,13 @@ pub(crate) fn classify_probe(data: &[u8], on_known_port: bool, on_nat_t_port: bo
 }
 
 impl Ike {
-    /// Parses `data` as an IKE header and updates the session summary. Always returns
+    /// Parses `data` as an IKE header and populates the session summary. Returns
     /// `HeadersDone` on a successful parse, since the header carries everything of
     /// interest in this scope without needing to assemble a multi-packet body.
+    ///
+    /// The session is removed and delivered on `HeadersDone`, after which the connection
+    /// moves to `LayerState::Payload` and this is not called again -- so the summary
+    /// describes the first IKE message only. See [`Ike`] for the implications.
     pub(crate) fn update(&mut self, data: &[u8], on_nat_t_port: bool) -> ParseResult {
         let data = strip_non_esp_marker(data, on_nat_t_port);
         let Some(fields) = parse_ike_header(data) else {
@@ -132,11 +136,10 @@ impl Ike {
         self.responder_spi = fields.responder_spi;
         self.version_major = fields.version_major;
         self.version_minor = fields.version_minor;
-        self.last_exchange_type = Some(IkeExchangeType::from_byte(fields.exchange_type));
+        self.exchange_type = Some(IkeExchangeType::from_byte(fields.exchange_type));
         self.is_initiator = fields.is_initiator;
         self.is_response = fields.is_response;
         self.message_id = fields.message_id;
-        self.message_count += 1;
 
         ParseResult::HeadersDone(0)
     }
@@ -216,16 +219,17 @@ impl ConnParsable for IkeParser {
     }
 
     fn session_parsed_state(&self) -> ParsingState {
-        // An IKE connection carries multiple exchanges over its lifetime (SA_INIT, AUTH,
-        // CREATE_CHILD_SA, INFORMATIONAL), so parsing continues rather than stopping.
-        ParsingState::Parsing
+        // Exactly one summary is produced per connection, so no further sessions are
+        // expected. Reporting `Stop` lets conntrack clear the `Parse` action once the
+        // session is delivered, rather than keeping the connection on the parse path for
+        // the rest of its life to reach an unimplemented code path.
+        ParsingState::Stop
     }
 
+    /// IKE payloads are out of scope for this parser, so there is no application-layer
+    /// body to offset into.
     fn body_offset(&mut self) -> Option<usize> {
-        match self.sessions.last_mut() {
-            Some(session) => std::mem::take(&mut session.last_body_offset),
-            None => None,
-        }
+        None
     }
 }
 
@@ -364,15 +368,22 @@ mod tests {
         let mut ike = Ike::new();
         let data = ike_sa_init_header();
         assert_eq!(ike.update(&data, false), ParseResult::HeadersDone(0));
-        assert_eq!(ike.initiator_spi, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(ike.initiator_spi(), [1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(ike.exchange_type(), Some(IkeExchangeType::IkeSaInit));
+        assert_eq!(ike.version(), (2, 0));
         assert!(ike.is_initiator());
-        assert_eq!(ike.message_count, 1);
+        assert!(!ike.is_response());
     }
 
     #[test]
     fn session_skips_unrecognized_data() {
         let mut ike = Ike::new();
         assert_eq!(ike.update(&[0u8; 10], false), ParseResult::Skipped);
+    }
+
+    #[test]
+    fn parser_reports_stop_so_conntrack_can_drop_the_parse_action() {
+        let parser = IkeParser::default();
+        assert!(matches!(parser.session_parsed_state(), ParsingState::Stop));
     }
 }

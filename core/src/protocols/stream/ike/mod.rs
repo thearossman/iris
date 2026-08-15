@@ -33,19 +33,23 @@ impl IkeExchangeType {
 }
 
 /// Parsed IKE connection summary.
+///
+/// ## Scope
+/// Every field describes the **first** IKE message observed on the connection (typically
+/// `IKE_SA_INIT`), not the most recent one. Iris delivers the session as soon as one
+/// complete header has been parsed and does not parse further packets on the connection,
+/// so later exchanges (`IKE_AUTH`, `CREATE_CHILD_SA`, `INFORMATIONAL`) are not reflected
+/// here.
 #[derive(Debug, Default, Serialize)]
 pub struct Ike {
     pub initiator_spi: [u8; 8],
     pub responder_spi: [u8; 8],
     pub version_major: u8,
     pub version_minor: u8,
-    pub last_exchange_type: Option<IkeExchangeType>,
+    pub exchange_type: Option<IkeExchangeType>,
     pub is_initiator: bool,
     pub is_response: bool,
     pub message_id: u32,
-    pub message_count: u32,
-    #[serde(skip_serializing)]
-    pub(crate) last_body_offset: Option<usize>,
 }
 
 impl Ike {
@@ -53,37 +57,37 @@ impl Ike {
         Ike::default()
     }
 
-    /// Returns the initiator SPI (Security Parameter Index) from the most recent message.
+    /// Returns the initiator SPI (Security Parameter Index) from the first message.
     pub fn initiator_spi(&self) -> [u8; 8] {
         self.initiator_spi
     }
 
-    /// Returns the responder SPI (Security Parameter Index) from the most recent message.
+    /// Returns the responder SPI (Security Parameter Index) from the first message.
     pub fn responder_spi(&self) -> [u8; 8] {
         self.responder_spi
     }
 
-    /// Returns the (major, minor) IKE protocol version from the most recent message.
+    /// Returns the (major, minor) IKE protocol version from the first message.
     pub fn version(&self) -> (u8, u8) {
         (self.version_major, self.version_minor)
     }
 
-    /// Returns the exchange type of the most recently processed message, if any.
+    /// Returns the exchange type of the first message observed, if any.
     pub fn exchange_type(&self) -> Option<IkeExchangeType> {
-        self.last_exchange_type
+        self.exchange_type
     }
 
-    /// Returns `true` if the most recently processed message had the Initiator flag set.
+    /// Returns `true` if the first message had the Initiator flag set.
     pub fn is_initiator(&self) -> bool {
         self.is_initiator
     }
 
-    /// Returns `true` if the most recently processed message had the Response flag set.
+    /// Returns `true` if the first message had the Response flag set.
     pub fn is_response(&self) -> bool {
         self.is_response
     }
 
-    /// Returns the message ID of the most recently processed message.
+    /// Returns the message ID of the first message observed.
     pub fn message_id(&self) -> u32 {
         self.message_id
     }
