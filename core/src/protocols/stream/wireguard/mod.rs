@@ -4,6 +4,14 @@
 //! [WireGuard whitepaper](https://www.wireguard.com/papers/wireguard.pdf), §5.4), so Iris
 //! identifies only the message type of each packet rather than extracting handshake
 //! sub-fields (ephemeral keys, MACs, encrypted blobs).
+//!
+//! A connection is identified as WireGuard, and a [`WireGuard`] session delivered, only if
+//! a handshake-phase message (Handshake Initiation, Handshake Response, or Cookie Reply)
+//! is actually observed on it. A tunnel picked up mid-stream, after its handshake has
+//! already gone by and only encrypted Transport Data remains, is left unidentified --
+//! Transport Data alone is too weak a signal (a 4-byte type+reserved match over a
+//! variable, mostly-encrypted length) to claim with confidence, and claiming it anyway
+//! would misreport an already-established tunnel as freshly identified.
 
 pub mod parser;
 
@@ -21,11 +29,12 @@ pub enum WireGuardMessageType {
 /// Parsed WireGuard connection summary.
 ///
 /// ## Scope
-/// These fields describe the *opening* of a tunnel, not its full lifetime. Iris delivers
-/// the session as soon as header parsing completes -- on the handshake response, or on the
-/// first Transport Data message for a tunnel picked up mid-stream -- and does not parse
-/// further packets on the connection. Fields are therefore one-shot observations rather
-/// than running tallies.
+/// A session is only ever created for a connection on which a handshake-phase message was
+/// observed (see the module docs) -- so every delivered `WireGuard` reflects a connection
+/// where at least one of `handshake_initiation_seen` and `cookie_reply_seen` is `true`.
+/// Fields describe the *opening* of the tunnel, not its full lifetime: Iris delivers the
+/// session as soon as header parsing completes and does not parse further packets on the
+/// connection, so these are one-shot observations rather than running tallies.
 #[derive(Debug, Default, Serialize)]
 pub struct WireGuard {
     /// `true` if a Handshake Initiation message (type 1) was observed.
@@ -34,9 +43,10 @@ pub struct WireGuard {
     pub handshake_response_seen: bool,
     /// `true` if a Cookie Reply message (type 3) was observed.
     pub cookie_reply_seen: bool,
-    /// `true` if a Transport Data message (type 4) was observed. Only set when the tunnel
-    /// was picked up mid-stream, since a tunnel observed from its handshake is delivered
-    /// before any transport data is parsed.
+    /// `true` if a Transport Data message (type 4) completed header parsing -- i.e. a
+    /// handshake-phase message was observed (see the `Scope` note above), but the
+    /// connection's Transport Data began before a Handshake Response was also captured
+    /// (e.g. the response was lost, or was not part of the earlier-matched exchange).
     pub transport_data_seen: bool,
     /// Message type of the packet that completed header parsing.
     pub message_type: Option<WireGuardMessageType>,
@@ -58,8 +68,8 @@ impl WireGuard {
         self.handshake_initiation_seen && self.handshake_response_seen
     }
 
-    /// Returns `true` if a Transport Data message was observed. See
-    /// [`WireGuard::transport_data_seen`] for why this is only set for mid-stream pickup.
+    /// Returns `true` if a Transport Data message completed header parsing. See
+    /// [`WireGuard::transport_data_seen`] for what this does (and does not) imply.
     pub fn transport_data_seen(&self) -> bool {
         self.transport_data_seen
     }

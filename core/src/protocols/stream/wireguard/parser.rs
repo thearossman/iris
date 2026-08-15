@@ -47,10 +47,13 @@ pub(crate) fn classify_message(data: &[u8]) -> Option<WireGuardMessageType> {
         }
         // Unlike the handshake types, whose exact fixed lengths are a strong signal, a
         // Transport Data message is otherwise only a 4-byte signature over a variable
-        // length -- too weak to claim a match on. The 64-bit counter at offset 8 is a
-        // per-session nonce that resets on rekey (every 2 minutes, well before 2^48
-        // messages), so requiring its top two bytes to be zero adds real structure
-        // without rejecting any tunnel that can occur in practice.
+        // length. `classify_probe` never claims a connection on this alone (see there for
+        // why); this additional check exists so that, once a connection has already been
+        // claimed via a handshake message, garbage on the wire isn't misread as Transport
+        // Data by `update`. The 64-bit counter at offset 8 is a per-session nonce that
+        // resets on rekey (every 2 minutes, well before 2^48 messages), so requiring its
+        // top two bytes to be zero adds real structure without rejecting any tunnel that
+        // can occur in practice.
         MSG_TYPE_TRANSPORT_DATA
             if data.len() >= TRANSPORT_DATA_MIN_LEN
                 && data[TRANSPORT_COUNTER_HIGH.0] == 0
@@ -62,10 +65,30 @@ pub(crate) fn classify_message(data: &[u8]) -> Option<WireGuardMessageType> {
     }
 }
 
+/// Decides the probe result for `data`. Only a handshake-phase message (Handshake
+/// Initiation, Handshake Response, or Cookie Reply) is claimed with certainty. A
+/// structurally valid Transport Data message alone is `Unsure`, not `Certain` -- Iris only
+/// identifies a connection as WireGuard when a handshake message is actually observed on
+/// it (see the `WireGuard` struct's scope note); claiming certainty on Transport Data
+/// alone would identify a tunnel picked up mid-stream, after its handshake already went
+/// by, from ciphertext bytes with no confirmed relationship to WireGuard at all. Returning
+/// `Unsure` rather than `NotForUs` keeps the connection open to a later legitimate
+/// handshake (e.g. a rekey) instead of giving up permanently.
+pub(crate) fn classify_probe(data: &[u8]) -> ProbeResult {
+    match classify_message(data) {
+        Some(WireGuardMessageType::HandshakeInitiation)
+        | Some(WireGuardMessageType::HandshakeResponse)
+        | Some(WireGuardMessageType::CookieReply) => ProbeResult::Certain,
+        Some(WireGuardMessageType::TransportData) => ProbeResult::Unsure,
+        None => ProbeResult::NotForUs,
+    }
+}
+
 impl WireGuard {
     /// Classifies `data` and updates the session summary. Returns `HeadersDone` once the
-    /// handshake completes (or, absent an observed handshake, on the first Transport Data
-    /// message), and `Continue` otherwise.
+    /// handshake response is observed, or (once a handshake-phase message has already
+    /// gated entry into this parser -- see `classify_probe`) on a Transport Data message,
+    /// and `Continue` otherwise.
     ///
     /// The session is removed and delivered on `HeadersDone`, after which the connection
     /// moves to `LayerState::Payload` and this is not called again -- so each field is set
@@ -131,10 +154,7 @@ impl ConnParsable for WireGuardParser {
         }
 
         if let Ok(data) = (pdu.mbuf).get_data_slice(offset, length) {
-            match classify_message(data) {
-                Some(_) => ProbeResult::Certain,
-                None => ProbeResult::NotForUs,
-            }
+            classify_probe(data)
         } else {
             log::warn!("Malformed packet");
             ProbeResult::Error
@@ -289,7 +309,11 @@ mod tests {
     fn rejects_dns_query_shaped_packet() {
         // A non-recursive DNS query with transaction ID 0x0400 and zero flags starts with
         // the same four bytes as a Transport Data message. Its QNAME bytes land where the
-        // counter's high bytes would be, so the counter check rejects it.
+        // counter's high bytes would be, so the counter check rejects it. `classify_probe`
+        // is the primary defense against this kind of collision (it never claims a
+        // connection on Transport Data alone), but `classify_message` should still reject
+        // it, since it's also relied on by `update` once a connection has already been
+        // claimed via a real handshake message.
         let mut data = vec![0x04, 0x00, 0x00, 0x00]; // txid 0x0400, flags 0x0000
         data.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // QDCOUNT=1, ANCOUNT=0
         data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // NSCOUNT=0, ARCOUNT=0
@@ -297,6 +321,33 @@ mod tests {
         data.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE=A, QCLASS=IN
         assert!(data.len() >= TRANSPORT_DATA_MIN_LEN);
         assert_eq!(classify_message(&data), None);
+    }
+
+    #[test]
+    fn probe_is_certain_only_for_handshake_phase_messages() {
+        let init = build_message(MSG_TYPE_HANDSHAKE_INITIATION, HANDSHAKE_INITIATION_LEN);
+        assert_eq!(classify_probe(&init), ProbeResult::Certain);
+
+        let resp = build_message(MSG_TYPE_HANDSHAKE_RESPONSE, HANDSHAKE_RESPONSE_LEN);
+        assert_eq!(classify_probe(&resp), ProbeResult::Certain);
+
+        let cookie = build_message(MSG_TYPE_COOKIE_REPLY, COOKIE_REPLY_LEN);
+        assert_eq!(classify_probe(&cookie), ProbeResult::Certain);
+    }
+
+    #[test]
+    fn probe_is_unsure_not_certain_for_transport_data_alone() {
+        // This is the crux of the mid-stream-pickup fix: a structurally valid Transport
+        // Data message never claims the connection on its own, so a tunnel observed only
+        // after its handshake already went by is left unidentified rather than reported
+        // with a mostly-empty session.
+        let data = build_message(MSG_TYPE_TRANSPORT_DATA, TRANSPORT_DATA_MIN_LEN);
+        assert_eq!(classify_probe(&data), ProbeResult::Unsure);
+    }
+
+    #[test]
+    fn probe_rejects_structurally_invalid_data() {
+        assert_eq!(classify_probe(&[9, 9, 9, 9]), ProbeResult::NotForUs);
     }
 
     #[test]
@@ -322,7 +373,12 @@ mod tests {
     }
 
     #[test]
-    fn session_marks_headers_done_on_first_transport_data_without_handshake() {
+    fn update_completes_headers_on_transport_data_when_called_directly() {
+        // `update` alone (unlike the full `ConnParsable` pipeline) does not enforce that a
+        // handshake message was seen first -- `WireGuardParser::probe` is what enforces
+        // that, by never returning `Certain` for Transport Data alone (see
+        // `probe_is_unsure_not_certain_for_transport_data_alone`), so a fresh session's
+        // `update` is never actually reached this way outside of this direct unit test.
         let mut wg = WireGuard::new();
         let data = build_message(MSG_TYPE_TRANSPORT_DATA, TRANSPORT_DATA_MIN_LEN);
         assert_eq!(wg.update(&data), ParseResult::HeadersDone(0));
