@@ -14,6 +14,8 @@
 {"DatatypeFn":{"group_name":"DnsTransaction","func":{"name":"from_session","datatypes":["Session"],"returns":{"Constructor":"OptRef"}},"level":["L7EndHdrs"]}}
 {"Datatype":{"name":"HttpTransaction","level":"L7EndHdrs","expl_parsers":["http"],"filtered":false}}
 {"DatatypeFn":{"group_name":"HttpTransaction","func":{"name":"from_session","datatypes":["Session"],"returns":{"Constructor":"OptRef"}},"level":["L7EndHdrs"]}}
+{"Datatype":{"name":"IkeHeader","level":"L7EndHdrs","expl_parsers":["ike"],"filtered":false}}
+{"DatatypeFn":{"group_name":"IkeHeader","func":{"name":"from_session","datatypes":["Session"],"returns":{"Constructor":"OptRef"}},"level":["L7EndHdrs"]}}
 {"Datatype":{"name":"BidirPktStream","level":null,"expl_parsers":[],"filtered":false}}
 {"DatatypeFn":{"group_name":"BidirPktStream","func":{"name":"update","datatypes":["L4Pdu"],"returns":"None"},"level":["InL4Conn"]}}
 {"Datatype":{"name":"OrigPktStream","level":null,"expl_parsers":[],"filtered":false}}
@@ -32,3 +34,5 @@
 {"Datatype":{"name":"EthAddr","level":"L4FirstPacket","expl_parsers":[],"filtered":false}}
 {"Datatype":{"name":"TlsHandshake","level":"L7EndHdrs","expl_parsers":["tls"],"filtered":false}}
 {"DatatypeFn":{"group_name":"TlsHandshake","func":{"name":"from_session","datatypes":["Session"],"returns":{"Constructor":"OptRef"}},"level":["L7EndHdrs"]}}
+{"Datatype":{"name":"WireGuardMessage","level":"L7EndHdrs","expl_parsers":["wireguard"],"filtered":false}}
+{"DatatypeFn":{"group_name":"WireGuardMessage","func":{"name":"from_session","datatypes":["Session"],"returns":{"Constructor":"OptRef"}},"level":["L7EndHdrs"]}}

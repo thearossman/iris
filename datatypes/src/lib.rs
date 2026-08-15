@@ -14,6 +14,9 @@ pub use dns_transaction::DnsTransaction;
 pub mod http_transaction;
 pub use http_transaction::HttpTransaction;
 
+pub mod ike_header;
+pub use ike_header::IkeHeader;
+
 pub mod packet_list;
 pub use packet_list::*;
 
@@ -28,6 +31,9 @@ pub use static_type::*;
 
 pub mod tls_handshake;
 pub use tls_handshake::TlsHandshake;
+
+pub mod wireguard_message;
+pub use wireguard_message::WireGuardMessage;
 
 /// No-op function to invoke macro
 /// REFACTOR: can we do this more cleanly?

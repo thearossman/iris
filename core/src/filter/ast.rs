@@ -30,6 +30,8 @@ lazy_static! {
         let dns      = g.add_node(protocol!("dns"));
         let quic     = g.add_node(protocol!("quic"));
         let ssh      = g.add_node(protocol!("ssh"));
+        let wireguard = g.add_node(protocol!("wireguard"));
+        let ike      = g.add_node(protocol!("ike"));
         // define valid outer layers for each protocol header
         g.extend_with_edges([
             (ipv4, ethernet),
@@ -41,6 +43,8 @@ lazy_static! {
             (dns, udp), (dns, tcp),
             (quic, udp), // NICE-TO-HAVE: tls over quic?
             (ssh, tcp),
+            (wireguard, udp),
+            (ike, udp),
         ]);
         g
     };
@@ -1231,6 +1235,12 @@ mod tests {
         assert!(!has_path(&protocol!("http"), &protocol!("udp")));
         assert!(has_path(&protocol!("quic"), &protocol!("udp")));
         assert!(!has_path(&protocol!("quic"), &protocol!("dns")));
+        assert!(has_path(&protocol!("wireguard"), &protocol!("udp")));
+        assert!(has_path(&protocol!("wireguard"), &protocol!("ipv4")));
+        assert!(!has_path(&protocol!("wireguard"), &protocol!("tcp")));
+        assert!(has_path(&protocol!("ike"), &protocol!("udp")));
+        assert!(has_path(&protocol!("ike"), &protocol!("ipv6")));
+        assert!(!has_path(&protocol!("ike"), &protocol!("tcp")));
     }
 
     #[test]
