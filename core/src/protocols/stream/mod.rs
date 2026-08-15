@@ -209,7 +209,7 @@ pub enum SessionData {
     Http(Box<Http>),
     Quic(Box<QuicConn>),
     Ssh(Box<Ssh>),
-    WireGuard(Box<WireGuard>),
+    Wireguard(Box<WireGuard>),
     Ike(Box<Ike>),
     Null,
 }
@@ -223,7 +223,7 @@ pub enum SessionProto {
     Http,
     Quic,
     Ssh,
-    WireGuard,
+    Wireguard,
     Ike,
     Ipv4,
     Ipv6,
@@ -275,9 +275,7 @@ pub enum ConnParser {
     Http(HttpParser),
     Quic(QuicParser),
     Ssh(SshParser),
-    #[strum(serialize = "wireguard")]
-    WireGuard(WireGuardParser),
-    #[strum(serialize = "ike")]
+    Wireguard(WireGuardParser),
     Ike(IkeParser),
     Unknown,
 }
@@ -291,7 +289,7 @@ impl ConnParser {
             ConnParser::Http(_) => ConnParser::Http(HttpParser::default()),
             ConnParser::Quic(_) => ConnParser::Quic(QuicParser::default()),
             ConnParser::Ssh(_) => ConnParser::Ssh(SshParser::default()),
-            ConnParser::WireGuard(_) => ConnParser::WireGuard(WireGuardParser::default()),
+            ConnParser::Wireguard(_) => ConnParser::Wireguard(WireGuardParser::default()),
             ConnParser::Ike(_) => ConnParser::Ike(IkeParser::default()),
             ConnParser::Unknown => ConnParser::Unknown,
         }
@@ -305,7 +303,7 @@ impl ConnParser {
             ConnParser::Http(parser) => parser.parse(pdu),
             ConnParser::Quic(parser) => parser.parse(pdu),
             ConnParser::Ssh(parser) => parser.parse(pdu),
-            ConnParser::WireGuard(parser) => parser.parse(pdu),
+            ConnParser::Wireguard(parser) => parser.parse(pdu),
             ConnParser::Ike(parser) => parser.parse(pdu),
             ConnParser::Unknown => ParseResult::None,
         }
@@ -319,7 +317,7 @@ impl ConnParser {
             ConnParser::Http(parser) => parser.probe(pdu),
             ConnParser::Quic(parser) => parser.probe(pdu),
             ConnParser::Ssh(parser) => parser.probe(pdu),
-            ConnParser::WireGuard(parser) => parser.probe(pdu),
+            ConnParser::Wireguard(parser) => parser.probe(pdu),
             ConnParser::Ike(parser) => parser.probe(pdu),
             ConnParser::Unknown => ProbeResult::Error,
         }
@@ -334,7 +332,7 @@ impl ConnParser {
             ConnParser::Http(parser) => parser.remove_session(session_id),
             ConnParser::Quic(parser) => parser.remove_session(session_id),
             ConnParser::Ssh(parser) => parser.remove_session(session_id),
-            ConnParser::WireGuard(parser) => parser.remove_session(session_id),
+            ConnParser::Wireguard(parser) => parser.remove_session(session_id),
             ConnParser::Ike(parser) => parser.remove_session(session_id),
             ConnParser::Unknown => None,
         }
@@ -348,7 +346,7 @@ impl ConnParser {
             ConnParser::Http(parser) => parser.drain_sessions(),
             ConnParser::Quic(parser) => parser.drain_sessions(),
             ConnParser::Ssh(parser) => parser.drain_sessions(),
-            ConnParser::WireGuard(parser) => parser.drain_sessions(),
+            ConnParser::Wireguard(parser) => parser.drain_sessions(),
             ConnParser::Ike(parser) => parser.drain_sessions(),
             ConnParser::Unknown => vec![],
         }
@@ -361,7 +359,7 @@ impl ConnParser {
             ConnParser::Http(parser) => parser.session_parsed_state(),
             ConnParser::Quic(parser) => parser.session_parsed_state(),
             ConnParser::Ssh(parser) => parser.session_parsed_state(),
-            ConnParser::WireGuard(parser) => parser.session_parsed_state(),
+            ConnParser::Wireguard(parser) => parser.session_parsed_state(),
             ConnParser::Ike(parser) => parser.session_parsed_state(),
             ConnParser::Unknown => ParsingState::Stop,
         }
@@ -374,7 +372,7 @@ impl ConnParser {
             ConnParser::Http(parser) => parser.body_offset(),
             ConnParser::Quic(parser) => parser.body_offset(),
             ConnParser::Ssh(parser) => parser.body_offset(),
-            ConnParser::WireGuard(parser) => parser.body_offset(),
+            ConnParser::Wireguard(parser) => parser.body_offset(),
             ConnParser::Ike(parser) => parser.body_offset(),
             ConnParser::Unknown => None,
         }
@@ -389,7 +387,7 @@ impl ConnParser {
             ConnParser::Http(_parser) => Some("http".into()),
             ConnParser::Quic(_parser) => Some("quic".into()),
             ConnParser::Ssh(_parser) => Some("ssh".into()),
-            ConnParser::WireGuard(_parser) => Some("wireguard".into()),
+            ConnParser::Wireguard(_parser) => Some("wireguard".into()),
             ConnParser::Ike(_parser) => Some("ike".into()),
             ConnParser::Unknown => None,
         }
@@ -402,7 +400,7 @@ impl ConnParser {
             ConnParser::Http(_) => SessionProto::Http,
             ConnParser::Quic(_) => SessionProto::Quic,
             ConnParser::Ssh(_) => SessionProto::Ssh,
-            ConnParser::WireGuard(_) => SessionProto::WireGuard,
+            ConnParser::Wireguard(_) => SessionProto::Wireguard,
             ConnParser::Ike(_) => SessionProto::Ike,
             ConnParser::Unknown => SessionProto::Null,
         }

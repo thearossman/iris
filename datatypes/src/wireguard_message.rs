@@ -16,7 +16,7 @@ impl FromSession for WireGuardMessage {
         datatype_fn("WireGuardMessage,level=L7EndHdrs")
     )]
     fn from_session(session: &Session) -> Option<&Self> {
-        if let SessionData::WireGuard(wg) = &session.data {
+        if let SessionData::Wireguard(wg) = &session.data {
             return Some(wg);
         }
         None

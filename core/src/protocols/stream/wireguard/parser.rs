@@ -163,7 +163,7 @@ impl ConnParsable for WireGuardParser {
 
     fn remove_session(&mut self, _session_id: usize) -> Option<Session> {
         self.sessions.pop().map(|wg| Session {
-            data: SessionData::WireGuard(Box::new(wg)),
+            data: SessionData::Wireguard(Box::new(wg)),
             id: 0,
         })
     }
@@ -172,7 +172,7 @@ impl ConnParsable for WireGuardParser {
         self.sessions
             .drain(..)
             .map(|wg| Session {
-                data: SessionData::WireGuard(Box::new(wg)),
+                data: SessionData::Wireguard(Box::new(wg)),
                 id: 0,
             })
             .collect()
