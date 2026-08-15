@@ -189,15 +189,33 @@ fn record_transport_bytes(bytes: &TransportBytes) {
     UDP_BYTES.fetch_add(bytes.udp_bytes, Ordering::Relaxed);
 }
 
-fn print_proto(name: &str, totals: &ByteTotals) {
+/// Returns `100 * numerator / denominator` as a percentage, or `None` if `denominator` is
+/// zero (e.g. a protocol that was never observed in this trace).
+fn pct(numerator: usize, denominator: usize) -> Option<f64> {
+    if denominator == 0 {
+        return None;
+    }
+    Some(100.0 * numerator as f64 / denominator as f64)
+}
+
+fn fmt_pct(p: Option<f64>) -> String {
+    match p {
+        Some(p) => format!("{:>6.2}%", p),
+        None => "   n/a ".to_string(),
+    }
+}
+
+/// Prints one protocol's handshake/payload split and its share of total transport traffic.
+fn print_proto(name: &str, totals: &ByteTotals, transport_total: usize) {
     let handshake = totals.handshake.load(Ordering::Relaxed);
     let payload = totals.payload.load(Ordering::Relaxed);
+    let total = handshake + payload;
     println!(
-        "{:<10} handshake: {:>12} bytes   payload: {:>12} bytes   total: {:>12} bytes",
+        "{:<10} handshake: {}   payload: {}   of total traffic: {}",
         name,
-        handshake,
-        payload,
-        handshake + payload
+        fmt_pct(pct(handshake, total)),
+        fmt_pct(pct(payload, total)),
+        fmt_pct(pct(total, transport_total)),
     );
 }
 
@@ -210,14 +228,18 @@ fn main() {
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config, filter).unwrap();
     runtime.run();
 
-    println!("\n=== Encrypted protocol bytes (cleartext handshake vs. encrypted payload) ===");
-    print_proto("TLS", &TLS_BYTES);
-    print_proto("SSH", &SSH_BYTES);
-    print_proto("QUIC", &QUIC_BYTES);
-    print_proto("WireGuard", &WIREGUARD_BYTES);
-    print_proto("IKE", &IKE_BYTES);
+    let tcp_bytes = TCP_BYTES.load(Ordering::Relaxed);
+    let udp_bytes = UDP_BYTES.load(Ordering::Relaxed);
+    let transport_total = tcp_bytes + udp_bytes;
+
+    println!("\n=== Encrypted protocol bytes: handshake % vs. payload %, and % of total transport traffic ===");
+    print_proto("TLS", &TLS_BYTES, transport_total);
+    print_proto("SSH", &SSH_BYTES, transport_total);
+    print_proto("QUIC", &QUIC_BYTES, transport_total);
+    print_proto("WireGuard", &WIREGUARD_BYTES, transport_total);
+    print_proto("IKE", &IKE_BYTES, transport_total);
 
     println!("\n=== Total transport-layer traffic ===");
-    println!("TCP: {} bytes", TCP_BYTES.load(Ordering::Relaxed));
-    println!("UDP: {} bytes", UDP_BYTES.load(Ordering::Relaxed));
+    println!("TCP: {}", fmt_pct(pct(tcp_bytes, transport_total)));
+    println!("UDP: {}", fmt_pct(pct(udp_bytes, transport_total)));
 }
