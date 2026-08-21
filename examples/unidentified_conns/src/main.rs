@@ -13,6 +13,12 @@
 //! which tears down all tracking for them -- no frames buffered, and Iris stops running the
 //! L7 parsers over them too. Only the sampled minority ever costs anything.
 //!
+//! A sampled connection is only written out if it also carries at least `--min-bytes` of
+//! captured frame data. Whether it clears that bar is not knowable until teardown, so the
+//! check happens in `finalize` alongside the identified/unanswered checks -- the frames are
+//! still buffered as they arrive, but a connection that falls short is dropped rather than
+//! written. This filters out trickle connections that carry too little to be worth dissecting.
+//!
 //! Output is sharded one pcap file per core, each behind its own `BufWriter`, so RX cores
 //! never contend on a shared writer or interleave frames into the same file. The accompanying
 //! `identify_protocols.sh` script reads the whole set back and post-processes it with `tshark`,
@@ -68,6 +74,13 @@ struct Args {
     #[clap(short, long, value_name = "N", default_value_t = 128)]
     max_frames: usize,
 
+    /// Only write a sampled connection if its captured frames total at least this many bytes;
+    /// 0 records regardless of size. Drops trickle connections that carry too little payload to
+    /// be worth dissecting. Measured over the bytes actually buffered, so a connection truncated
+    /// at --max-frames is judged on those frames alone.
+    #[clap(long, value_name = "N", default_value_t = 0)]
+    min_bytes: usize,
+
     /// Path to a 32-byte binary key file. If given, every frame's source and destination IP
     /// is rewritten with Crypto-PAn before being written out. Generate one with:
     /// `openssl rand -out anon.key 32`. If omitted, captures carry real IP addresses.
@@ -95,6 +108,10 @@ static SAMPLE_RATE: AtomicU64 = AtomicU64::new(1);
 /// Per-connection frame ceiling, read on every buffered packet. `usize::MAX` means no limit.
 static MAX_FRAMES: AtomicUsize = AtomicUsize::new(usize::MAX);
 
+/// Minimum captured bytes a sampled connection must carry to be written out; read once per
+/// connection in `finalize`. 0 means no threshold.
+static MIN_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 /// Connections seen at teardown that a parser did identify.
 static CONNS_IDENTIFIED: AtomicUsize = AtomicUsize::new(0);
 /// Sampled connections that no parser identified, i.e. those written out.
@@ -103,6 +120,8 @@ static CONNS_WRITTEN: AtomicUsize = AtomicUsize::new(0);
 static CONNS_TRUNCATED: AtomicUsize = AtomicUsize::new(0);
 /// TCP connections dropped because the responder never sent anything (unanswered SYNs).
 static CONNS_UNANSWERED: AtomicUsize = AtomicUsize::new(0);
+/// Sampled, unidentified connections dropped for carrying fewer than [`MIN_BYTES`] bytes.
+static CONNS_BELOW_THRESHOLD: AtomicUsize = AtomicUsize::new(0);
 
 /// Set only when `--anon-key` is given; `finalize` anonymizes a connection's frames iff this
 /// is populated, so omitting the flag costs nothing beyond the `Option` check.
@@ -153,6 +172,10 @@ struct SampledConn {
     sampled: bool,
     frames: Vec<Vec<u8>>,
     truncated: bool,
+    /// Running total of captured frame bytes, compared against [`MIN_BYTES`] at teardown.
+    /// Counts only the bytes actually buffered, so frames dropped past [`MAX_FRAMES`] do not
+    /// contribute -- a truncated connection is judged on what was kept.
+    total_bytes: usize,
     /// TCP connections that never draw a single packet from the responder are unanswered SYNs:
     /// scans, backscatter, and failed connects. They have no payload to identify by definition,
     /// so recording them buries the genuinely unknown traffic. Tracked here and dropped at
@@ -169,6 +192,7 @@ impl StreamingCallback for SampledConn {
             sampled: should_sample(&FiveTuple::from_ctxt(&first_pkt.ctxt)),
             frames: Vec::new(),
             truncated: false,
+            total_bytes: 0,
             is_tcp: first_pkt.ctxt.proto == TCP_PROTOCOL,
             saw_responder: false,
         }
@@ -177,6 +201,7 @@ impl StreamingCallback for SampledConn {
     fn clear(&mut self) {
         self.frames = Vec::with_capacity(0);
         self.truncated = false;
+        self.total_bytes = 0;
     }
 }
 
@@ -201,7 +226,9 @@ impl SampledConn {
         // `dir` is true for orig -> resp, so anything else is the responder answering.
         self.saw_responder |= !pdu.dir;
         if self.frames.len() < MAX_FRAMES.load(Ordering::Relaxed) {
-            self.frames.push(pdu.mbuf_ref().data().to_vec());
+            let frame = pdu.mbuf_ref().data().to_vec();
+            self.total_bytes += frame.len();
+            self.frames.push(frame);
         } else {
             self.truncated = true;
         }
@@ -224,6 +251,14 @@ impl SampledConn {
         // discovery never concluded (e.g. a connection too short to classify).
         if !matches!(proto, SessionProto::Null | SessionProto::Probing) {
             CONNS_IDENTIFIED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        // A connection that carried too little data to be worth dissecting is dropped here
+        // rather than written. Judged on the bytes actually buffered, so a truncation at
+        // --max-frames cannot push a connection over the bar on frames that were discarded.
+        if self.total_bytes < MIN_BYTES.load(Ordering::Relaxed) {
+            CONNS_BELOW_THRESHOLD.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
@@ -425,6 +460,8 @@ fn main() {
         Ordering::Relaxed,
     );
 
+    MIN_BYTES.store(args.min_bytes, Ordering::Relaxed);
+
     if let Some(key_path) = &args.anon_key {
         let key_bytes = std::fs::read(key_path)
             .unwrap_or_else(|e| panic!("Failed to read {}: {}", key_path.display(), e));
@@ -483,6 +520,13 @@ fn main() {
         "Skipped {} unanswered SYNs (TCP connections the responder never answered).",
         CONNS_UNANSWERED.load(Ordering::Relaxed)
     );
+    let below_threshold = CONNS_BELOW_THRESHOLD.load(Ordering::Relaxed);
+    if args.min_bytes > 0 {
+        println!(
+            "Skipped {} connections carrying fewer than {} captured bytes (--min-bytes).",
+            below_threshold, args.min_bytes
+        );
+    }
     if CRYPTOPAN.get().is_some() {
         println!("IP addresses in the capture were anonymized with Crypto-PAn.");
     } else {
