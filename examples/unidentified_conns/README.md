@@ -7,10 +7,13 @@ All seven of Iris's session parsers (TLS, DNS, HTTP, QUIC, SSH, WireGuard, IKE) 
 run against every TCP/UDP connection. Connections that any parser identifies are dropped; whatever
 is left — protocol discovery failed outright, or never concluded — has its raw packets written out.
 
-The app does no protocol reporting of its own. The companion
-[`identify_protocols.sh`](./identify_protocols.sh) script post-processes those captures with
-`tshark`, whose independent dissectors take a second pass at the leftover traffic, and prints the
-most common protocols it finds — by parsing, not by assuming that a port number implies a protocol.
+The app's own reporting stops at *identified* connections: the run summary breaks those down by
+protocol (TLS, DNS, HTTP, ...), a free byproduct of the identified/unidentified check it already
+runs in `finalize`. Everything about the *unidentified* connections — which is the traffic this
+app exists to surface — comes from the companion [`identify_protocols.sh`](./identify_protocols.sh)
+script, which post-processes the written captures with `tshark`. Its independent dissectors take a
+second pass at the leftover traffic and print the most common protocols found there — again by
+parsing, not by assuming that a port number implies a protocol.
 
 ## Running at line rate
 
@@ -108,11 +111,24 @@ This writes one `unidentified_core<N>.pcap` per core and reports what it kept:
 ```
 Sampled 1 in 1 connections. Of those, identified 349 by parsing and wrote 283 unidentified ones to unidentified_core*.pcap
 Skipped 29 unanswered SYNs (TCP connections the responder never answered).
+
+Identified connections by protocol (these were dropped, not written):
+  TLS        210
+  DNS        84
+  HTTP       31
+  QUIC       17
+  SSH        7
 IP addresses in the capture were anonymized with Crypto-PAn.
 ```
 
 Both counts cover sampled connections only — unsampled ones unsubscribe on their first packet and
 are never classified at all, which is precisely the work being skipped.
+
+The protocol breakdown is a byproduct of the identified/unidentified check `finalize` already
+runs, not a separate pass — it counts every connection that *was* identified, so it's the mirror
+image of what `identify_protocols.sh` reports on the ones that weren't. Only protocols actually
+seen are listed; an `other` bucket exists for any `SessionProto` value outside the seven parsers
+this app registers, as a safety net, and should always read zero in practice.
 
 Then post-process the whole set — with no arguments the script picks up every
 `unidentified_core*.pcap` in the current directory:

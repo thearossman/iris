@@ -123,6 +123,22 @@ static CONNS_UNANSWERED: AtomicUsize = AtomicUsize::new(0);
 /// Sampled, unidentified connections dropped for carrying fewer than [`MIN_BYTES`] bytes.
 static CONNS_BELOW_THRESHOLD: AtomicUsize = AtomicUsize::new(0);
 
+/// Per-protocol counts of *identified* connections (the ones dropped from the capture, not the
+/// ones written to it), one counter per parser named in the callback filter. Incremented once
+/// each in `finalize` and printed as a summary at the end of the run -- this is a cheap,
+/// approximate read on parser coverage that falls out of a check the app is already doing.
+static COUNT_TLS: AtomicUsize = AtomicUsize::new(0);
+static COUNT_DNS: AtomicUsize = AtomicUsize::new(0);
+static COUNT_HTTP: AtomicUsize = AtomicUsize::new(0);
+static COUNT_QUIC: AtomicUsize = AtomicUsize::new(0);
+static COUNT_SSH: AtomicUsize = AtomicUsize::new(0);
+static COUNT_WIREGUARD: AtomicUsize = AtomicUsize::new(0);
+static COUNT_IKE: AtomicUsize = AtomicUsize::new(0);
+/// Identified but not one of the seven counters above. Only reachable if `SessionProto` grows a
+/// new identified variant the match below doesn't yet know about; kept as a safety net so that
+/// degrades to "uncounted" instead of a compile error or a panic.
+static COUNT_OTHER: AtomicUsize = AtomicUsize::new(0);
+
 /// Set only when `--anon-key` is given; `finalize` anonymizes a connection's frames iff this
 /// is populated, so omitting the flag costs nothing beyond the `Option` check.
 static CRYPTOPAN: OnceLock<CryptoPAN> = OnceLock::new();
@@ -251,6 +267,17 @@ impl SampledConn {
         // discovery never concluded (e.g. a connection too short to classify).
         if !matches!(proto, SessionProto::Null | SessionProto::Probing) {
             CONNS_IDENTIFIED.fetch_add(1, Ordering::Relaxed);
+            let counter = match proto {
+                SessionProto::Tls => &COUNT_TLS,
+                SessionProto::Dns => &COUNT_DNS,
+                SessionProto::Http => &COUNT_HTTP,
+                SessionProto::Quic => &COUNT_QUIC,
+                SessionProto::Ssh => &COUNT_SSH,
+                SessionProto::Wireguard => &COUNT_WIREGUARD,
+                SessionProto::Ike => &COUNT_IKE,
+                _ => &COUNT_OTHER,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
@@ -520,6 +547,24 @@ fn main() {
         "Skipped {} unanswered SYNs (TCP connections the responder never answered).",
         CONNS_UNANSWERED.load(Ordering::Relaxed)
     );
+
+    let mut by_protocol = vec![
+        ("TLS", COUNT_TLS.load(Ordering::Relaxed)),
+        ("DNS", COUNT_DNS.load(Ordering::Relaxed)),
+        ("HTTP", COUNT_HTTP.load(Ordering::Relaxed)),
+        ("QUIC", COUNT_QUIC.load(Ordering::Relaxed)),
+        ("SSH", COUNT_SSH.load(Ordering::Relaxed)),
+        ("WireGuard", COUNT_WIREGUARD.load(Ordering::Relaxed)),
+        ("IKE", COUNT_IKE.load(Ordering::Relaxed)),
+        ("other", COUNT_OTHER.load(Ordering::Relaxed)),
+    ];
+    by_protocol.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+    println!("\nIdentified connections by protocol (these were dropped, not written):");
+    for (name, count) in by_protocol {
+        if count > 0 {
+            println!("  {:<10} {}", name, count);
+        }
+    }
     let below_threshold = CONNS_BELOW_THRESHOLD.load(Ordering::Relaxed);
     if args.min_bytes > 0 {
         println!(
