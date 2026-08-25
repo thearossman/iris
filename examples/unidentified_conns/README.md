@@ -125,30 +125,35 @@ sudo env LD_LIBRARY_PATH=$LD_LIBRARY_PATH RUST_LOG=error ./target/release/uniden
 This writes one `unidentified_core<N>.pcap` per core and reports what it kept:
 
 ```
-Sampled 1 in 1 connections. Of those, identified 349 (52.8%) by parsing and wrote 283 (42.8%) unidentified ones to unidentified_core*.pcap
+Sampled 1 in 1 connections. Of those, identified 349 (55.2%) by parsing and wrote 283 (44.8%) unidentified ones to unidentified_core*.pcap
 Skipped 29 (4.4%) unanswered SYNs (TCP connections the responder never answered).
 
 Identified connections by protocol (these were dropped, not written):
-  TLS        210 (60.2%)
-  DNS        84 (24.1%)
-  HTTP       31 (8.9%)
-  QUIC       17 (4.9%)
-  SSH        7 (2.0%)
+  TLS        210 (33.2%)
+  DNS        84 (13.3%)
+  HTTP       31 (4.9%)
+  QUIC       17 (2.7%)
+  SSH        7 (1.1%)
 IP addresses in the capture were anonymized with Crypto-PAn.
 ```
 
 Both counts cover sampled connections only — unsampled ones unsubscribe on their first packet and
 are never classified at all, which is precisely the work being skipped.
 
-Every percentage is a share of the population its line is actually describing, not a single
-grand total for the whole summary. "Identified", "wrote", and "unanswered" are each a share of
-*all sampled connections* — the four counts on the identified/unanswered/below-threshold/written
-finalize decision always sum to that total. The per-protocol breakdown below them is a share of
-*identified connections specifically* (its rows already sum to the "identified" count above), and
-a later "truncated" line, when present, is a share of *written connections* (truncation is only
-ever recorded for a connection that made it to disk). Mixing these up — e.g. reading a protocol's
-percentage as a share of all sampled connections rather than of identified ones — would overstate
-how rare each protocol is.
+Every percentage answers "what share of the connections that were actually candidates for
+identification?" — not "what share of everything sampled?" On a real capture, unanswered SYNs
+(scans, backscatter) and connections below `--min-bytes` can dwarf everything else, and folding
+them into the denominator would make "identified" and each protocol's share look artificially
+tiny. So "identified", "wrote"/unidentified, and the per-protocol breakdown are all measured
+against `real_sampled = identified + written` — the connections that cleared both the unanswered-
+SYN and `--min-bytes` filters — and always sum to exactly 100% of it: "identified" and "wrote" are
+its only two components, and the protocol rows sum back to exactly the "identified" percentage.
+
+The two "Skipped" lines are the exception, by necessity: they're reporting how much of *everything
+sampled* got excluded, so they're measured against the full sampled population (identified +
+written + unanswered + below-threshold) instead — the one denominator that includes them. A later
+"truncated" line, when present, uses a third denominator, *written connections*, since truncation
+is only ever recorded for a connection that made it to disk.
 
 The protocol breakdown is a byproduct of the identified/unidentified check `finalize` already
 runs, not a separate pass — it counts every connection that *was* identified, so it's the mirror

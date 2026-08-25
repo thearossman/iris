@@ -607,32 +607,42 @@ fn main() {
 
     // Counts cover sampled connections only: unsampled ones unsubscribe on their first packet
     // and so never reach `finalize`, which is exactly the work being avoided. Every sampled
-    // connection lands in exactly one of these four buckets, so their sum is the right
-    // denominator for "share of sampled connections" below.
+    // connection lands in exactly one of these four buckets, so their sum (`total_sampled`) is
+    // the full sampled population.
     let identified = CONNS_IDENTIFIED.load(Ordering::Relaxed);
     let unanswered = CONNS_UNANSWERED.load(Ordering::Relaxed);
     let below_threshold = CONNS_BELOW_THRESHOLD.load(Ordering::Relaxed);
     let written = CONNS_WRITTEN.load(Ordering::Relaxed);
     let total_sampled = identified + unanswered + below_threshold + written;
 
+    // Unanswered SYNs and below-threshold connections are noise -- scans, backscatter, trickle
+    // traffic -- not a population the identified/unidentified split or protocol breakdown
+    // should be measured against. `real_sampled` excludes them, so "identified" and "written"
+    // are shares of the connections that were actually candidates for identification, and
+    // together sum to exactly 100% of it (they're its only two components).
+    let real_sampled = identified + written;
+
     if args.no_pcap {
         println!(
             "\nSampled 1 in {} connections. Of those, identified {} by parsing; {} were \
              unidentified (packet capture skipped: --no-pcap).",
             args.sample_rate,
-            fmt_count_pct(identified, total_sampled),
-            fmt_count_pct(written, total_sampled),
+            fmt_count_pct(identified, real_sampled),
+            fmt_count_pct(written, real_sampled),
         );
     } else {
         println!(
             "\nSampled 1 in {} connections. Of those, identified {} by parsing and wrote {} \
              unidentified ones to {}_core*.pcap",
             args.sample_rate,
-            fmt_count_pct(identified, total_sampled),
-            fmt_count_pct(written, total_sampled),
+            fmt_count_pct(identified, real_sampled),
+            fmt_count_pct(written, real_sampled),
             args.outfile_prefix,
         );
     }
+    // Unlike the lines above, this one *is* a share of every sampled connection -- it's
+    // reporting how much of the full population unanswered SYNs made up, so `total_sampled`
+    // (not `real_sampled`, which excludes them by definition) is the right denominator here.
     println!(
         "Skipped {} unanswered SYNs (TCP connections the responder never answered).",
         fmt_count_pct(unanswered, total_sampled)
@@ -652,11 +662,16 @@ fn main() {
     println!("\nIdentified connections by protocol (these were dropped, not written):");
     for (name, count) in by_protocol {
         if count > 0 {
-            // Share of *identified* connections, not of all sampled ones -- this is a
-            // breakdown of the "identified" total printed above, not a new population.
-            println!("  {:<10} {}", name, fmt_count_pct(count, identified));
+            // Share of `real_sampled`, the same denominator as "identified" above -- so these
+            // rows sum to exactly the "identified" percentage, with "unidentified" as the
+            // complement, rather than each protocol being diluted by scan/junk traffic that
+            // was never a candidate for identification in the first place.
+            println!("  {:<10} {}", name, fmt_count_pct(count, real_sampled));
         }
     }
+    // Also a share of the full sampled population, for the same reason as the unanswered-SYN
+    // line above: this line describes how much of everything got excluded, so it can't use the
+    // denominator that excludes it.
     if args.min_bytes > 0 {
         println!(
             "Skipped {} connections carrying fewer than {} captured bytes (--min-bytes).",
