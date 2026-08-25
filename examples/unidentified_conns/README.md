@@ -90,6 +90,22 @@ the addresses via the pseudo-header, are left stale — this matches most captur
 checksum offload means on-the-wire transport checksums are frequently invalid before anonymization
 even runs, and `tshark` does not validate them by default. IPv6 has no header checksum to fix.
 
+## Skipping capture entirely
+
+Pass `--no-pcap` to run the app for its connection-level counts alone — identified/unanswered/
+per-protocol — without buffering a single packet or writing a `.pcap` file:
+
+```
+./target/release/unidentified_conns --config configs/offline.toml --no-pcap
+```
+
+The `finalize` classification (identified vs. unidentified, unanswered SYN, per-protocol) is
+unchanged, since it comes from `SessionProto` and the five-tuple/`dir` bit, not from the buffered
+frames. `update` never makes the copy that normally fills `self.frames`, and no per-core `.pcap`
+files are created at all. `--min-bytes` still works as a size-threshold statistic, since the byte
+count is tracked from packet lengths regardless. `--outfile-prefix`, `--max-frames`, and
+`--anon-key`/`--anon-bits-*` are accepted but have nothing to act on.
+
 ## Usage
 
 Build from the repo root:
@@ -165,9 +181,11 @@ Three labels come from the script rather than from a protocol name:
 | `--outfile-prefix` | `unidentified` | Per-core captures are written as `<prefix>_core<N>.pcap` |
 | `--sample-rate` | `100` | Record one in every N connections; `1` records all of them |
 | `--max-frames` | `128` | Keep at most N frames per sampled connection; `0` for no limit |
+| `--min-bytes` | `0` | Only write a connection if its captured frames total at least N bytes; `0` for no threshold |
 | `--anon-key` | (none) | Path to a 32-byte key file; if given, IPs are anonymized with Crypto-PAn |
 | `--anon-bits-v4` | `32` | Trailing IPv4 bits to anonymize (only meaningful with `--anon-key`) |
 | `--anon-bits-v6` | `128` | Trailing IPv6 bits to anonymize (only meaningful with `--anon-key`) |
+| `--no-pcap` | off | Skip capturing entirely: no frames buffered, no `.pcap` files written, counts only |
 
 ### Script
 
@@ -196,3 +214,7 @@ directory. The script requires `tshark` (`sudo apt install tshark`).
   happen and *every* connection would look unidentified.
 - **Without `--anon-key`, captures carry real IP addresses.** The run summary states which mode
   was used on every run, so it's visible rather than silent.
+- **`--no-pcap` changes what the run summary reports, not just whether files are written.** The
+  "wrote N unidentified ones to ..." and anonymization-status lines are replaced with a note that
+  capture was skipped, and the final `identify_protocols.sh` suggestion is omitted, since there
+  is nothing for it to read.

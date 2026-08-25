@@ -25,6 +25,12 @@
 //! whose independent dissectors work out what the leftover traffic actually is -- again by
 //! parsing, not by assuming a port number implies a protocol.
 //!
+//! `--no-pcap` skips capturing entirely: no frames are copied or written, and no `.pcap` files
+//! are created. Only the connection-level counts -- identified/unanswered/per-protocol, still
+//! computed from `SessionProto` and the five-tuple rather than from buffered bytes -- are
+//! produced. Useful for a quick read on parser coverage without the I/O and memory cost of
+//! actually capturing anything.
+//!
 //! ## IP anonymization
 //! Passing `--anon-key` rewrites the source and destination IP address of every frame with
 //! Crypto-PAn (`cryptopan` module) before it is written, so a capture meant to leave a trusted
@@ -45,7 +51,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Parser, Debug)]
@@ -96,6 +102,12 @@ struct Args {
     /// Only meaningful with --anon-key.
     #[clap(long, value_name = "N", default_value_t = 128)]
     anon_bits_v6: u32,
+
+    /// Skip capturing packets entirely: no frames are buffered or written, and no .pcap files
+    /// are created. Only the connection-level counts (identified/unanswered/per-protocol) are
+    /// produced. Makes --outfile-prefix, --max-frames, and --anon-key* irrelevant.
+    #[clap(long)]
+    no_pcap: bool,
 }
 
 /// Sampling denominator, read once per connection by [`SampledConn::new`].
@@ -111,6 +123,12 @@ static MAX_FRAMES: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// Minimum captured bytes a sampled connection must carry to be written out; read once per
 /// connection in `finalize`. 0 means no threshold.
 static MIN_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Set from `--no-pcap`. When true, `update` never copies packet data into `self.frames`, and
+/// `finalize` never anonymizes or writes it -- the connection-level counts (identified,
+/// unanswered, per-protocol) are produced exactly as normal, since those come from `SessionProto`
+/// and the five-tuple/`dir` bit rather than from the buffered bytes.
+static NO_PCAP: AtomicBool = AtomicBool::new(false);
 
 /// Connections seen at teardown that a parser did identify.
 static CONNS_IDENTIFIED: AtomicUsize = AtomicUsize::new(0);
@@ -234,6 +252,11 @@ impl SampledConn {
     /// capture altogether -- and whether it is even wanted is not known until teardown, when
     /// protocol discovery has finished. The frames kept are the *first* ones, which is what
     /// matters downstream: dissectors identify a protocol from the start of a connection.
+    ///
+    /// Under `--no-pcap` this skips the copy into `self.frames` entirely -- that copy is the
+    /// actual "packet capturing" cost the flag exists to avoid -- but still adds the packet's
+    /// length to `total_bytes`, so `--min-bytes` and the run summary behave identically to a
+    /// normal run; only the bytes themselves are never retained.
     #[callback_fn("SampledConn,level=InL4Conn")]
     fn update(&mut self, pdu: &L4Pdu) -> bool {
         if !self.sampled {
@@ -241,7 +264,9 @@ impl SampledConn {
         }
         // `dir` is true for orig -> resp, so anything else is the responder answering.
         self.saw_responder |= !pdu.dir;
-        if self.frames.len() < MAX_FRAMES.load(Ordering::Relaxed) {
+        if NO_PCAP.load(Ordering::Relaxed) {
+            self.total_bytes += pdu.mbuf_ref().data().len();
+        } else if self.frames.len() < MAX_FRAMES.load(Ordering::Relaxed) {
             let frame = pdu.mbuf_ref().data().to_vec();
             self.total_bytes += frame.len();
             self.frames.push(frame);
@@ -289,19 +314,21 @@ impl SampledConn {
             return false;
         }
 
-        if let Some(cp) = CRYPTOPAN.get() {
-            for frame in &mut self.frames {
-                anonymize_frame(frame, cp);
+        if !NO_PCAP.load(Ordering::Relaxed) {
+            if let Some(cp) = CRYPTOPAN.get() {
+                for frame in &mut self.frames {
+                    anonymize_frame(frame, cp);
+                }
             }
-        }
 
-        writer(core_id)
-            .lock()
-            .unwrap()
-            .write_conn(&self.frames)
-            .unwrap_or_else(|e| {
-                panic!("Failed to write capture for core {}: {}", core_id.raw(), e)
-            });
+            writer(core_id)
+                .lock()
+                .unwrap()
+                .write_conn(&self.frames)
+                .unwrap_or_else(|e| {
+                    panic!("Failed to write capture for core {}: {}", core_id.raw(), e)
+                });
+        }
         CONNS_WRITTEN.fetch_add(1, Ordering::Relaxed);
         if self.truncated {
             CONNS_TRUNCATED.fetch_add(1, Ordering::Relaxed);
@@ -488,6 +515,7 @@ fn main() {
     );
 
     MIN_BYTES.store(args.min_bytes, Ordering::Relaxed);
+    NO_PCAP.store(args.no_pcap, Ordering::Relaxed);
 
     if let Some(key_path) = &args.anon_key {
         let key_bytes = std::fs::read(key_path)
@@ -507,42 +535,57 @@ fn main() {
 
     let config = load_config(&args.config);
 
-    let core_ids = config.get_all_core_ids();
-    let nb_slots = core_ids.iter().map(|c| c.raw() as usize).max().unwrap_or(0) + 1;
-    let mut writers = Vec::with_capacity(nb_slots);
-    writers.resize_with(nb_slots, || None);
-    for core_id in &core_ids {
-        let path = PathBuf::from(format!(
-            "{}_core{}.pcap",
-            args.outfile_prefix,
-            core_id.raw()
-        ));
-        let pcap = PcapWriter::create(&path)
-            .unwrap_or_else(|e| panic!("Failed to create {}: {}", path.display(), e));
-        writers[core_id.raw() as usize] = Some(Mutex::new(pcap));
+    if !args.no_pcap {
+        let core_ids = config.get_all_core_ids();
+        let nb_slots = core_ids.iter().map(|c| c.raw() as usize).max().unwrap_or(0) + 1;
+        let mut writers = Vec::with_capacity(nb_slots);
+        writers.resize_with(nb_slots, || None);
+        for core_id in &core_ids {
+            let path = PathBuf::from(format!(
+                "{}_core{}.pcap",
+                args.outfile_prefix,
+                core_id.raw()
+            ));
+            let pcap = PcapWriter::create(&path)
+                .unwrap_or_else(|e| panic!("Failed to create {}: {}", path.display(), e));
+            writers[core_id.raw() as usize] = Some(Mutex::new(pcap));
+        }
+        WRITERS
+            .set(writers)
+            .ok()
+            .expect("writers already initialized");
     }
-    WRITERS
-        .set(writers)
-        .ok()
-        .expect("writers already initialized");
 
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config, filter).unwrap();
     runtime.run();
 
-    for pcap in WRITERS.get().unwrap().iter().flatten() {
-        pcap.lock().unwrap().inner.flush().unwrap();
+    // WRITERS is only populated when capturing, so there's nothing to flush under --no-pcap.
+    if let Some(writers) = WRITERS.get() {
+        for pcap in writers.iter().flatten() {
+            pcap.lock().unwrap().inner.flush().unwrap();
+        }
     }
 
     // Counts cover sampled connections only: unsampled ones unsubscribe on their first packet
     // and so never reach `finalize`, which is exactly the work being avoided.
-    println!(
-        "\nSampled 1 in {} connections. Of those, identified {} by parsing and wrote {} \
-         unidentified ones to {}_core*.pcap",
-        args.sample_rate,
-        CONNS_IDENTIFIED.load(Ordering::Relaxed),
-        CONNS_WRITTEN.load(Ordering::Relaxed),
-        args.outfile_prefix,
-    );
+    if args.no_pcap {
+        println!(
+            "\nSampled 1 in {} connections. Of those, identified {} by parsing; {} were \
+             unidentified (packet capture skipped: --no-pcap).",
+            args.sample_rate,
+            CONNS_IDENTIFIED.load(Ordering::Relaxed),
+            CONNS_WRITTEN.load(Ordering::Relaxed),
+        );
+    } else {
+        println!(
+            "\nSampled 1 in {} connections. Of those, identified {} by parsing and wrote {} \
+             unidentified ones to {}_core*.pcap",
+            args.sample_rate,
+            CONNS_IDENTIFIED.load(Ordering::Relaxed),
+            CONNS_WRITTEN.load(Ordering::Relaxed),
+            args.outfile_prefix,
+        );
+    }
     println!(
         "Skipped {} unanswered SYNs (TCP connections the responder never answered).",
         CONNS_UNANSWERED.load(Ordering::Relaxed)
@@ -572,10 +615,12 @@ fn main() {
             below_threshold, args.min_bytes
         );
     }
-    if CRYPTOPAN.get().is_some() {
-        println!("IP addresses in the capture were anonymized with Crypto-PAn.");
-    } else {
-        println!("IP addresses in the capture are NOT anonymized (pass --anon-key to enable).");
+    if !args.no_pcap {
+        if CRYPTOPAN.get().is_some() {
+            println!("IP addresses in the capture were anonymized with Crypto-PAn.");
+        } else {
+            println!("IP addresses in the capture are NOT anonymized (pass --anon-key to enable).");
+        }
     }
 
     let truncated = CONNS_TRUNCATED.load(Ordering::Relaxed);
@@ -585,8 +630,12 @@ fn main() {
             truncated, args.max_frames, args.max_frames
         );
     }
-    println!(
-        "Run ./examples/unidentified_conns/identify_protocols.sh {}_core*.pcap to see what they actually are.",
-        args.outfile_prefix
-    );
+    if args.no_pcap {
+        println!("No .pcap files were written (--no-pcap).");
+    } else {
+        println!(
+            "Run ./examples/unidentified_conns/identify_protocols.sh {}_core*.pcap to see what they actually are.",
+            args.outfile_prefix
+        );
+    }
 }
