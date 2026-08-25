@@ -28,6 +28,15 @@
 //! granularity approximation on that single packet), and -- critically, unlike the
 //! `app_offset` approach -- every packet after it is correctly counted as payload too,
 //! regardless of whether the parser is still actively running.
+//!
+//! ## `--min-bytes`
+//! Passing `--min-bytes N` excludes any connection whose own total byte count (handshake +
+//! payload for `EncBytesCallback`, tcp + udp for `TransportBytes`) is not more than `N` --
+//! its packets never reach any global counter at all, rather than being counted and then
+//! subtracted out. The check happens once per connection, in each callback's own
+//! `L4Terminated` handler, using that connection's own running total; the two callbacks never
+//! need to compare notes, since a connection matched by both tracks the same packets and so
+//! arrives at the same total independently. Default is 0, i.e. no filtering.
 
 use clap::Parser;
 use iris_compiler::{callback, callback_fn, datatype, datatype_fn, input_files, iris_end_macros};
@@ -51,6 +60,39 @@ struct Args {
         default_value = "./configs/offline.toml"
     )]
     config: PathBuf,
+
+    /// Only count a connection (and the packets in it) if its total byte count is more than N.
+    /// 0 (the default) counts every connection.
+    #[clap(short, long, value_name = "N", default_value_t = 0)]
+    min_bytes: usize,
+}
+
+/// Set from `--min-bytes`, read once per connection at `L4Terminated` by both
+/// `EncBytesCallback::finalize` and `record_transport_bytes`. 0 means no filtering.
+static MIN_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a connection with `total_bytes` clears the `--min-bytes` bar, i.e. should be
+/// counted. "More than" is strict, so a connection with exactly `min_bytes` bytes is excluded.
+fn clears_min_bytes(total_bytes: usize, min_bytes: usize) -> bool {
+    total_bytes > min_bytes
+}
+
+#[cfg(test)]
+mod min_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn zero_threshold_excludes_only_empty_connections() {
+        assert!(!clears_min_bytes(0, 0));
+        assert!(clears_min_bytes(1, 0));
+    }
+
+    #[test]
+    fn strictly_greater_than() {
+        assert!(!clears_min_bytes(100, 100));
+        assert!(clears_min_bytes(101, 100));
+        assert!(!clears_min_bytes(0, 100));
+    }
 }
 
 /// Running handshake/payload byte totals for one encrypted protocol.
@@ -141,6 +183,12 @@ impl EncBytesCallback {
             SessionProto::Ike => &*IKE_BYTES,
             _ => return false,
         };
+        // Below the bar: none of this connection's bytes are added, not even to a "dropped"
+        // bucket -- excluded connections are invisible to every printed total.
+        let total = self.handshake_bytes + self.payload_bytes;
+        if !clears_min_bytes(total, MIN_BYTES.load(Ordering::Relaxed)) {
+            return false;
+        }
         totals.add(self.handshake_bytes, self.payload_bytes);
         false
     }
@@ -185,6 +233,12 @@ impl Tracked for TransportBytes {
 
 #[callback("tcp or udp,level=L4Terminated")]
 fn record_transport_bytes(bytes: &TransportBytes) {
+    // Same threshold, applied to this callback's own total; see the `--min-bytes` module docs
+    // for why the two callbacks don't need to coordinate to agree on which connections count.
+    let total = bytes.tcp_bytes + bytes.udp_bytes;
+    if !clears_min_bytes(total, MIN_BYTES.load(Ordering::Relaxed)) {
+        return;
+    }
     TCP_BYTES.fetch_add(bytes.tcp_bytes, Ordering::Relaxed);
     UDP_BYTES.fetch_add(bytes.udp_bytes, Ordering::Relaxed);
 }
@@ -224,6 +278,7 @@ fn print_proto(name: &str, totals: &ByteTotals, transport_total: usize) {
 fn main() {
     env_logger::init();
     let args = Args::parse();
+    MIN_BYTES.store(args.min_bytes, Ordering::Relaxed);
     let config = load_config(&args.config);
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config, filter).unwrap();
     runtime.run();
@@ -232,6 +287,12 @@ fn main() {
     let udp_bytes = UDP_BYTES.load(Ordering::Relaxed);
     let transport_total = tcp_bytes + udp_bytes;
 
+    if args.min_bytes > 0 {
+        println!(
+            "\n(Connections with {} or fewer total bytes are excluded from every count below.)",
+            args.min_bytes
+        );
+    }
     println!("\n=== Encrypted protocol bytes: handshake % vs. payload %, and % of total transport traffic ===");
     print_proto("TLS", &TLS_BYTES, transport_total);
     print_proto("SSH", &SSH_BYTES, transport_total);
