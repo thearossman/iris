@@ -496,6 +496,45 @@ fn anonymize_ipv6_header(frame: &mut [u8], ip_off: usize, cp: &CryptoPAN) {
         .copy_from_slice(&cp.anonymize_ipv6(Ipv6Addr::from(dst)).octets());
 }
 
+/// Returns `100 * numerator / denominator`, or `None` if `denominator` is zero (e.g. no
+/// connections were sampled at all).
+fn pct(numerator: usize, denominator: usize) -> Option<f64> {
+    if denominator == 0 {
+        return None;
+    }
+    Some(100.0 * numerator as f64 / denominator as f64)
+}
+
+/// Formats a numerator alongside its share of `denominator`, e.g. `"12 (3.4%)"`, or just the
+/// bare count if `denominator` is zero.
+fn fmt_count_pct(numerator: usize, denominator: usize) -> String {
+    match pct(numerator, denominator) {
+        Some(p) => format!("{} ({:.1}%)", numerator, p),
+        None => numerator.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod pct_tests {
+    use super::*;
+
+    #[test]
+    fn zero_denominator_is_none() {
+        assert_eq!(pct(0, 0), None);
+        assert_eq!(pct(5, 0), None);
+        assert_eq!(fmt_count_pct(5, 0), "5");
+    }
+
+    #[test]
+    fn whole_and_fractional_shares() {
+        assert_eq!(pct(1, 4), Some(25.0));
+        assert_eq!(fmt_count_pct(1, 4), "1 (25.0%)");
+        assert_eq!(fmt_count_pct(1, 3), "1 (33.3%)");
+        assert_eq!(fmt_count_pct(3, 3), "3 (100.0%)");
+        assert_eq!(fmt_count_pct(0, 3), "0 (0.0%)");
+    }
+}
+
 #[input_files("$IRIS_HOME/datatypes/data.txt")]
 #[iris_end_macros]
 fn main() {
@@ -567,28 +606,36 @@ fn main() {
     }
 
     // Counts cover sampled connections only: unsampled ones unsubscribe on their first packet
-    // and so never reach `finalize`, which is exactly the work being avoided.
+    // and so never reach `finalize`, which is exactly the work being avoided. Every sampled
+    // connection lands in exactly one of these four buckets, so their sum is the right
+    // denominator for "share of sampled connections" below.
+    let identified = CONNS_IDENTIFIED.load(Ordering::Relaxed);
+    let unanswered = CONNS_UNANSWERED.load(Ordering::Relaxed);
+    let below_threshold = CONNS_BELOW_THRESHOLD.load(Ordering::Relaxed);
+    let written = CONNS_WRITTEN.load(Ordering::Relaxed);
+    let total_sampled = identified + unanswered + below_threshold + written;
+
     if args.no_pcap {
         println!(
             "\nSampled 1 in {} connections. Of those, identified {} by parsing; {} were \
              unidentified (packet capture skipped: --no-pcap).",
             args.sample_rate,
-            CONNS_IDENTIFIED.load(Ordering::Relaxed),
-            CONNS_WRITTEN.load(Ordering::Relaxed),
+            fmt_count_pct(identified, total_sampled),
+            fmt_count_pct(written, total_sampled),
         );
     } else {
         println!(
             "\nSampled 1 in {} connections. Of those, identified {} by parsing and wrote {} \
              unidentified ones to {}_core*.pcap",
             args.sample_rate,
-            CONNS_IDENTIFIED.load(Ordering::Relaxed),
-            CONNS_WRITTEN.load(Ordering::Relaxed),
+            fmt_count_pct(identified, total_sampled),
+            fmt_count_pct(written, total_sampled),
             args.outfile_prefix,
         );
     }
     println!(
         "Skipped {} unanswered SYNs (TCP connections the responder never answered).",
-        CONNS_UNANSWERED.load(Ordering::Relaxed)
+        fmt_count_pct(unanswered, total_sampled)
     );
 
     let mut by_protocol = vec![
@@ -605,14 +652,16 @@ fn main() {
     println!("\nIdentified connections by protocol (these were dropped, not written):");
     for (name, count) in by_protocol {
         if count > 0 {
-            println!("  {:<10} {}", name, count);
+            // Share of *identified* connections, not of all sampled ones -- this is a
+            // breakdown of the "identified" total printed above, not a new population.
+            println!("  {:<10} {}", name, fmt_count_pct(count, identified));
         }
     }
-    let below_threshold = CONNS_BELOW_THRESHOLD.load(Ordering::Relaxed);
     if args.min_bytes > 0 {
         println!(
             "Skipped {} connections carrying fewer than {} captured bytes (--min-bytes).",
-            below_threshold, args.min_bytes
+            fmt_count_pct(below_threshold, total_sampled),
+            args.min_bytes
         );
     }
     if !args.no_pcap {
@@ -626,8 +675,12 @@ fn main() {
     let truncated = CONNS_TRUNCATED.load(Ordering::Relaxed);
     if truncated > 0 {
         println!(
+            // Share of *written* connections -- truncation is only ever recorded for a
+            // connection that made it to disk, so `written` is the right denominator here.
             "{} of them hit the {}-frame cap and were truncated to their first {} frames.",
-            truncated, args.max_frames, args.max_frames
+            fmt_count_pct(truncated, written),
+            args.max_frames,
+            args.max_frames
         );
     }
     if args.no_pcap {

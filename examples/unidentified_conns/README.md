@@ -125,20 +125,30 @@ sudo env LD_LIBRARY_PATH=$LD_LIBRARY_PATH RUST_LOG=error ./target/release/uniden
 This writes one `unidentified_core<N>.pcap` per core and reports what it kept:
 
 ```
-Sampled 1 in 1 connections. Of those, identified 349 by parsing and wrote 283 unidentified ones to unidentified_core*.pcap
-Skipped 29 unanswered SYNs (TCP connections the responder never answered).
+Sampled 1 in 1 connections. Of those, identified 349 (52.8%) by parsing and wrote 283 (42.8%) unidentified ones to unidentified_core*.pcap
+Skipped 29 (4.4%) unanswered SYNs (TCP connections the responder never answered).
 
 Identified connections by protocol (these were dropped, not written):
-  TLS        210
-  DNS        84
-  HTTP       31
-  QUIC       17
-  SSH        7
+  TLS        210 (60.2%)
+  DNS        84 (24.1%)
+  HTTP       31 (8.9%)
+  QUIC       17 (4.9%)
+  SSH        7 (2.0%)
 IP addresses in the capture were anonymized with Crypto-PAn.
 ```
 
 Both counts cover sampled connections only — unsampled ones unsubscribe on their first packet and
 are never classified at all, which is precisely the work being skipped.
+
+Every percentage is a share of the population its line is actually describing, not a single
+grand total for the whole summary. "Identified", "wrote", and "unanswered" are each a share of
+*all sampled connections* — the four counts on the identified/unanswered/below-threshold/written
+finalize decision always sum to that total. The per-protocol breakdown below them is a share of
+*identified connections specifically* (its rows already sum to the "identified" count above), and
+a later "truncated" line, when present, is a share of *written connections* (truncation is only
+ever recorded for a connection that made it to disk). Mixing these up — e.g. reading a protocol's
+percentage as a share of all sampled connections rather than of identified ones — would overstate
+how rare each protocol is.
 
 The protocol breakdown is a byproduct of the identified/unidentified check `finalize` already
 runs, not a separate pass — it counts every connection that *was* identified, so it's the mirror
