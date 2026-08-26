@@ -128,6 +128,25 @@ def fmt_window(seconds):
     return f"{seconds:g}-s"
 
 
+def place_legend(fig, ax):
+    """Adds the legend in the widest column layout that actually fits inside the axes.
+
+    A fixed column count can't work across the range of figure sizes and font sizes this
+    script accepts: one wide row is right at default settings, but at a narrower --figsize or
+    a larger --font-size the same row runs past the axes and collides with the y-label. So
+    try widest-first and measure each candidate's rendered width rather than guessing from
+    character counts."""
+    legend = None
+    for ncol in (3, 2, 1):
+        if legend is not None:
+            legend.remove()
+        legend = ax.legend(loc="lower right", frameon=False, ncol=ncol)
+        fig.canvas.draw()
+        if legend.get_window_extent().width <= ax.get_window_extent().width:
+            break
+    return legend
+
+
 def parse_figsize(text):
     parts = text.split(",")
     if len(parts) != 2:
@@ -176,10 +195,22 @@ def main():
         "(default: 60)",
     )
     parser.add_argument(
+        "--font-size",
+        type=float,
+        default=12.0,
+        help="Base point size for axis labels; tick labels sit one point below it "
+        "(default: 12)",
+    )
+    parser.add_argument(
+        "--legend-font-size",
+        type=float,
+        help="Point size for the in-plot legend text (default: two points above --font-size)",
+    )
+    parser.add_argument(
         "--figsize",
         type=parse_figsize,
-        default=(6.5, 2.0),
-        help="Figure size as WIDTH,HEIGHT in inches (default: 6.5,2)",
+        default=(6.5, 2.6),
+        help="Figure size as WIDTH,HEIGHT in inches (default: 6.5,2.6)",
     )
     args = parser.parse_args()
 
@@ -208,6 +239,22 @@ def main():
     window = 1
     if args.smooth_secs > 0 and slice_width_s:
         window = max(1, round(args.smooth_secs / slice_width_s))
+
+    # Set before the figure is built, so tight_layout below measures the real text extents.
+    # The legend is sized independently of the axis text: it sits inside the plot rather than
+    # against its edge, so it needs to be a touch larger to read at the same distance.
+    legend_font_size = args.legend_font_size
+    if legend_font_size is None:
+        legend_font_size = args.font_size + 2
+    plt.rcParams.update(
+        {
+            "font.size": args.font_size,
+            "axes.labelsize": args.font_size,
+            "xtick.labelsize": args.font_size - 1,
+            "ytick.labelsize": args.font_size - 1,
+            "legend.fontsize": legend_font_size,
+        }
+    )
 
     fig, ax = plt.subplots(figsize=args.figsize)
     # One hue for the data, so the faint raw series reads as the same series as the mean
@@ -259,9 +306,9 @@ def main():
     ax.set_xlim(scaled_offsets[0], scaled_offsets[-1])
     ax.set_ylim(0, max(flows) * Y_HEADROOM)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / y_divisor:,.10g}"))
-    # The series sits near the top of a zero-based axis, so the lower half is free space.
-    ax.legend(loc="lower right", frameon=False, fontsize="small", ncol=3)
     fig.tight_layout()
+    # The series sits near the top of a zero-based axis, so the lower half is free space.
+    place_legend(fig, ax)
 
     if args.output:
         fig.savefig(args.output, dpi=200)
