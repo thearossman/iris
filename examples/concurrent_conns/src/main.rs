@@ -4,6 +4,10 @@
 //! parser, and DNS-over-TLS/QUIC traffic is already identified as TLS/QUIC by the parsers
 //! those protocols already register.
 //!
+//! The per-slice counts are always printed to stdout; passing `--outfile FILE` also writes
+//! them as two-column CSV (`slice_start_s,active_connections`), one row per slice, suitable
+//! for plotting directly with a spreadsheet, gnuplot, or `pandas.read_csv`.
+//!
 //! ## What "active" means
 //! A connection is active in a slice if its lifetime `[start_ts, last_ts]` overlaps that
 //! slice, where `start_ts`/`last_ts` come from the built-in `ConnDuration` datatype -- the
@@ -55,7 +59,9 @@ use iris_compiler::{callback, input_files, iris_end_macros};
 use iris_core::protocols::stream::SessionProto;
 use iris_core::{config::load_config, Runtime};
 use iris_datatypes::ConnDuration;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -83,6 +89,13 @@ struct Args {
     /// array, and counted in the overflow warning printed at the end of the run.
     #[clap(long, value_name = "SECS", default_value_t = 48 * 3600)]
     max_duration_secs: u64,
+
+    /// Optional path to also write the per-slice active-connection counts as CSV
+    /// (`slice_start_s,active_connections`), one row per slice -- e.g. for plotting with a
+    /// spreadsheet, gnuplot, or `pandas.read_csv`. If omitted, only the printed summary is
+    /// produced.
+    #[clap(short, long, parse(from_os_str), value_name = "FILE")]
+    outfile: Option<PathBuf>,
 }
 
 lazy_static! {
@@ -282,6 +295,21 @@ mod pct_tests {
     }
 }
 
+/// Writes the per-slice active-connection counts as CSV (`slice_start_s,active_connections`),
+/// one row per slice up to `last_nonzero` (inclusive), or just the header if `None`. Panics on
+/// any I/O failure -- there's no meaningful way to recover a partially written run's output.
+fn write_slice_csv(path: &Path, per_slice: &[i64], last_nonzero: Option<usize>, slice_ms: u64) {
+    let mut file =
+        File::create(path).unwrap_or_else(|e| panic!("Failed to create {}: {}", path.display(), e));
+    writeln!(file, "slice_start_s,active_connections").unwrap();
+    if let Some(last) = last_nonzero {
+        for (i, &count) in per_slice.iter().enumerate().take(last + 1) {
+            let offset_s = (i as u64 * slice_ms) as f64 / 1000.0;
+            writeln!(file, "{:.3},{}", offset_s, count).unwrap();
+        }
+    }
+}
+
 #[input_files("$IRIS_HOME/datatypes/data.txt")]
 #[iris_end_macros]
 fn main() {
@@ -336,6 +364,11 @@ fn main() {
             }
         }
         None => println!("(no encrypted connections observed)"),
+    }
+
+    if let Some(path) = &args.outfile {
+        write_slice_csv(path, &per_slice, last_nonzero, args.slice_ms);
+        println!("\nWrote per-slice counts to {}", path.display());
     }
 
     let total = TOTAL_CONNS.load(Ordering::Relaxed);
