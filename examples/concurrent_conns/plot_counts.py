@@ -10,9 +10,9 @@ connections, and each one is two unidirectional flows (one per five-tuple direct
 The figure is laid out for a paper: short and wide by default, since a roughly steady series
 carries its meaning in its level rather than its vertical structure, and zero-based so the
 magnitude claim is honest. The raw per-slice series is drawn faintly underneath a rolling
-mean, which is what stays legible at print size; a dashed line marks the mean level. Large
-counts are rescaled into thousands or millions, named in the axis label, so gridlines aren't
-labelled with seven-digit numbers.
+mean, which is what stays legible at print size; a dashed line marks the mean level, labelled
+with the exact figure. Large counts are rescaled into thousands or millions on the tick labels
+only, named in the axis label, so gridlines aren't labelled with seven-digit numbers.
 
 `--warmup-mins`/`--cooldown-mins` drop the ends of the run and re-base the remainder to t=0.
 Both ends are measurement artifacts rather than network behavior: conntrack only counts a
@@ -110,13 +110,6 @@ def pick_y_unit(max_value):
         if max_value >= threshold:
             return divisor, name
     return 1, None
-
-
-def fmt_scaled(value, divisor):
-    """Formats one y-value in the axis's own unit, so legend numbers and tick labels are
-    directly comparable."""
-    decimals = 0 if divisor == 1 else 1
-    return f"{value / divisor:,.{decimals}f}"
 
 
 def fmt_window(seconds):
@@ -293,7 +286,10 @@ def main():
         linestyle="--",
         linewidth=0.8,
         color="0.35",
-        label=f"mean {fmt_scaled(mean_flows, y_divisor)}",
+        # Spelled out in full rather than in the axis's unit: the ticks are for reading the
+        # shape of the series, but this is the number a reader quotes, and it should be
+        # unambiguous on its own.
+        label=f"mean {mean_flows:,.0f}",
     )
 
     # Wrapped, and the unit kept on its own line: rotated upright, the label's longest line
