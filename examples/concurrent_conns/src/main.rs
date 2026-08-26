@@ -39,11 +39,12 @@
 //! every per-slice count, regardless of how many slices it actually spans. A single prefix
 //! sum over the array after `runtime.run()` returns recovers the same per-slice active counts
 //! that per-connection post-processing would have produced. Memory is `O(slices)`, fixed by
-//! `--max-duration-secs` at startup, not `O(connections)` -- a two-hour run at the default
-//! 1-second slice width costs under a hundred KB of counters, no matter how many connections
-//! it observes. A connection whose lifetime runs past `--max-duration-secs` (sized generously,
-//! 48 hours by default) is folded into the final slice rather than growing the array, and
-//! counted in the "overflow" warning printed at the end of the run.
+//! `--max-duration-secs` and `--slice-ms` at startup -- 8 bytes per slice, so the default
+//! 48-hour horizon at the default 1-second width costs about 1.4MB, regardless of how many
+//! connections are observed or how long the run actually lasts (a run stopped after ten
+//! minutes still allocates the array sized for the full horizon). A connection whose lifetime
+//! runs past `--max-duration-secs` is folded into the final slice rather than growing the
+//! array, and counted in the "overflow" warning printed at the end of the run.
 //!
 //! ## Timestamps are processing time, not capture time
 //! `ConnDuration`'s timestamps come from `L4Pdu::ts`, which Iris sets from `Instant::now()`
@@ -62,7 +63,7 @@ use iris_core::{config::load_config, Runtime};
 use iris_datatypes::ConnDuration;
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -84,10 +85,11 @@ struct Args {
     #[clap(long, value_name = "MS", default_value_t = 1000)]
     slice_ms: u64,
 
-    /// Upper bound on how long the run can last, in seconds. Sizes the fixed-size slice
-    /// array up front, so per-connection bookkeeping never allocates. A connection whose
-    /// lifetime runs past this horizon is folded into the final slice instead of growing the
-    /// array, and counted in the overflow warning printed at the end of the run.
+    /// Length of the accounting horizon, in seconds -- does not limit how long the run itself
+    /// lasts. Sizes the fixed-size slice array up front, so per-connection bookkeeping never
+    /// allocates. A connection whose lifetime runs past this horizon is folded into the final
+    /// slice instead of growing the array, and counted in the overflow warning printed at the
+    /// end of the run.
     #[clap(long, value_name = "SECS", default_value_t = 48 * 3600)]
     max_duration_secs: u64,
 
@@ -301,18 +303,44 @@ mod pct_tests {
     }
 }
 
-/// Writes the per-slice active-connection counts as CSV (`slice_start_s,active_connections`),
-/// one row per slice up to `last_nonzero` (inclusive), or just the header if `None`. Panics on
-/// any I/O failure -- there's no meaningful way to recover a partially written run's output.
-fn write_slice_csv(path: &Path, per_slice: &[i64], last_nonzero: Option<usize>, slice_ms: u64) {
-    let mut file =
-        File::create(path).unwrap_or_else(|e| panic!("Failed to create {}: {}", path.display(), e));
+/// Turns per-slice counts into `(offset_seconds, count)` rows, one per slice up to
+/// `last_nonzero` inclusive (empty if `None`) -- the single source of truth for which slices
+/// get shown, shared by both the stdout table and the CSV file so they can't drift apart.
+fn slice_rows(per_slice: &[i64], last_nonzero: Option<usize>, slice_ms: u64) -> Vec<(f64, i64)> {
+    let Some(last) = last_nonzero else {
+        return Vec::new();
+    };
+    per_slice[..=last]
+        .iter()
+        .enumerate()
+        .map(|(i, &count)| ((i as u64 * slice_ms) as f64 / 1000.0, count))
+        .collect()
+}
+
+/// Writes `rows` as CSV (`slice_start_s,active_connections`) to an already-open file. Panics
+/// on any I/O failure -- there's no meaningful way to recover a partially written run's output.
+fn write_slice_csv(file: &mut File, rows: &[(f64, i64)]) {
     writeln!(file, "slice_start_s,active_connections").unwrap();
-    if let Some(last) = last_nonzero {
-        for (i, &count) in per_slice.iter().enumerate().take(last + 1) {
-            let offset_s = (i as u64 * slice_ms) as f64 / 1000.0;
-            writeln!(file, "{:.3},{}", offset_s, count).unwrap();
-        }
+    for (offset_s, count) in rows {
+        writeln!(file, "{:.3},{}", offset_s, count).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod slice_rows_tests {
+    use super::*;
+
+    #[test]
+    fn no_activity_is_empty() {
+        assert_eq!(slice_rows(&[0, 0, 0], None, 1000), Vec::new());
+    }
+
+    #[test]
+    fn truncates_at_last_nonzero() {
+        assert_eq!(
+            slice_rows(&[1, 2, 0, 0], Some(1), 1000),
+            vec![(0.0, 1), (1.0, 2)]
+        );
     }
 }
 
@@ -327,18 +355,30 @@ fn main() {
         "--max-duration-secs must be at least 1"
     );
 
+    // Opened up front, before the (potentially hours-long) capture runs, so a bad --outfile
+    // path (unwritable directory, missing parent, etc.) fails immediately instead of losing
+    // the whole run's output to a panic after `runtime.run()` returns.
+    let mut outfile = File::create(&args.outfile)
+        .unwrap_or_else(|e| panic!("Failed to create {}: {}", args.outfile.display(), e));
+
     SLICE_MS.store(args.slice_ms, Ordering::Relaxed);
-    let num_slices = (args.max_duration_secs * 1000 / args.slice_ms) as usize + 1;
+    let total_ms = args.max_duration_secs.checked_mul(1000).unwrap_or_else(|| {
+        panic!(
+            "--max-duration-secs {} is too large (overflows when converted to milliseconds)",
+            args.max_duration_secs
+        )
+    });
+    let num_slices = (total_ms / args.slice_ms) as usize + 1;
     DELTAS
         .set((0..=num_slices).map(|_| AtomicI64::new(0)).collect())
         .expect("DELTAS already initialized");
-    // Force the epoch now, before any connection's start/end times can be captured, so slice
-    // 0 lines up with runtime start rather than with whenever the first connection happens to
-    // terminate.
-    lazy_static::initialize(&EPOCH);
 
     let config = load_config(&args.config);
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config, filter).unwrap();
+    // Force the epoch now, immediately before packet processing starts, so slice 0 lines up
+    // with when the capture actually begins rather than including config load / DPDK EAL init
+    // time that happened above.
+    lazy_static::initialize(&EPOCH);
     runtime.run();
 
     let deltas = DELTAS.get().expect("DELTAS initialized");
@@ -357,22 +397,21 @@ fn main() {
             max_slice = i;
         }
     }
+    let rows = slice_rows(&per_slice, last_nonzero, args.slice_ms);
 
     println!(
         "=== Concurrent encrypted connections (TLS, SSH, QUIC, WireGuard, IKE) per {}ms slice ===",
         args.slice_ms
     );
-    match last_nonzero {
-        Some(last) => {
-            for (i, &count) in per_slice.iter().enumerate().take(last + 1) {
-                let offset_s = (i as u64 * args.slice_ms) as f64 / 1000.0;
-                println!("t={:>10.3}s  {}", offset_s, count);
-            }
+    if rows.is_empty() {
+        println!("(no encrypted connections observed)");
+    } else {
+        for (offset_s, count) in &rows {
+            println!("t={:>10.3}s  {}", offset_s, count);
         }
-        None => println!("(no encrypted connections observed)"),
     }
 
-    write_slice_csv(&args.outfile, &per_slice, last_nonzero, args.slice_ms);
+    write_slice_csv(&mut outfile, &rows);
     println!("\nWrote per-slice counts to {}", args.outfile.display());
 
     let total = TOTAL_CONNS.load(Ordering::Relaxed);
