@@ -4,9 +4,10 @@
 //! parser, and DNS-over-TLS/QUIC traffic is already identified as TLS/QUIC by the parsers
 //! those protocols already register.
 //!
-//! The per-slice counts are always printed to stdout; passing `--outfile FILE` also writes
-//! them as two-column CSV (`slice_start_s,active_connections`), one row per slice, suitable
-//! for plotting directly with a spreadsheet, gnuplot, or `pandas.read_csv`.
+//! The per-slice counts are printed to stdout and also written as two-column CSV
+//! (`slice_start_s,active_connections`, one row per slice) to `--outfile` (default
+//! `counts.csv`), suitable for plotting directly with a spreadsheet, gnuplot, or
+//! `pandas.read_csv`.
 //!
 //! ## What "active" means
 //! A connection is active in a slice if its lifetime `[start_ts, last_ts]` overlaps that
@@ -90,12 +91,17 @@ struct Args {
     #[clap(long, value_name = "SECS", default_value_t = 48 * 3600)]
     max_duration_secs: u64,
 
-    /// Optional path to also write the per-slice active-connection counts as CSV
+    /// Path to also write the per-slice active-connection counts as CSV
     /// (`slice_start_s,active_connections`), one row per slice -- e.g. for plotting with a
-    /// spreadsheet, gnuplot, or `pandas.read_csv`. If omitted, only the printed summary is
-    /// produced.
-    #[clap(short, long, parse(from_os_str), value_name = "FILE")]
-    outfile: Option<PathBuf>,
+    /// spreadsheet, gnuplot, or `pandas.read_csv`.
+    #[clap(
+        short,
+        long,
+        parse(from_os_str),
+        value_name = "FILE",
+        default_value = "counts.csv"
+    )]
+    outfile: PathBuf,
 }
 
 lazy_static! {
@@ -366,10 +372,8 @@ fn main() {
         None => println!("(no encrypted connections observed)"),
     }
 
-    if let Some(path) = &args.outfile {
-        write_slice_csv(path, &per_slice, last_nonzero, args.slice_ms);
-        println!("\nWrote per-slice counts to {}", path.display());
-    }
+    write_slice_csv(&args.outfile, &per_slice, last_nonzero, args.slice_ms);
+    println!("\nWrote per-slice counts to {}", args.outfile.display());
 
     let total = TOTAL_CONNS.load(Ordering::Relaxed);
     println!("\n=== Summary ===");
