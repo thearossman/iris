@@ -112,6 +112,19 @@ def pick_y_unit(max_value):
     return 1, None
 
 
+def fmt_sample_label(slice_width_s):
+    """Legend label for the raw series. Named after the run's actual slice width, since
+    concurrent_conns' --slice-ms is configurable and a hardcoded "per-second" would quietly
+    mislabel a run recorded at any other width."""
+    if slice_width_s is None:
+        return "per-slice"
+    if abs(slice_width_s - 1) < 1e-6:
+        return "per-second"
+    if abs(slice_width_s - 60) < 1e-6:
+        return "per-minute"
+    return f"per {slice_width_s:g}s"
+
+
 def fmt_window(seconds):
     """Human-readable smoothing window, for the legend entry."""
     if seconds >= 3600 and seconds % 3600 == 0:
@@ -262,7 +275,7 @@ def main():
             linewidth=0.5,
             alpha=0.3,
             color=color,
-            label="per-slice",
+            label=fmt_sample_label(slice_width_s),
         )
         ax.plot(
             scaled_offsets,
@@ -278,7 +291,7 @@ def main():
             where="post",
             linewidth=0.8,
             color=color,
-            label="per-slice",
+            label=fmt_sample_label(slice_width_s),
         )
     y_divisor, y_unit = pick_y_unit(max(flows))
     ax.axhline(
