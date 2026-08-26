@@ -10,7 +10,9 @@ connections, and each one is two unidirectional flows (one per five-tuple direct
 The figure is laid out for a paper: short and wide by default, since a roughly steady series
 carries its meaning in its level rather than its vertical structure, and zero-based so the
 magnitude claim is honest. The raw per-slice series is drawn faintly underneath a rolling
-mean, which is what stays legible at print size; a dashed line marks the mean level.
+mean, which is what stays legible at print size; a dashed line marks the mean level. Large
+counts are rescaled into thousands or millions, named in the axis label, so gridlines aren't
+labelled with seven-digit numbers.
 
 `--warmup-mins`/`--cooldown-mins` drop the ends of the run and re-base the remainder to t=0.
 Both ends are measurement artifacts rather than network behavior: conntrack only counts a
@@ -26,10 +28,17 @@ import argparse
 import csv
 
 import matplotlib.pyplot as plt
-from matplotlib.ticker import StrMethodFormatter
+from matplotlib.ticker import FuncFormatter
 
 MINUTES_THRESHOLD_S = 10 * 60
 HOURS_THRESHOLD_S = 3 * 60 * 60
+
+# Y-axis tick scaling, largest unit first: a series in the millions reads better as ticks of
+# "1,150" against a "(thousands)" axis label than as "1,150,000" repeated up the gridlines.
+Y_UNITS = [
+    (10_000_000, 1_000_000, "millions"),
+    (10_000, 1_000, "thousands"),
+]
 
 # Headroom above the tallest sample, so the mean annotation has somewhere to sit.
 Y_HEADROOM = 1.15
@@ -93,6 +102,21 @@ def pick_time_unit(duration_s):
     if duration_s > MINUTES_THRESHOLD_S:
         return "minutes", 60.0
     return "seconds", 1.0
+
+
+def pick_y_unit(max_value):
+    """Divisor and unit name for the y-axis, or (1, None) to plot raw counts."""
+    for threshold, divisor, name in Y_UNITS:
+        if max_value >= threshold:
+            return divisor, name
+    return 1, None
+
+
+def fmt_scaled(value, divisor):
+    """Formats one y-value in the axis's own unit, so legend numbers and tick labels are
+    directly comparable."""
+    decimals = 0 if divisor == 1 else 1
+    return f"{value / divisor:,.{decimals}f}"
 
 
 def fmt_window(seconds):
@@ -216,19 +240,25 @@ def main():
             color=color,
             label="per-slice",
         )
+    y_divisor, y_unit = pick_y_unit(max(flows))
     ax.axhline(
         mean_flows,
         linestyle="--",
         linewidth=0.8,
         color="0.35",
-        label=f"mean {mean_flows:,.0f}",
+        label=f"mean {fmt_scaled(mean_flows, y_divisor)}",
     )
 
+    # Wrapped, and the unit kept on its own line: rotated upright, the label's longest line
+    # has to fit the figure's *height*, which is deliberately small here.
+    ylabel = "Active encrypted\nunidirectional flows"
+    if y_unit:
+        ylabel += f"\n({y_unit})"
     ax.set_xlabel(f"Time ({unit})")
-    ax.set_ylabel("Active encrypted\nunidirectional flows")
+    ax.set_ylabel(ylabel)
     ax.set_xlim(scaled_offsets[0], scaled_offsets[-1])
     ax.set_ylim(0, max(flows) * Y_HEADROOM)
-    ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / y_divisor:,.10g}"))
     # The series sits near the top of a zero-based axis, so the lower half is free space.
     ax.legend(loc="lower right", frameon=False, fontsize="small", ncol=3)
     fig.tight_layout()
