@@ -17,6 +17,9 @@ pub use http_transaction::HttpTransaction;
 pub mod ike_header;
 pub use ike_header::IkeHeader;
 
+pub mod maybe_quic;
+pub use maybe_quic::*;
+
 pub mod packet_list;
 pub use packet_list::*;
 
