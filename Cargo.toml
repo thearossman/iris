@@ -4,6 +4,7 @@ members = [
     "datatypes",
     "examples/basic",
     "examples/basic_dispatching",
+    "examples/concurrent_conns",
     "examples/enc_conns",
     "examples/encrypted_bytes",
     "examples/measuring_sec",
