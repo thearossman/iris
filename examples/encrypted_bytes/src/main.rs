@@ -1,6 +1,8 @@
 //! Counts bytes across all of Iris's encrypted stream protocols (TLS, SSH, QUIC,
 //! WireGuard, IKE), split into cleartext handshake bytes vs. encrypted payload bytes, plus
-//! total TCP and UDP traffic.
+//! heuristically-detected mid-stream QUIC and Zoom media traffic (`MaybeQuic`/`MaybeZoom`,
+//! counted entirely as payload -- see "`MaybeQuic`/`MaybeZoom` bytes" below), plus total TCP
+//! and UDP traffic.
 //!
 //! ## Handshake vs. payload split
 //! This deliberately does NOT use `L4Pdu::app_body_offset()`/`pdu.ctxt.app_offset`, despite
@@ -29,6 +31,12 @@
 //! `app_offset` approach -- every packet after it is correctly counted as payload too,
 //! regardless of whether the parser is still actively running.
 //!
+//! ## `MaybeQuic`/`MaybeZoom` bytes
+//! `MaybeQuic` and `MaybeZoom` (`datatypes/src/maybe_quic.rs`, `datatypes/src/maybe_zoom.rs`)
+//! are heuristic streaming filters, not real L7 parsers -- they never fire `L7EndHdrs`, so
+//! there's no handshake/payload boundary to detect for them. Every byte on a connection they
+//! accept is counted as payload; `handshake` stays 0 for `MAYBE_QUIC_BYTES`/`MAYBE_ZOOM_BYTES`.
+//!
 //! ## `--min-bytes`
 //! Passing `--min-bytes N` excludes any connection whose own total byte count (handshake +
 //! payload for `EncBytesCallback`, tcp + udp for `TransportBytes`) is not more than `N` --
@@ -45,6 +53,7 @@ use iris_core::protocols::packet::udp::UDP_PROTOCOL;
 use iris_core::protocols::stream::SessionProto;
 use iris_core::subscription::{StreamingCallback, Tracked};
 use iris_core::{config::load_config, L4Pdu, Runtime};
+use iris_datatypes::ByteCount;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -121,6 +130,8 @@ lazy_static! {
     static ref QUIC_BYTES: ByteTotals = ByteTotals::new();
     static ref WIREGUARD_BYTES: ByteTotals = ByteTotals::new();
     static ref IKE_BYTES: ByteTotals = ByteTotals::new();
+    static ref MAYBE_QUIC_BYTES: ByteTotals = ByteTotals::new();
+    static ref MAYBE_ZOOM_BYTES: ByteTotals = ByteTotals::new();
     static ref TCP_BYTES: AtomicUsize = AtomicUsize::new(0);
     static ref UDP_BYTES: AtomicUsize = AtomicUsize::new(0);
 }
@@ -243,6 +254,26 @@ fn record_transport_bytes(bytes: &TransportBytes) {
     UDP_BYTES.fetch_add(bytes.udp_bytes, Ordering::Relaxed);
 }
 
+/// `MaybeQuic`/`MaybeZoom` are heuristic filters, not real L7 parsers, so there's no handshake
+/// to split out -- the whole connection's bytes count as payload. See the module docs.
+#[callback("MaybeQuic,level=L4Terminated")]
+fn record_maybe_quic_bytes(bytes: &ByteCount) {
+    let total = bytes.total();
+    if !clears_min_bytes(total, MIN_BYTES.load(Ordering::Relaxed)) {
+        return;
+    }
+    MAYBE_QUIC_BYTES.add(0, total);
+}
+
+#[callback("MaybeZoom,level=L4Terminated")]
+fn record_maybe_zoom_bytes(bytes: &ByteCount) {
+    let total = bytes.total();
+    if !clears_min_bytes(total, MIN_BYTES.load(Ordering::Relaxed)) {
+        return;
+    }
+    MAYBE_ZOOM_BYTES.add(0, total);
+}
+
 /// Returns `100 * numerator / denominator` as a percentage, or `None` if `denominator` is
 /// zero (e.g. a protocol that was never observed in this trace).
 fn pct(numerator: usize, denominator: usize) -> Option<f64> {
@@ -299,6 +330,8 @@ fn main() {
     print_proto("QUIC", &QUIC_BYTES, transport_total);
     print_proto("WireGuard", &WIREGUARD_BYTES, transport_total);
     print_proto("IKE", &IKE_BYTES, transport_total);
+    print_proto("MaybeQUIC", &MAYBE_QUIC_BYTES, transport_total);
+    print_proto("MaybeZoom", &MAYBE_ZOOM_BYTES, transport_total);
 
     println!("\n=== Total transport-layer traffic ===");
     println!("TCP: {}", fmt_pct(pct(tcp_bytes, transport_total)));
