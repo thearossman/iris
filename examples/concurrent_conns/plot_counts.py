@@ -203,14 +203,14 @@ def main():
     parser.add_argument(
         "--font-size",
         type=float,
-        default=12.0,
+        default=14.0,
         help="Base point size for axis labels; tick labels sit one point below it "
-        "(default: 12)",
+        "(default: 14)",
     )
     parser.add_argument(
         "--legend-font-size",
         type=float,
-        help="Point size for the in-plot legend text (default: two points above --font-size)",
+        help="Point size for the in-plot legend text (default: matches --font-size)",
     )
     parser.add_argument(
         "--figsize",
@@ -247,11 +247,11 @@ def main():
         window = max(1, round(args.smooth_secs / slice_width_s))
 
     # Set before the figure is built, so tight_layout below measures the real text extents.
-    # The legend is sized independently of the axis text: it sits inside the plot rather than
-    # against its edge, so it needs to be a touch larger to read at the same distance.
+    # Legend text matches the axis text by default, but stays separately settable so either
+    # can be nudged without dragging the other along.
     legend_font_size = args.legend_font_size
     if legend_font_size is None:
-        legend_font_size = args.font_size + 2
+        legend_font_size = args.font_size
     plt.rcParams.update(
         {
             "font.size": args.font_size,
