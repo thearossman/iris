@@ -148,7 +148,16 @@ where
                     }
                 }
             }
-            L4Conn::Udp(_) => self.info.consume_stream(&mut pdu, subscription, registry),
+            L4Conn::Udp(_) => {
+                // Mark the post-parse pass, exactly as the first-packet path in
+                // `ConnTracker::process_packet` does. UDP has no reassembly, so without this
+                // the `new_packet` inside `consume_stream` still reports `InL4Conn` -- the
+                // same transition already dispatched by the pre-reassembly update above --
+                // and every InL4Conn datatype, callback, and streaming filter sees each UDP
+                // packet twice.
+                pdu.ctxt.reassembled = true;
+                self.info.consume_stream(&mut pdu, subscription, registry)
+            }
         }
     }
 
