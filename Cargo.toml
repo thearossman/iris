@@ -5,6 +5,7 @@ members = [
     "examples/basic",
     "examples/basic_dispatching",
     "examples/concurrent_conns",
+    "examples/bytes_over_time",
     "examples/enc_conns",
     "examples/encrypted_bytes",
     "examples/measuring_sec",
