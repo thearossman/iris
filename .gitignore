@@ -7,3 +7,4 @@ Cargo.lock
 *.jsonl
 *.DS_Store
 .claude
+.codex
