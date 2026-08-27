@@ -5,6 +5,9 @@ use iris_core::{protocols::Session, L4Pdu};
 pub mod conn_fts;
 pub use conn_fts::*;
 
+pub mod capwap_header;
+pub use capwap_header::CapwapHeader;
+
 pub mod connection;
 pub use connection::ConnRecord;
 

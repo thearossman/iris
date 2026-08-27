@@ -4,6 +4,7 @@
 //! considered a "stream-level" protocol, even if it is a datagram-based protocol in the
 //! traditional-sense.
 
+pub mod capwap;
 #[doc(hidden)]
 pub mod conn;
 pub mod dns;
@@ -14,6 +15,7 @@ pub mod ssh;
 pub mod tls;
 pub mod wireguard;
 
+use self::capwap::{parser::CapwapParser, Capwap};
 use self::conn::ConnField;
 use self::conn::{Ipv4CData, Ipv6CData, TcpCData, UdpCData};
 use self::dns::{parser::DnsParser, Dns};
@@ -33,8 +35,16 @@ use anyhow::Result;
 use quic::QuicConn;
 use strum_macros::EnumString;
 
-pub const IMPLEMENTED_PROTOCOLS: [&str; 7] =
-    ["tls", "dns", "http", "quic", "ssh", "wireguard", "ike"];
+pub const IMPLEMENTED_PROTOCOLS: [&str; 8] = [
+    "tls",
+    "dns",
+    "http",
+    "quic",
+    "ssh",
+    "wireguard",
+    "ike",
+    "capwap",
+];
 
 /// Represents the result of parsing one packet as a protocol message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +221,7 @@ pub enum SessionData {
     Ssh(Box<Ssh>),
     Wireguard(Box<WireGuard>),
     Ike(Box<Ike>),
+    Capwap(Box<Capwap>),
     Null,
 }
 
@@ -225,6 +236,7 @@ pub enum SessionProto {
     Ssh,
     Wireguard,
     Ike,
+    Capwap,
     Ipv4,
     Ipv6,
     Tcp,
@@ -277,6 +289,7 @@ pub enum ConnParser {
     Ssh(SshParser),
     Wireguard(WireGuardParser),
     Ike(IkeParser),
+    Capwap(CapwapParser),
     Unknown,
 }
 
@@ -291,6 +304,7 @@ impl ConnParser {
             ConnParser::Ssh(_) => ConnParser::Ssh(SshParser::default()),
             ConnParser::Wireguard(_) => ConnParser::Wireguard(WireGuardParser::default()),
             ConnParser::Ike(_) => ConnParser::Ike(IkeParser::default()),
+            ConnParser::Capwap(_) => ConnParser::Capwap(CapwapParser::default()),
             ConnParser::Unknown => ConnParser::Unknown,
         }
     }
@@ -305,6 +319,7 @@ impl ConnParser {
             ConnParser::Ssh(parser) => parser.parse(pdu),
             ConnParser::Wireguard(parser) => parser.parse(pdu),
             ConnParser::Ike(parser) => parser.parse(pdu),
+            ConnParser::Capwap(parser) => parser.parse(pdu),
             ConnParser::Unknown => ParseResult::None,
         }
     }
@@ -319,6 +334,7 @@ impl ConnParser {
             ConnParser::Ssh(parser) => parser.probe(pdu),
             ConnParser::Wireguard(parser) => parser.probe(pdu),
             ConnParser::Ike(parser) => parser.probe(pdu),
+            ConnParser::Capwap(parser) => parser.probe(pdu),
             ConnParser::Unknown => ProbeResult::Error,
         }
     }
@@ -334,6 +350,7 @@ impl ConnParser {
             ConnParser::Ssh(parser) => parser.remove_session(session_id),
             ConnParser::Wireguard(parser) => parser.remove_session(session_id),
             ConnParser::Ike(parser) => parser.remove_session(session_id),
+            ConnParser::Capwap(parser) => parser.remove_session(session_id),
             ConnParser::Unknown => None,
         }
     }
@@ -348,6 +365,7 @@ impl ConnParser {
             ConnParser::Ssh(parser) => parser.drain_sessions(),
             ConnParser::Wireguard(parser) => parser.drain_sessions(),
             ConnParser::Ike(parser) => parser.drain_sessions(),
+            ConnParser::Capwap(parser) => parser.drain_sessions(),
             ConnParser::Unknown => vec![],
         }
     }
@@ -361,6 +379,7 @@ impl ConnParser {
             ConnParser::Ssh(parser) => parser.session_parsed_state(),
             ConnParser::Wireguard(parser) => parser.session_parsed_state(),
             ConnParser::Ike(parser) => parser.session_parsed_state(),
+            ConnParser::Capwap(parser) => parser.session_parsed_state(),
             ConnParser::Unknown => ParsingState::Stop,
         }
     }
@@ -374,6 +393,7 @@ impl ConnParser {
             ConnParser::Ssh(parser) => parser.body_offset(),
             ConnParser::Wireguard(parser) => parser.body_offset(),
             ConnParser::Ike(parser) => parser.body_offset(),
+            ConnParser::Capwap(parser) => parser.body_offset(),
             ConnParser::Unknown => None,
         }
     }
@@ -389,6 +409,7 @@ impl ConnParser {
             ConnParser::Ssh(_parser) => Some("ssh".into()),
             ConnParser::Wireguard(_parser) => Some("wireguard".into()),
             ConnParser::Ike(_parser) => Some("ike".into()),
+            ConnParser::Capwap(_parser) => Some("capwap".into()),
             ConnParser::Unknown => None,
         }
     }
@@ -402,6 +423,7 @@ impl ConnParser {
             ConnParser::Ssh(_) => SessionProto::Ssh,
             ConnParser::Wireguard(_) => SessionProto::Wireguard,
             ConnParser::Ike(_) => SessionProto::Ike,
+            ConnParser::Capwap(_) => SessionProto::Capwap,
             ConnParser::Unknown => SessionProto::Null,
         }
     }
