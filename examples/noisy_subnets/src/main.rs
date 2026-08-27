@@ -17,10 +17,11 @@
 //! flow's bytes count toward both of its endpoints, these percentages do not sum to 100%.
 //!
 //! ## Output
-//! Prints the top `--top` rows (default 20) to stdout after the run, followed by the share
-//! of all connection bytes that belonged to a flow with at least one endpoint in private IP
-//! space (RFC 1918 for IPv4, `fc00::/7` unique-local for IPv6). With `--out <path>`, also
-//! writes the complete ranking (every subnet) as JSON.
+//! Prints the top `--top` subnet rows (default 20) to stdout after the run, then the 5
+//! noisiest individual public addresses with the share of total traffic each carries, then
+//! the share of all connection bytes that belonged to a flow with at least one endpoint in
+//! private IP space (RFC 1918 for IPv4, `fc00::/7` unique-local for IPv6). With
+//! `--out <path>`, also writes the complete subnet ranking (every subnet) as JSON.
 //!
 //! ## Run
 //! ```
@@ -78,9 +79,21 @@ struct SubnetStat {
     conns: u64,
 }
 
+/// Running totals for one individual endpoint address.
+#[derive(Default, Clone, Copy)]
+struct IpStat {
+    /// Bytes in every flow this address was an endpoint of (either end).
+    bytes: u64,
+    /// Flows this address was an endpoint of.
+    conns: u64,
+}
+
 lazy_static! {
     /// Keyed by subnet, regardless of whether the subnet was the flow's source or destination.
     static ref SUBNETS: Mutex<HashMap<String, SubnetStat>> = Mutex::new(HashMap::new());
+
+    /// Keyed by individual public (non-private) address, source or destination alike.
+    static ref PUBLIC_IPS: Mutex<HashMap<IpAddr, IpStat>> = Mutex::new(HashMap::new());
 }
 
 /// Sum of every connection's byte count, counted once per connection. Denominator for
@@ -120,9 +133,40 @@ fn is_private(ip: IpAddr) -> bool {
     }
 }
 
+/// Whether `ip` is a "public" address: routable on the open internet, i.e. not private and
+/// not one of the other special-use ranges (loopback, link-local, multicast, broadcast,
+/// unspecified, documentation).
+fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => {
+            !a.is_private()
+                && !a.is_loopback()
+                && !a.is_link_local()
+                && !a.is_multicast()
+                && !a.is_broadcast()
+                && !a.is_unspecified()
+                && !a.is_documentation()
+        }
+        IpAddr::V6(a) => {
+            !a.is_unique_local()
+                && !a.is_loopback()
+                && !a.is_multicast()
+                && !a.is_unspecified()
+                && !a.is_unicast_link_local()
+        }
+    }
+}
+
 fn add(key: String, bytes: u64) {
     let mut map = SUBNETS.lock().unwrap();
     let e = map.entry(key).or_default();
+    e.bytes += bytes;
+    e.conns += 1;
+}
+
+fn add_public_ip(ip: IpAddr, bytes: u64) {
+    let mut map = PUBLIC_IPS.lock().unwrap();
+    let e = map.entry(ip).or_default();
     e.bytes += bytes;
     e.conns += 1;
 }
@@ -132,12 +176,21 @@ fn add(key: String, bytes: u64) {
 fn record(ft: &FiveTuple, bytes: &ByteCount) {
     let total = bytes.total() as u64;
     TOTAL_BYTES.fetch_add(total, Ordering::Relaxed);
-    if is_private(ft.orig.ip()) || is_private(ft.resp.ip()) {
+    let src_ip = ft.orig.ip();
+    let dst_ip = ft.resp.ip();
+    if is_private(src_ip) || is_private(dst_ip) {
         PRIVATE_BYTES.fetch_add(total, Ordering::Relaxed);
     }
+    if is_public(src_ip) {
+        add_public_ip(src_ip, total);
+    }
+    // Guard against crediting an address twice when both endpoints are it.
+    if is_public(dst_ip) && dst_ip != src_ip {
+        add_public_ip(dst_ip, total);
+    }
 
-    let src = subnet_str(ft.orig.ip());
-    let dst = subnet_str(ft.resp.ip());
+    let src = subnet_str(src_ip);
+    let dst = subnet_str(dst_ip);
     add(src.clone(), total);
     // Guard against crediting a subnet twice when both endpoints fall in it.
     if dst != src {
@@ -209,6 +262,40 @@ fn print_table(rows: &[Row], top: usize) {
     }
 }
 
+/// Prints the `n` noisiest individual public addresses and the share of total traffic each
+/// carries. As with the subnet table, a flow's bytes count toward both of its endpoints, so
+/// these percentages need not sum to anything in particular.
+fn print_top_public_ips(n: usize) {
+    let total_traffic = TOTAL_BYTES.load(Ordering::Relaxed);
+    let mut rows: Vec<(IpAddr, IpStat)> = PUBLIC_IPS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(ip, stat)| (*ip, *stat))
+        .collect();
+    rows.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then_with(|| a.0.cmp(&b.0)));
+
+    println!("\n=== Noisiest public IPs (top {n} of {}) ===", rows.len());
+    println!(
+        "{:<39}  {:>12}  {:>9}  {:>8}",
+        "address", "bytes", "% traffic", "conns"
+    );
+    for (ip, stat) in rows.iter().take(n) {
+        let pct = if total_traffic == 0 {
+            0.0
+        } else {
+            100.0 * stat.bytes as f64 / total_traffic as f64
+        };
+        println!(
+            "{:<39}  {:>12}  {:>8.2}%  {:>8}",
+            ip.to_string(),
+            human(stat.bytes),
+            pct,
+            stat.conns
+        );
+    }
+}
+
 #[derive(Serialize)]
 struct Report {
     v4_prefix: u8,
@@ -230,6 +317,7 @@ fn main() {
 
     let rows = ranked();
     print_table(&rows, args.top);
+    print_top_public_ips(5);
 
     let total_bytes = TOTAL_BYTES.load(Ordering::Relaxed);
     let private_bytes = PRIVATE_BYTES.load(Ordering::Relaxed);
