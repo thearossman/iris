@@ -6,6 +6,7 @@ members = [
     "examples/basic_dispatching",
     "examples/enc_conns",
     "examples/measuring_sec",
+    "examples/noisy_subnets",
     "examples/ml_qos",
     "examples/open_vpn",
     "examples/combined",
