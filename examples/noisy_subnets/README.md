@@ -14,9 +14,10 @@ count toward both of its endpoints, `% traffic` does not sum to 100%. Rows are r
 `bytes` descending.
 
 After the table, it prints the 5 noisiest individual **public** addresses (routable on the
-open internet — private, loopback, link-local, multicast, etc. excluded) and the share of
-total traffic each carries. As with the subnet rows, a flow's bytes count toward both of
-its endpoints.
+open internet — private, loopback, link-local, multicast, etc. excluded), then the 5
+noisiest **TCP ports** and 5 noisiest **UDP ports**, each with the share of total traffic
+it carries. As with the subnet rows, a flow's bytes count toward both of its endpoints
+(both addresses, and both the source and destination port).
 
 Finally it prints the share of all connection bytes that belonged to a flow with at least
 one endpoint in private IP space (RFC 1918 `10/8`, `172.16/12`, `192.168/16` for IPv4;
