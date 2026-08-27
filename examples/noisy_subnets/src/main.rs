@@ -1,30 +1,24 @@
-//! Rank the "noisiest" subnets by byte volume, separately for subnets acting as the
-//! connection *source* (originator) and as the connection *destination* (responder).
+//! Rank the "noisiest" subnets by byte volume, counting a subnet's traffic whether it was
+//! the *source* or the *destination* of a flow.
 //!
 //! ## What it measures
 //! One callback fires once per TCP/UDP connection, at `L4Terminated`. It receives the
-//! connection 5-tuple (`FiveTuple`, from the first packet) and the per-direction L4 byte
-//! counts (`ByteCount`, payload bytes excluding packet headers). Each connection's
-//! originator IP and responder IP are masked to a subnet prefix (`--v4-prefix` /
-//! `--v6-prefix`, default `/24` and `/64`) and the connection's bytes are added to two
-//! global tables:
+//! connection 5-tuple (`FiveTuple`, from the first packet) and the L4 byte count
+//! (`ByteCount`, payload bytes excluding packet headers). Both endpoint IPs are masked to a
+//! subnet prefix (`--v4-prefix` / `--v6-prefix`, default `/24` and `/64`), and the
+//! connection's total bytes are added to *each* endpoint subnet's running total -- the
+//! direction of the flow is not tracked.
 //!
-//! - **SRC table**, keyed by the originator's subnet: `sent` += bytes the originator sent,
-//!   `recv` += bytes the originator received.
-//! - **DST table**, keyed by the responder's subnet: `sent` += bytes the responder sent,
-//!   `recv` += bytes the responder received.
+//! So a connection where 10.0.0.5 talks to 93.184.216.34 moving 1 MiB adds 1 MiB to both
+//! `10.0.0.0/24` and `93.184.216.0/24`. A subnet's total is therefore "bytes in every flow
+//! this subnet took part in, either end". Subnets are ranked by that total descending.
 //!
-//! Both tables also count how many connections touched each subnet. Subnets are ranked by
-//! `sent + recv` (total bytes moved on that subnet's behalf) descending.
-//!
-//! A connection where 10.0.0.5 talks to 93.184.216.34 contributes to `10.0.0.0/24` in the
-//! SRC table and to `93.184.216.0/24` in the DST table -- so the same bytes appear once in
-//! each ranking, which is what "noisiest source subnets" and "noisiest destination subnets"
-//! each want.
+//! `pct_of_traffic` is a subnet's total over the sum of all connections' bytes. Because a
+//! flow's bytes count toward both of its endpoints, these percentages do not sum to 100%.
 //!
 //! ## Output
-//! Prints the top `--top` rows (default 20) of each table to stdout after the run. With
-//! `--out <path>`, also writes the *complete* ranking (every subnet, both tables) as JSON.
+//! Prints the top `--top` rows (default 20) to stdout after the run. With `--out <path>`,
+//! also writes the complete ranking (every subnet) as JSON.
 //!
 //! ## Run
 //! ```
@@ -35,7 +29,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use clap::Parser;
@@ -56,46 +50,40 @@ struct Args {
     )]
     config: PathBuf,
 
-    /// How many rows of each table to print to stdout.
+    /// How many rows to print to stdout.
     #[clap(short, long, value_name = "N", default_value_t = 20)]
     top: usize,
 
-    /// IPv4 prefix length used to group source/destination addresses into subnets.
+    /// IPv4 prefix length used to group addresses into subnets.
     #[clap(long, value_name = "BITS", default_value_t = 24)]
     v4_prefix: u8,
 
-    /// IPv6 prefix length used to group source/destination addresses into subnets.
+    /// IPv6 prefix length used to group addresses into subnets.
     #[clap(long, value_name = "BITS", default_value_t = 64)]
     v6_prefix: u8,
 
-    /// Optional path to write the complete ranking (all subnets, both tables) as JSON.
+    /// Optional path to write the complete ranking (every subnet) as JSON.
     #[clap(short, long, parse(from_os_str), value_name = "FILE")]
     out: Option<PathBuf>,
 }
 
-/// Running totals for one subnet in one role (source or destination).
+/// Running totals for one subnet.
 #[derive(Default, Clone, Copy, Serialize)]
 struct SubnetStat {
-    /// Bytes sent by hosts in this subnet.
-    sent: u64,
-    /// Bytes received by hosts in this subnet.
-    recv: u64,
-    /// Connections in which this subnet took part in this role.
+    /// Bytes in every flow this subnet was an endpoint of (either end).
+    bytes: u64,
+    /// Flows this subnet was an endpoint of.
     conns: u64,
 }
 
-impl SubnetStat {
-    fn total(&self) -> u64 {
-        self.sent + self.recv
-    }
+lazy_static! {
+    /// Keyed by subnet, regardless of whether the subnet was the flow's source or destination.
+    static ref SUBNETS: Mutex<HashMap<String, SubnetStat>> = Mutex::new(HashMap::new());
 }
 
-lazy_static! {
-    /// Keyed by the originator's subnet.
-    static ref SRC: Mutex<HashMap<String, SubnetStat>> = Mutex::new(HashMap::new());
-    /// Keyed by the responder's subnet.
-    static ref DST: Mutex<HashMap<String, SubnetStat>> = Mutex::new(HashMap::new());
-}
+/// Sum of every connection's byte count, counted once per connection. Denominator for
+/// `pct_of_traffic`.
+static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Set once from CLI args before the runtime starts; read by the callback on every core.
 static V4_PREFIX: AtomicU8 = AtomicU8::new(24);
@@ -117,64 +105,57 @@ fn subnet_str(ip: IpAddr) -> String {
     }
 }
 
-fn add(table: &Mutex<HashMap<String, SubnetStat>>, key: String, sent: u64, recv: u64) {
-    let mut map = table.lock().unwrap();
+fn add(key: String, bytes: u64) {
+    let mut map = SUBNETS.lock().unwrap();
     let e = map.entry(key).or_default();
-    e.sent += sent;
-    e.recv += recv;
+    e.bytes += bytes;
     e.conns += 1;
 }
 
 /// Fires once per TCP/UDP connection, when it terminates (FIN/RST or timeout).
 #[callback("tcp or udp,level=L4Terminated")]
 fn record(ft: &FiveTuple, bytes: &ByteCount) {
-    let orig_bytes = bytes.orig() as u64;
-    let resp_bytes = bytes.resp() as u64;
+    let total = bytes.total() as u64;
+    TOTAL_BYTES.fetch_add(total, Ordering::Relaxed);
 
-    // The originator's subnet sent `orig_bytes` and received `resp_bytes`.
-    add(&SRC, subnet_str(ft.orig.ip()), orig_bytes, resp_bytes);
-    // The responder's subnet sent `resp_bytes` and received `orig_bytes`.
-    add(&DST, subnet_str(ft.resp.ip()), resp_bytes, orig_bytes);
+    let src = subnet_str(ft.orig.ip());
+    let dst = subnet_str(ft.resp.ip());
+    add(src.clone(), total);
+    // Guard against crediting a subnet twice when both endpoints fall in it.
+    if dst != src {
+        add(dst, total);
+    }
 }
 
 #[derive(Serialize)]
 struct Row {
     subnet: String,
-    #[serde(flatten)]
-    stat: SubnetStat,
-    total: u64,
-    /// This row's `total` as a percentage of all bytes in its table. Every connection
-    /// contributes its bytes to exactly one row per table, so the rows' totals sum to the
-    /// table's observed traffic and these percentages sum to 100 (barring rounding).
+    bytes: u64,
+    conns: u64,
+    /// `bytes` over the sum of all connections' bytes. A flow counts toward both of its
+    /// endpoint subnets, so these do not sum to 100%.
     pct_of_traffic: f64,
 }
 
-/// Sorts a table into a ranking, noisiest first.
-fn ranked(table: &Mutex<HashMap<String, SubnetStat>>) -> Vec<Row> {
-    let stats: Vec<(String, SubnetStat)> = table
+/// Sorts the table into a ranking, noisiest first.
+fn ranked() -> Vec<Row> {
+    let total_traffic = TOTAL_BYTES.load(Ordering::Relaxed);
+    let mut rows: Vec<Row> = SUBNETS
         .lock()
         .unwrap()
         .iter()
-        .map(|(subnet, stat)| (subnet.clone(), *stat))
-        .collect();
-    let table_total: u64 = stats.iter().map(|(_, stat)| stat.total()).sum();
-    let mut rows: Vec<Row> = stats
-        .into_iter()
-        .map(|(subnet, stat)| {
-            let total = stat.total();
-            Row {
-                subnet,
-                stat,
-                total,
-                pct_of_traffic: if table_total == 0 {
-                    0.0
-                } else {
-                    100.0 * total as f64 / table_total as f64
-                },
-            }
+        .map(|(subnet, stat)| Row {
+            subnet: subnet.clone(),
+            bytes: stat.bytes,
+            conns: stat.conns,
+            pct_of_traffic: if total_traffic == 0 {
+                0.0
+            } else {
+                100.0 * stat.bytes as f64 / total_traffic as f64
+            },
         })
         .collect();
-    rows.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.subnet.cmp(&b.subnet)));
+    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.subnet.cmp(&b.subnet)));
     rows
 }
 
@@ -193,21 +174,19 @@ fn human(bytes: u64) -> String {
     }
 }
 
-fn print_table(title: &str, rows: &[Row], top: usize) {
-    println!("\n=== {title} (top {top} of {}) ===", rows.len());
+fn print_table(rows: &[Row], top: usize) {
+    println!("\n=== Noisiest subnets (top {top} of {}) ===", rows.len());
     println!(
-        "{:<24}  {:>12}  {:>9}  {:>12}  {:>12}  {:>8}",
-        "subnet", "total", "% traffic", "sent", "recv", "conns"
+        "{:<24}  {:>12}  {:>9}  {:>8}",
+        "subnet", "bytes", "% traffic", "conns"
     );
     for r in rows.iter().take(top) {
         println!(
-            "{:<24}  {:>12}  {:>8.2}%  {:>12}  {:>12}  {:>8}",
+            "{:<24}  {:>12}  {:>8.2}%  {:>8}",
             r.subnet,
-            human(r.total),
+            human(r.bytes),
             r.pct_of_traffic,
-            human(r.stat.sent),
-            human(r.stat.recv),
-            r.stat.conns
+            r.conns
         );
     }
 }
@@ -216,8 +195,7 @@ fn print_table(title: &str, rows: &[Row], top: usize) {
 struct Report {
     v4_prefix: u8,
     v6_prefix: u8,
-    by_source_subnet: Vec<Row>,
-    by_dest_subnet: Vec<Row>,
+    subnets: Vec<Row>,
 }
 
 #[input_files("$IRIS_HOME/datatypes/data.txt")]
@@ -232,18 +210,14 @@ fn main() {
     let mut runtime: Runtime<SubscribedWrapper> = Runtime::new(config, filter).unwrap();
     runtime.run();
 
-    let by_src = ranked(&SRC);
-    let by_dst = ranked(&DST);
-
-    print_table("Noisiest source subnets", &by_src, args.top);
-    print_table("Noisiest destination subnets", &by_dst, args.top);
+    let rows = ranked();
+    print_table(&rows, args.top);
 
     if let Some(path) = args.out {
         let report = Report {
             v4_prefix: args.v4_prefix,
             v6_prefix: args.v6_prefix,
-            by_source_subnet: by_src,
-            by_dest_subnet: by_dst,
+            subnets: rows,
         };
         let json = serde_json::to_string_pretty(&report).unwrap();
         std::fs::write(&path, json).unwrap();
