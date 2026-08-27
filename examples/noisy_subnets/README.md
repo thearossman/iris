@@ -13,6 +13,10 @@ Each subnet row tracks total `bytes`, the number of `conns` it was an endpoint o
 count toward both of its endpoints, `% traffic` does not sum to 100%. Rows are ranked by
 `bytes` descending.
 
+After the table, it also prints the share of all connection bytes that belonged to a flow
+with at least one endpoint in private IP space (RFC 1918 `10/8`, `172.16/12`, `192.168/16`
+for IPv4; `fc00::/7` unique-local for IPv6).
+
 ## Usage
 
 ```

@@ -17,8 +17,10 @@
 //! flow's bytes count toward both of its endpoints, these percentages do not sum to 100%.
 //!
 //! ## Output
-//! Prints the top `--top` rows (default 20) to stdout after the run. With `--out <path>`,
-//! also writes the complete ranking (every subnet) as JSON.
+//! Prints the top `--top` rows (default 20) to stdout after the run, followed by the share
+//! of all connection bytes that belonged to a flow with at least one endpoint in private IP
+//! space (RFC 1918 for IPv4, `fc00::/7` unique-local for IPv6). With `--out <path>`, also
+//! writes the complete ranking (every subnet) as JSON.
 //!
 //! ## Run
 //! ```
@@ -85,6 +87,10 @@ lazy_static! {
 /// `pct_of_traffic`.
 static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Sum of the byte count of every connection with at least one endpoint in private IP space
+/// (RFC 1918 for IPv4, `fc00::/7` unique-local for IPv6). Counted once per connection.
+static PRIVATE_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// Set once from CLI args before the runtime starts; read by the callback on every core.
 static V4_PREFIX: AtomicU8 = AtomicU8::new(24);
 static V6_PREFIX: AtomicU8 = AtomicU8::new(64);
@@ -105,6 +111,15 @@ fn subnet_str(ip: IpAddr) -> String {
     }
 }
 
+/// Whether `ip` falls in private (non-globally-routable "internal") address space:
+/// RFC 1918 (`10/8`, `172.16/12`, `192.168/16`) for IPv4, unique-local (`fc00::/7`) for IPv6.
+fn is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => a.is_private(),
+        IpAddr::V6(a) => a.is_unique_local(),
+    }
+}
+
 fn add(key: String, bytes: u64) {
     let mut map = SUBNETS.lock().unwrap();
     let e = map.entry(key).or_default();
@@ -117,6 +132,9 @@ fn add(key: String, bytes: u64) {
 fn record(ft: &FiveTuple, bytes: &ByteCount) {
     let total = bytes.total() as u64;
     TOTAL_BYTES.fetch_add(total, Ordering::Relaxed);
+    if is_private(ft.orig.ip()) || is_private(ft.resp.ip()) {
+        PRIVATE_BYTES.fetch_add(total, Ordering::Relaxed);
+    }
 
     let src = subnet_str(ft.orig.ip());
     let dst = subnet_str(ft.resp.ip());
@@ -212,6 +230,19 @@ fn main() {
 
     let rows = ranked();
     print_table(&rows, args.top);
+
+    let total_bytes = TOTAL_BYTES.load(Ordering::Relaxed);
+    let private_bytes = PRIVATE_BYTES.load(Ordering::Relaxed);
+    let private_pct = if total_bytes == 0 {
+        0.0
+    } else {
+        100.0 * private_bytes as f64 / total_bytes as f64
+    };
+    println!(
+        "\nBytes in flows with >=1 private-space endpoint: {} of {} ({private_pct:.2}%)",
+        human(private_bytes),
+        human(total_bytes),
+    );
 
     if let Some(path) = args.out {
         let report = Report {
