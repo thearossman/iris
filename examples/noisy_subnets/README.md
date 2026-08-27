@@ -10,8 +10,9 @@ IP to a subnet prefix, and accumulates bytes into two global tables:
 - **by source subnet** — keyed by the originator's subnet
 - **by destination subnet** — keyed by the responder's subnet
 
-Each subnet row tracks bytes `sent`, bytes `recv`, and the number of `conns` it took part
-in; rows are ranked by `sent + recv` descending.
+Each subnet row tracks bytes `sent`, bytes `recv`, the number of `conns` it took part in,
+and its share of the table's total observed bytes (`% traffic`); rows are ranked by
+`sent + recv` descending.
 
 ## Usage
 

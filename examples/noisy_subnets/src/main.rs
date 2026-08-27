@@ -143,18 +143,35 @@ struct Row {
     #[serde(flatten)]
     stat: SubnetStat,
     total: u64,
+    /// This row's `total` as a percentage of all bytes in its table. Every connection
+    /// contributes its bytes to exactly one row per table, so the rows' totals sum to the
+    /// table's observed traffic and these percentages sum to 100 (barring rounding).
+    pct_of_traffic: f64,
 }
 
 /// Sorts a table into a ranking, noisiest first.
 fn ranked(table: &Mutex<HashMap<String, SubnetStat>>) -> Vec<Row> {
-    let mut rows: Vec<Row> = table
+    let stats: Vec<(String, SubnetStat)> = table
         .lock()
         .unwrap()
         .iter()
-        .map(|(subnet, stat)| Row {
-            subnet: subnet.clone(),
-            stat: *stat,
-            total: stat.total(),
+        .map(|(subnet, stat)| (subnet.clone(), *stat))
+        .collect();
+    let table_total: u64 = stats.iter().map(|(_, stat)| stat.total()).sum();
+    let mut rows: Vec<Row> = stats
+        .into_iter()
+        .map(|(subnet, stat)| {
+            let total = stat.total();
+            Row {
+                subnet,
+                stat,
+                total,
+                pct_of_traffic: if table_total == 0 {
+                    0.0
+                } else {
+                    100.0 * total as f64 / table_total as f64
+                },
+            }
         })
         .collect();
     rows.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.subnet.cmp(&b.subnet)));
@@ -179,14 +196,15 @@ fn human(bytes: u64) -> String {
 fn print_table(title: &str, rows: &[Row], top: usize) {
     println!("\n=== {title} (top {top} of {}) ===", rows.len());
     println!(
-        "{:<24}  {:>12}  {:>12}  {:>12}  {:>8}",
-        "subnet", "total", "sent", "recv", "conns"
+        "{:<24}  {:>12}  {:>9}  {:>12}  {:>12}  {:>8}",
+        "subnet", "total", "% traffic", "sent", "recv", "conns"
     );
     for r in rows.iter().take(top) {
         println!(
-            "{:<24}  {:>12}  {:>12}  {:>12}  {:>8}",
+            "{:<24}  {:>12}  {:>8.2}%  {:>12}  {:>12}  {:>8}",
             r.subnet,
             human(r.total),
+            r.pct_of_traffic,
             human(r.stat.sent),
             human(r.stat.recv),
             r.stat.conns
