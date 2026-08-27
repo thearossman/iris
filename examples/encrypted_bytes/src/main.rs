@@ -20,16 +20,28 @@
 //! unconditionally resets `app_offset` to `Some(0)` before any subscriber ever observes the
 //! precise offset -- so even TLS/SSH's sub-packet split is never actually visible here.)
 //!
-//! Instead, this tracks an `in_payload` flag per connection, flipped exactly once by an
-//! `L7EndHdrs`-level callback method (the same pattern `TlsCbStreaming` in
-//! `examples/basic/src/main.rs` uses). `L7EndHdrs` fires exactly once, when the handshake
-//! completes, and is dispatched before that same packet's `InL4Conn` update
-//! (`ConnInfo::consume_stream` calls `process_stream`/`exec_state_tx` -- which is what
-//! dispatches `L7EndHdrs` -- before `new_packet`, which dispatches `InL4Conn`). So the one
-//! packet on which the handshake completes is counted entirely as payload (a whole-packet
-//! granularity approximation on that single packet), and -- critically, unlike the
-//! `app_offset` approach -- every packet after it is correctly counted as payload too,
-//! regardless of whether the parser is still actively running.
+//! Instead, `EncBytes` tracks an `in_payload` flag per connection, flipped exactly once by
+//! an `L7EndHdrs`-level method. Unlike the `app_offset` approach, every packet after the
+//! headers finish is correctly counted as payload regardless of whether the parser is still
+//! actively running.
+//!
+//! The packet on which the headers finish is counted entirely as *handshake* -- a
+//! whole-packet granularity approximation on that single packet. `Conn::update` dispatches
+//! `InL4Conn` from its pre-reassembly update, before handing the packet to
+//! reassembly/parsing, so that packet is accumulated before `process_stream` reaches
+//! `L7EndHdrs` and flips the flag.
+//!
+//! ## Why a datatype and not a callback
+//! The byte counting lives in a `Tracked` datatype rather than in `#[callback_fn]` methods.
+//! A callback method only runs while its wrapper `is_active()`, which is set when the
+//! filter pattern matches -- for an L7 subscription, at `L7OnDisc`. But the packet that
+//! *triggers* discovery has already been dispatched at `InL4Conn` by that pre-reassembly
+//! update, while the callback is still `Matching`. Counting there dropped each connection's
+//! first data packet outright: on `traces/tls_single_flow.pcap` that was the whole 214-byte
+//! ClientHello, and protocols whose discovery spans several packets (QUIC) lost more.
+//! Datatypes update unconditionally, so these totals cover the connection from its first
+//! byte. The numbers therefore mean "all bytes of a connection that turned out to be TLS",
+//! not "bytes observed after we knew it was TLS".
 //!
 //! ## `MaybeQuic`/`MaybeZoom` bytes
 //! `MaybeQuic` and `MaybeZoom` (`datatypes/src/maybe_quic.rs`, `datatypes/src/maybe_zoom.rs`)
@@ -39,7 +51,7 @@
 //!
 //! ## `--min-bytes`
 //! Passing `--min-bytes N` excludes any connection whose own total byte count (handshake +
-//! payload for `EncBytesCallback`, tcp + udp for `TransportBytes`) is not more than `N` --
+//! payload for `EncBytes`, tcp + udp for `TransportBytes`) is not more than `N` --
 //! its packets never reach any global counter at all, rather than being counted and then
 //! subtracted out. The check happens once per connection, in each callback's own
 //! `L4Terminated` handler, using that connection's own running total; the two callbacks never
@@ -47,11 +59,11 @@
 //! arrives at the same total independently. Default is 0, i.e. no filtering.
 
 use clap::Parser;
-use iris_compiler::{callback, callback_fn, datatype, datatype_fn, input_files, iris_end_macros};
+use iris_compiler::{callback, datatype, datatype_fn, input_files, iris_end_macros};
 use iris_core::protocols::packet::tcp::TCP_PROTOCOL;
 use iris_core::protocols::packet::udp::UDP_PROTOCOL;
 use iris_core::protocols::stream::SessionProto;
-use iris_core::subscription::{StreamingCallback, Tracked};
+use iris_core::subscription::Tracked;
 use iris_core::{config::load_config, L4Pdu, Runtime};
 use iris_datatypes::ByteCount;
 use std::path::PathBuf;
@@ -77,7 +89,7 @@ struct Args {
 }
 
 /// Set from `--min-bytes`, read once per connection at `L4Terminated` by both
-/// `EncBytesCallback::finalize` and `record_transport_bytes`. 0 means no filtering.
+/// `record_enc_bytes` and `record_transport_bytes`. 0 means no filtering.
 static MIN_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether a connection with `total_bytes` clears the `--min-bytes` bar, i.e. should be
@@ -136,20 +148,51 @@ lazy_static! {
     static ref UDP_BYTES: AtomicUsize = AtomicUsize::new(0);
 }
 
-/// One stateful callback across all five encrypted protocols: the filter's OR predicate
-/// registers all five parsers, and `SessionProto` (read once the connection is torn down)
-/// tells us which one actually matched, so the handshake/payload split logic itself never
-/// needs to know which protocol it's looking at -- it only reacts to generic `L4Pdu`/state-
-/// transition events.
-#[callback("tls or ssh or quic or wireguard or ike")]
-#[derive(Debug)]
-struct EncBytesCallback {
+/// Per-connection handshake/payload byte split.
+///
+/// This is a `Tracked` datatype, not accumulation inside the callback, and that distinction
+/// is load-bearing -- see "Why a datatype and not a callback" in the module docs. It reacts
+/// only to generic `L4Pdu`/state-transition events, so it never needs to know which of the
+/// five protocols it is looking at; `record_enc_bytes` reads `SessionProto` at teardown to
+/// decide which bucket the result lands in.
+#[datatype]
+struct EncBytes {
     in_payload: bool,
     handshake_bytes: usize,
     payload_bytes: usize,
 }
 
-impl StreamingCallback for EncBytesCallback {
+impl EncBytes {
+    fn total(&self) -> usize {
+        self.handshake_bytes + self.payload_bytes
+    }
+
+    #[datatype_fn("EncBytes,level=InL4Conn")]
+    fn update(&mut self, pdu: &L4Pdu) {
+        let len = pdu.length();
+        if len == 0 {
+            return;
+        }
+        if self.in_payload {
+            self.payload_bytes += len;
+        } else {
+            self.handshake_bytes += len;
+        }
+    }
+
+    /// Fires exactly once, when the L7 headers finish. See the module docs for why this
+    /// (rather than `app_offset`) is the reliable signal.
+    ///
+    /// `SessionProto` is requested only because a `datatype_fn` must take at least one
+    /// parameter (`datatype_func_to_tokens` panics otherwise). It is the cheapest builtin
+    /// available at this level -- a plain `last_protocol()` read -- and registers no parser.
+    #[datatype_fn("EncBytes,level=L7EndHdrs")]
+    fn end_handshake(&mut self, _proto: &SessionProto) {
+        self.in_payload = true;
+    }
+}
+
+impl Tracked for EncBytes {
     fn new(_first_pkt: &L4Pdu) -> Self {
         Self {
             in_payload: false,
@@ -158,51 +201,31 @@ impl StreamingCallback for EncBytesCallback {
         }
     }
 
-    fn clear(&mut self) {}
+    fn clear(&mut self) {
+        self.in_payload = false;
+        self.handshake_bytes = 0;
+        self.payload_bytes = 0;
+    }
 }
 
-impl EncBytesCallback {
-    #[callback_fn("EncBytesCallback,level=InL4Conn")]
-    fn update(&mut self, pdu: &L4Pdu) -> bool {
-        let len = pdu.length();
-        if len > 0 {
-            if self.in_payload {
-                self.payload_bytes += len;
-            } else {
-                self.handshake_bytes += len;
-            }
-        }
-        true
+/// The filter's OR predicate registers all five parsers; `SessionProto`, read once the
+/// connection is torn down, says which one actually matched.
+#[callback("tls or ssh or quic or wireguard or ike,level=L4Terminated")]
+fn record_enc_bytes(bytes: &EncBytes, proto: &SessionProto) {
+    let totals = match proto {
+        SessionProto::Tls => &*TLS_BYTES,
+        SessionProto::Ssh => &*SSH_BYTES,
+        SessionProto::Quic => &*QUIC_BYTES,
+        SessionProto::Wireguard => &*WIREGUARD_BYTES,
+        SessionProto::Ike => &*IKE_BYTES,
+        _ => return,
+    };
+    // Below the bar: none of this connection's bytes are added, not even to a "dropped"
+    // bucket -- excluded connections are invisible to every printed total.
+    if !clears_min_bytes(bytes.total(), MIN_BYTES.load(Ordering::Relaxed)) {
+        return;
     }
-
-    /// Fires exactly once, when the handshake completes. See the module docs for why this
-    /// (rather than `app_offset`) is the reliable signal, and why it's dispatched before
-    /// this same packet's `update` above.
-    #[callback_fn("EncBytesCallback,level=L7EndHdrs")]
-    fn end_handshake(&mut self) -> bool {
-        self.in_payload = true;
-        true
-    }
-
-    #[callback_fn("EncBytesCallback,level=L4Terminated")]
-    fn finalize(&mut self, proto: &SessionProto) -> bool {
-        let totals = match proto {
-            SessionProto::Tls => &*TLS_BYTES,
-            SessionProto::Ssh => &*SSH_BYTES,
-            SessionProto::Quic => &*QUIC_BYTES,
-            SessionProto::Wireguard => &*WIREGUARD_BYTES,
-            SessionProto::Ike => &*IKE_BYTES,
-            _ => return false,
-        };
-        // Below the bar: none of this connection's bytes are added, not even to a "dropped"
-        // bucket -- excluded connections are invisible to every printed total.
-        let total = self.handshake_bytes + self.payload_bytes;
-        if !clears_min_bytes(total, MIN_BYTES.load(Ordering::Relaxed)) {
-            return false;
-        }
-        totals.add(self.handshake_bytes, self.payload_bytes);
-        false
-    }
+    totals.add(bytes.handshake_bytes, bytes.payload_bytes);
 }
 
 /// Per-connection tracked datatype for total TCP/UDP traffic, independent of whether an
