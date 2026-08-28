@@ -1,10 +1,23 @@
 //! Writes a raw packet capture containing a sample of the connections that Iris's stateful
 //! parsers could *not* identify.
 //!
-//! All of Iris's session parsers (TLS, DNS, HTTP, QUIC, SSH, WireGuard, IKE) are registered
-//! and run against every TCP/UDP connection. Connections that any of them successfully
-//! identifies are discarded; the ones left over -- where protocol discovery failed outright,
-//! or never completed -- have their raw packets written out.
+//! All of Iris's session parsers (TLS, DNS, HTTP, QUIC, SSH, WireGuard, IKE, CAPWAP) are
+//! registered and run against every TCP/UDP connection. Connections that any of them
+//! successfully identifies are discarded; the ones left over -- where protocol discovery
+//! failed outright, or never completed -- have their raw packets written out.
+//!
+//! CAPWAP is counted as identified regardless of whether it turned out to be DTLS-encapsulated
+//! or plaintext -- unlike `encrypted_bytes`/`bytes_over_time`'s DTLS-only restriction, this app
+//! only cares whether a stateful parser could classify the connection at all, not whether the
+//! result happens to be encrypted.
+//!
+//! ## Heuristic detections (`MaybeQuic`/`MaybeZoom`/`MaybeIperf3`)
+//! These are streaming heuristics, not stateful parsers -- they never change `SessionProto`, so
+//! a connection they accept still reads `Null`/`Probing` and is written to the capture like any
+//! other unidentified connection (the heuristics are guesses, not the certain classification
+//! this app otherwise requires to drop a connection). Their counts, tallied separately below,
+//! are a bonus cross-check over *all* traffic, not just the sampled/unidentified population --
+//! see "Heuristic detections" further down.
 //!
 //! ## Keeping up at line rate
 //! Buffering every packet of every connection would not survive a real link, so the sampling
@@ -152,10 +165,20 @@ static COUNT_QUIC: AtomicUsize = AtomicUsize::new(0);
 static COUNT_SSH: AtomicUsize = AtomicUsize::new(0);
 static COUNT_WIREGUARD: AtomicUsize = AtomicUsize::new(0);
 static COUNT_IKE: AtomicUsize = AtomicUsize::new(0);
-/// Identified but not one of the seven counters above. Only reachable if `SessionProto` grows a
+static COUNT_CAPWAP: AtomicUsize = AtomicUsize::new(0);
+/// Identified but not one of the eight counters above. Only reachable if `SessionProto` grows a
 /// new identified variant the match below doesn't yet know about; kept as a safety net so that
 /// degrades to "uncounted" instead of a compile error or a panic.
 static COUNT_OTHER: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts of connections -- across *all* traffic, not just the sampled/unidentified population
+/// `finalize` works over -- that a heuristic filter accepted. Incremented by their own
+/// independent `L4Terminated` callbacks below, since these filters aren't stateful parsers and
+/// so never appear in `SessionProto`/`finalize`. See "Heuristic detections" in the module docs
+/// and further down where these are printed.
+static COUNT_MAYBE_QUIC: AtomicUsize = AtomicUsize::new(0);
+static COUNT_MAYBE_ZOOM: AtomicUsize = AtomicUsize::new(0);
+static COUNT_MAYBE_IPERF3: AtomicUsize = AtomicUsize::new(0);
 
 /// Set only when `--anon-key` is given; `finalize` anonymizes a connection's frames iff this
 /// is populated, so omitting the flag costs nothing beyond the `Option` check.
@@ -198,9 +221,9 @@ fn should_sample(five_tuple: &FiveTuple) -> bool {
 /// The filter matches all TCP and UDP connections rather than naming protocols, because the
 /// connections of interest are exactly the ones no protocol predicate would match. Iris only
 /// compiles in the parsers that some filter or datatype needs, so `parsers=` registers all
-/// seven explicitly -- without it no parsing would happen at all and every connection would
+/// eight explicitly -- without it no parsing would happen at all and every connection would
 /// look unidentified.
-#[callback("tcp or udp,parsers=tls&dns&http&quic&ssh&wireguard&ike")]
+#[callback("tcp or udp,parsers=tls&dns&http&quic&ssh&wireguard&ike&capwap")]
 #[derive(Debug)]
 struct SampledConn {
     sampled: bool,
@@ -300,6 +323,7 @@ impl SampledConn {
                 SessionProto::Ssh => &COUNT_SSH,
                 SessionProto::Wireguard => &COUNT_WIREGUARD,
                 SessionProto::Ike => &COUNT_IKE,
+                SessionProto::Capwap => &COUNT_CAPWAP,
                 _ => &COUNT_OTHER,
             };
             counter.fetch_add(1, Ordering::Relaxed);
@@ -335,6 +359,43 @@ impl SampledConn {
         }
         false
     }
+}
+
+/// Whether a real stateful parser already identified this connection -- `Null` means every
+/// registered parser rejected it, `Probing` means discovery never concluded. Shared by the
+/// heuristic callbacks below so their guards can't drift from `SampledConn::finalize`'s own
+/// identified/unidentified split.
+fn is_identified(proto: &SessionProto) -> bool {
+    !matches!(proto, SessionProto::Null | SessionProto::Probing)
+}
+
+/// Independent `L4Terminated` callbacks tallying [`COUNT_MAYBE_QUIC`]/[`COUNT_MAYBE_ZOOM`]/
+/// [`COUNT_MAYBE_IPERF3`] -- see "Heuristic detections" in the module docs for why these run
+/// over all traffic rather than folding into `SampledConn::finalize`'s sampled population.
+///
+/// `MaybeQuic`/`MaybeZoom` skip a connection a real parser already identified, so they never
+/// double-count against the eight real-parser counters or each other -- following
+/// `encrypted_bytes`'s `MAYBE_QUIC_BYTES`/`MAYBE_ZOOM_BYTES`. `MaybeIperf3` has no such guard and
+/// can double-count against any of the others.
+#[callback("MaybeQuic,level=L4Terminated")]
+fn record_maybe_quic(proto: &SessionProto) {
+    if is_identified(proto) {
+        return;
+    }
+    COUNT_MAYBE_QUIC.fetch_add(1, Ordering::Relaxed);
+}
+
+#[callback("MaybeZoom,level=L4Terminated")]
+fn record_maybe_zoom(proto: &SessionProto) {
+    if is_identified(proto) {
+        return;
+    }
+    COUNT_MAYBE_ZOOM.fetch_add(1, Ordering::Relaxed);
+}
+
+#[callback("MaybeIperf3,level=L4Terminated")]
+fn record_maybe_iperf3(_proto: &SessionProto) {
+    COUNT_MAYBE_IPERF3.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Per-core capture files, indexed by raw core ID. Core IDs need not be contiguous, so slots
@@ -656,6 +717,7 @@ fn main() {
         ("SSH", COUNT_SSH.load(Ordering::Relaxed)),
         ("WireGuard", COUNT_WIREGUARD.load(Ordering::Relaxed)),
         ("IKE", COUNT_IKE.load(Ordering::Relaxed)),
+        ("CAPWAP", COUNT_CAPWAP.load(Ordering::Relaxed)),
         ("other", COUNT_OTHER.load(Ordering::Relaxed)),
     ];
     by_protocol.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
@@ -667,6 +729,28 @@ fn main() {
             // complement, rather than each protocol being diluted by scan/junk traffic that
             // was never a candidate for identification in the first place.
             println!("  {:<10} {}", name, fmt_count_pct(count, real_sampled));
+        }
+    }
+    // Heuristic detections run over *all* traffic seen by the runtime, not just the sampled
+    // population `by_protocol` above is scored against -- see "Heuristic detections" in the
+    // module docs -- so these are printed as raw counts rather than shares of `real_sampled`.
+    let maybe_quic = COUNT_MAYBE_QUIC.load(Ordering::Relaxed);
+    let maybe_zoom = COUNT_MAYBE_ZOOM.load(Ordering::Relaxed);
+    let maybe_iperf3 = COUNT_MAYBE_IPERF3.load(Ordering::Relaxed);
+    if maybe_quic > 0 || maybe_zoom > 0 || maybe_iperf3 > 0 {
+        println!(
+            "\nHeuristic detections across all traffic (not a subset of the counts above -- \
+             SessionProto is unchanged, so these connections are still sampled/written as \
+             unidentified if selected):"
+        );
+        if maybe_quic > 0 {
+            println!("  {:<10} {}", "MaybeQuic", maybe_quic);
+        }
+        if maybe_zoom > 0 {
+            println!("  {:<10} {}", "MaybeZoom", maybe_zoom);
+        }
+        if maybe_iperf3 > 0 {
+            println!("  {:<10} {}", "MaybeIperf3", maybe_iperf3);
         }
     }
     // Also a share of the full sampled population, for the same reason as the unanswered-SYN

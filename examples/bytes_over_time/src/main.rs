@@ -1,8 +1,16 @@
 //! Reports, for each fixed-width time slice (`--slice-ms`, default 1000ms), how many bytes
 //! were seen on each of Iris's identified encrypted-protocol connections (TLS, SSH, QUIC,
-//! WireGuard, IKE), on heuristically-detected mid-stream QUIC/Zoom traffic (`MaybeQuic`,
-//! `MaybeZoom`), and on total TCP/UDP transport traffic -- each protocol split into cleartext
-//! handshake bytes vs. encrypted payload bytes, following `examples/encrypted_bytes`.
+//! WireGuard, IKE, and DTLS-encapsulated CAPWAP -- see "CAPWAP" below), on heuristically-detected
+//! mid-stream QUIC/Zoom/iperf3 traffic (`MaybeQuic`, `MaybeZoom`, `MaybeIperf3`), and on total
+//! TCP/UDP transport traffic -- each protocol split into cleartext handshake bytes vs. encrypted
+//! payload bytes, following `examples/encrypted_bytes`.
+//!
+//! ## CAPWAP
+//! As in `encrypted_bytes`, only DTLS-encapsulated CAPWAP is counted here: the filter term is
+//! `capwap.preamble_type = 1`, not bare `capwap`, so plaintext CAPWAP (both channels are
+//! cleartext by default) is excluded from the protocol series -- its bytes still land in the
+//! unconditional `tcp`/`udp` transport totals. See `encrypted_bytes`'s module docs for the full
+//! reasoning.
 //!
 //! This app is the combination of `examples/concurrent_conns` (fixed-width time slicing,
 //! stdout table + CSV output) and `examples/encrypted_bytes` (per-protocol byte attribution
@@ -22,7 +30,7 @@
 //!
 //! ## Why not `L4Pdu::app_body_offset()`
 //! Also as in `encrypted_bytes`: `app_offset` is only touched while the L7 layer's `Parse`
-//! action is set, which is cleared as soon as headers finish for four of the five protocols
+//! action is set, which is cleared as soon as headers finish for five of the six protocols
 //! here (everything but QUIC) -- so it can't tell "still in handshake" from "deep in payload"
 //! for most of a connection's life. `ByteSeries` instead tracks an `in_payload` flag flipped
 //! exactly once by an `L7EndHdrs`-level method; every packet after headers finish is counted
@@ -65,7 +73,7 @@
 //! `tcp_bytes` (via a *separate* `TransportBytes`-style datatype tracking the same packets).
 //! The protocol columns and the transport columns are not meant to be summed together.
 //!
-//! The `maybe_quic_*`/`maybe_zoom_*` columns, however, *are* disjoint from the five real
+//! The `maybe_quic_*`/`maybe_zoom_*` columns, however, *are* (mostly) disjoint from the six real
 //! protocol columns: `MaybeQuic`/`MaybeZoom` never consult the real parsers' results, so a
 //! connection the `quic` parser identifies can also satisfy `MaybeQuic`, and the generated
 //! `L4Terminated` dispatch does not chain a custom filter predicate against a protocol
@@ -76,6 +84,9 @@
 //! connection it recognizes, so every connection lands in at most one protocol/maybe_* column.
 //! `MaybeQuic` and `MaybeZoom` need no such guard against each other -- see `encrypted_bytes`'s
 //! module docs for why their heuristics are structurally disjoint.
+//!
+//! `maybe_iperf3_*` has no such guard, following `encrypted_bytes`'s `MAYBE_IPERF3_BYTES`: it is
+//! the one column that can still double-count against any of the others.
 //!
 //! ## Byte unit: L4 payload, not wire bytes
 //! As in `encrypted_bytes`: every column here -- the stdout table, the CSV, and the summary
@@ -172,16 +183,19 @@ static MIN_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Set once from `--max-conn-slices` before `runtime.run()`, read on every packet.
 static MAX_CONN_SLICES: AtomicUsize = AtomicUsize::new(512);
 
-/// Number of protocol series tracked: TLS, SSH, QUIC, WireGuard, IKE, MaybeQuic, MaybeZoom.
-const NUM_PROTOS: usize = 7;
+/// Number of protocol series tracked: TLS, SSH, QUIC, WireGuard, IKE, CAPWAP (DTLS-only),
+/// MaybeQuic, MaybeZoom, MaybeIperf3.
+const NUM_PROTOS: usize = 9;
 const PROTO_NAMES: [&str; NUM_PROTOS] = [
     "TLS",
     "SSH",
     "QUIC",
     "WireGuard",
     "IKE",
+    "CAPWAP",
     "MaybeQuic",
     "MaybeZoom",
+    "MaybeIperf3",
 ];
 /// Lowercase CSV column prefixes, matching [`PROTO_NAMES`] index-for-index.
 const PROTO_COLUMNS: [&str; NUM_PROTOS] = [
@@ -190,8 +204,10 @@ const PROTO_COLUMNS: [&str; NUM_PROTOS] = [
     "quic",
     "wireguard",
     "ike",
+    "capwap",
     "maybe_quic",
     "maybe_zoom",
+    "maybe_iperf3",
 ];
 
 /// Global per-slice handshake/payload byte arrays for one protocol series. Sized once (from
@@ -211,7 +227,7 @@ impl SeriesArrays {
 }
 
 /// Indexed by [`proto_index`]/[`PROTO_NAMES`]: 0 TLS, 1 SSH, 2 QUIC, 3 WireGuard, 4 IKE,
-/// 5 MaybeQuic, 6 MaybeZoom.
+/// 5 CAPWAP, 6 MaybeQuic, 7 MaybeZoom, 8 MaybeIperf3.
 static PROTO_SERIES: OnceLock<Vec<SeriesArrays>> = OnceLock::new();
 /// `[0]` = TCP, `[1]` = UDP; totals only, no handshake/payload split -- see the module docs
 /// on why the transport series is tracked separately from the protocol series.
@@ -226,15 +242,22 @@ static PROTO_CONN_COUNTS: [AtomicUsize; NUM_PROTOS] = [
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
 ];
 /// Connections whose lifetime extended past `--max-duration-secs` and had some bytes folded
 /// into the final slice rather than accurately bucketed.
 static OVERFLOWED_CONNS: AtomicUsize = AtomicUsize::new(0);
 
 /// Maps an identified `SessionProto` to its slot in [`PROTO_SERIES`]/[`PROTO_NAMES`] for the
-/// five real parsers. `None` for anything else -- unreachable in practice, since
-/// `record_enc_series`'s filter only matches these five protocols, but matched defensively
+/// six real parsers. `None` for anything else -- unreachable in practice, since
+/// `record_enc_series`'s filter only matches these six protocols, but matched defensively
 /// rather than assumed. See `concurrent_conns::proto_index`.
+///
+/// CAPWAP lands here too even though `record_enc_series`'s filter restricts it to
+/// DTLS-encapsulated connections (`capwap.preamble_type = 1`) -- `SessionProto` itself doesn't
+/// encode that distinction, so any CAPWAP connection that reaches this function already cleared
+/// the filter. See "CAPWAP" in the module docs.
 fn proto_index(proto: &SessionProto) -> Option<usize> {
     match proto {
         SessionProto::Tls => Some(0),
@@ -242,7 +265,40 @@ fn proto_index(proto: &SessionProto) -> Option<usize> {
         SessionProto::Quic => Some(2),
         SessionProto::Wireguard => Some(3),
         SessionProto::Ike => Some(4),
+        SessionProto::Capwap => Some(5),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod proto_index_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_every_real_protocol() {
+        for proto in [
+            SessionProto::Tls,
+            SessionProto::Ssh,
+            SessionProto::Quic,
+            SessionProto::Wireguard,
+            SessionProto::Ike,
+            SessionProto::Capwap,
+        ] {
+            assert!(
+                proto_index(&proto).is_some(),
+                "proto_index should recognize {proto:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_undiscovered_and_unhandled_protocols() {
+        for proto in [SessionProto::Null, SessionProto::Probing, SessionProto::Dns] {
+            assert!(
+                proto_index(&proto).is_none(),
+                "proto_index should not recognize {proto:?}"
+            );
+        }
     }
 }
 
@@ -677,9 +733,10 @@ fn flush_transport(series: &ByteSeries, dest: &[AtomicU64]) {
     }
 }
 
-/// The filter's OR predicate registers all five parsers; `SessionProto`, read once the
-/// connection is torn down, says which one actually matched.
-#[callback("tls or ssh or quic or wireguard or ike,level=L4Terminated")]
+/// The filter's OR predicate registers all six parsers; `SessionProto`, read once the
+/// connection is torn down, says which one actually matched. The CAPWAP term is
+/// `capwap.preamble_type = 1`, not bare `capwap` -- see "CAPWAP" in the module docs.
+#[callback("tls or ssh or quic or wireguard or ike or capwap.preamble_type = 1,level=L4Terminated")]
 fn record_enc_series(series: &ByteSeries, proto: &SessionProto) {
     let Some(idx) = proto_index(proto) else {
         return;
@@ -697,7 +754,7 @@ fn record_maybe_quic_series(series: &ByteSeries, proto: &SessionProto) {
         return;
     }
     let all_series = PROTO_SERIES.get().expect("PROTO_SERIES initialized");
-    flush_series(series, &all_series[5], &PROTO_CONN_COUNTS[5]);
+    flush_series(series, &all_series[6], &PROTO_CONN_COUNTS[6]);
 }
 
 #[callback("MaybeZoom,level=L4Terminated")]
@@ -706,7 +763,16 @@ fn record_maybe_zoom_series(series: &ByteSeries, proto: &SessionProto) {
         return;
     }
     let all_series = PROTO_SERIES.get().expect("PROTO_SERIES initialized");
-    flush_series(series, &all_series[6], &PROTO_CONN_COUNTS[6]);
+    flush_series(series, &all_series[7], &PROTO_CONN_COUNTS[7]);
+}
+
+/// No `proto_index` guard, unlike `record_maybe_quic_series`/`record_maybe_zoom_series` --
+/// following `encrypted_bytes`'s `MAYBE_IPERF3_BYTES`, this is the one column that can still
+/// double-count against any of the others. See the "Column overlap" module docs.
+#[callback("MaybeIperf3,level=L4Terminated")]
+fn record_maybe_iperf3_series(series: &ByteSeries) {
+    let all_series = PROTO_SERIES.get().expect("PROTO_SERIES initialized");
+    flush_series(series, &all_series[8], &PROTO_CONN_COUNTS[8]);
 }
 
 #[callback("tcp or udp,level=L4Terminated")]

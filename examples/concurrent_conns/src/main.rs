@@ -1,8 +1,19 @@
 //! Reports, for each fixed-width time slice (`--slice-ms`, default 1000ms), how many of
-//! Iris's identified encrypted-protocol connections (TLS, SSH, QUIC, WireGuard, IKE) were
-//! concurrently active. eDNS is not counted separately: Iris has no distinct encrypted-DNS
-//! parser, and DNS-over-TLS/QUIC traffic is already identified as TLS/QUIC by the parsers
-//! those protocols already register.
+//! Iris's identified encrypted-protocol connections (TLS, SSH, QUIC, WireGuard, IKE, and
+//! DTLS-encapsulated CAPWAP) plus heuristically-detected mid-stream QUIC/Zoom/iperf3 traffic
+//! (`MaybeQuic`, `MaybeZoom`, `MaybeIperf3`) were concurrently active. eDNS is not counted
+//! separately: Iris has no distinct encrypted-DNS parser, and DNS-over-TLS/QUIC traffic is
+//! already identified as TLS/QUIC by the parsers those protocols already register.
+//!
+//! As in `encrypted_bytes`, only DTLS-encapsulated CAPWAP counts here (`capwap.preamble_type =
+//! 1`) -- plaintext CAPWAP is not encrypted, so it is excluded from this "concurrent encrypted
+//! connections" count. `MaybeQuic`/`MaybeZoom` skip a connection a real parser already claimed,
+//! so they never double-count against the six real protocols or each other; `MaybeIperf3` has no
+//! such guard and can double-count against any of the others -- see `encrypted_bytes`'s module
+//! docs for the full reasoning behind both of those invariants. All nine protocols/heuristics
+//! feed the *same* blended concurrency count below: this app tracks "some encrypted or
+//! maybe-encrypted connection was active", not a separate time series per protocol -- see
+//! `examples/bytes_over_time` for the per-protocol breakdown.
 //!
 //! The per-slice counts are printed to stdout and also written as two-column CSV
 //! (`slice_start_s,active_connections`, one row per slice) to `--outfile` (default
@@ -123,24 +134,45 @@ static SLICE_MS: AtomicU64 = AtomicU64::new(1000);
 /// Sized once from `--max-duration-secs`/`--slice-ms` before `runtime.run()` starts.
 static DELTAS: OnceLock<Vec<AtomicI64>> = OnceLock::new();
 
-/// Total encrypted connections collected, across all five protocols.
+/// Total encrypted/maybe-encrypted connections collected, across all nine protocols/heuristics.
 static TOTAL_CONNS: AtomicUsize = AtomicUsize::new(0);
 /// Connections whose lifetime extended past `--max-duration-secs` and were folded into the
 /// final slice rather than accurately bucketed.
 static OVERFLOWED_CONNS: AtomicUsize = AtomicUsize::new(0);
-/// Per-protocol connection counts, indexed by [`proto_index`].
-static PROTO_COUNTS: [AtomicUsize; 5] = [
+/// Per-protocol connection counts, indexed by [`proto_index`] for the six real protocols and
+/// by the fixed slots 6/7/8 for `MaybeQuic`/`MaybeZoom`/`MaybeIperf3`.
+static PROTO_COUNTS: [AtomicUsize; 9] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
 ];
-const PROTO_NAMES: [&str; 5] = ["TLS", "SSH", "QUIC", "WireGuard", "IKE"];
+const PROTO_NAMES: [&str; 9] = [
+    "TLS",
+    "SSH",
+    "QUIC",
+    "WireGuard",
+    "IKE",
+    "CAPWAP",
+    "MaybeQuic",
+    "MaybeZoom",
+    "MaybeIperf3",
+];
 
-/// Maps an identified `SessionProto` to its slot in [`PROTO_COUNTS`]/[`PROTO_NAMES`]. `None`
-/// for anything else -- unreachable in practice, since the callback's filter only matches
-/// these five protocols, but matched defensively rather than assumed.
+/// Maps an identified `SessionProto` to its slot in [`PROTO_COUNTS`]/[`PROTO_NAMES`] for the
+/// six real parsers. `None` for anything else -- unreachable in practice, since `record_conn`'s
+/// filter only matches these six protocols, but matched defensively rather than assumed.
+///
+/// CAPWAP lands here too even though `record_conn`'s filter restricts it to DTLS-encapsulated
+/// connections (`capwap.preamble_type = 1`) -- `SessionProto` itself doesn't encode that
+/// distinction, so any CAPWAP connection reaching this function already cleared the filter.
+/// `MaybeQuic`/`MaybeZoom`/`MaybeIperf3` (slots 6/7/8) don't go through this function at all --
+/// their own callbacks below use fixed indices, since they aren't `SessionProto` variants.
 fn proto_index(proto: &SessionProto) -> Option<usize> {
     match proto {
         SessionProto::Tls => Some(0),
@@ -148,7 +180,40 @@ fn proto_index(proto: &SessionProto) -> Option<usize> {
         SessionProto::Quic => Some(2),
         SessionProto::Wireguard => Some(3),
         SessionProto::Ike => Some(4),
+        SessionProto::Capwap => Some(5),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod proto_index_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_every_real_protocol() {
+        for proto in [
+            SessionProto::Tls,
+            SessionProto::Ssh,
+            SessionProto::Quic,
+            SessionProto::Wireguard,
+            SessionProto::Ike,
+            SessionProto::Capwap,
+        ] {
+            assert!(
+                proto_index(&proto).is_some(),
+                "proto_index should recognize {proto:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_undiscovered_and_unhandled_protocols() {
+        for proto in [SessionProto::Null, SessionProto::Probing, SessionProto::Dns] {
+            assert!(
+                proto_index(&proto).is_none(),
+                "proto_index should not recognize {proto:?}"
+            );
+        }
     }
 }
 
@@ -238,14 +303,11 @@ mod prefix_sum_tests {
     }
 }
 
-/// Collected once per encrypted connection, at teardown -- see the module docs for why
-/// `L4Terminated` is the collection point but `dur.last_ts` (not "now") is the connection's
-/// counted end.
-#[callback("tls or ssh or quic or wireguard or ike,level=L4Terminated")]
-fn record_conn(dur: &ConnDuration, proto: &SessionProto) {
-    let Some(idx) = proto_index(proto) else {
-        return;
-    };
+/// Folds one connection into [`PROTO_COUNTS`]`[idx]`, [`TOTAL_CONNS`], and the [`DELTAS`]
+/// difference array. Shared by every collecting callback below (the six real protocols plus the
+/// three `Maybe*` heuristics) so they can't drift out of sync on how a connection's active
+/// interval is turned into difference-array updates.
+fn collect_conn(idx: usize, dur: &ConnDuration) {
     PROTO_COUNTS[idx].fetch_add(1, Ordering::Relaxed);
     TOTAL_CONNS.fetch_add(1, Ordering::Relaxed);
 
@@ -266,6 +328,44 @@ fn record_conn(dur: &ConnDuration, proto: &SessionProto) {
     // per connection.
     deltas[first].fetch_add(1, Ordering::Relaxed);
     deltas[last + 1].fetch_add(-1, Ordering::Relaxed);
+}
+
+/// Collected once per encrypted connection, at teardown -- see the module docs for why
+/// `L4Terminated` is the collection point but `dur.last_ts` (not "now") is the connection's
+/// counted end. The CAPWAP term is `capwap.preamble_type = 1`, not bare `capwap` -- see the
+/// module docs.
+#[callback("tls or ssh or quic or wireguard or ike or capwap.preamble_type = 1,level=L4Terminated")]
+fn record_conn(dur: &ConnDuration, proto: &SessionProto) {
+    let Some(idx) = proto_index(proto) else {
+        return;
+    };
+    collect_conn(idx, dur);
+}
+
+/// `proto` is checked first: a connection a real parser already claimed is skipped here, so it
+/// isn't double-counted in both its protocol's slot and this one -- see the module docs.
+#[callback("MaybeQuic,level=L4Terminated")]
+fn record_maybe_quic_conn(dur: &ConnDuration, proto: &SessionProto) {
+    if proto_index(proto).is_some() {
+        return;
+    }
+    collect_conn(6, dur);
+}
+
+#[callback("MaybeZoom,level=L4Terminated")]
+fn record_maybe_zoom_conn(dur: &ConnDuration, proto: &SessionProto) {
+    if proto_index(proto).is_some() {
+        return;
+    }
+    collect_conn(7, dur);
+}
+
+/// No `proto_index` guard, unlike `record_maybe_quic_conn`/`record_maybe_zoom_conn` -- following
+/// `encrypted_bytes`'s `MAYBE_IPERF3_BYTES`, this is the one slot that can still double-count
+/// against any of the others. See the module docs.
+#[callback("MaybeIperf3,level=L4Terminated")]
+fn record_maybe_iperf3_conn(dur: &ConnDuration) {
+    collect_conn(8, dur);
 }
 
 /// Returns `100 * numerator / denominator` as a percentage, or `None` if `denominator` is
@@ -400,7 +500,8 @@ fn main() {
     let rows = slice_rows(&per_slice, last_nonzero, args.slice_ms);
 
     println!(
-        "=== Concurrent encrypted connections (TLS, SSH, QUIC, WireGuard, IKE) per {}ms slice ===",
+        "=== Concurrent encrypted/maybe-encrypted connections (TLS, SSH, QUIC, WireGuard, IKE, \
+         CAPWAP, MaybeQuic, MaybeZoom, MaybeIperf3) per {}ms slice ===",
         args.slice_ms
     );
     if rows.is_empty() {
@@ -416,7 +517,7 @@ fn main() {
 
     let total = TOTAL_CONNS.load(Ordering::Relaxed);
     println!("\n=== Summary ===");
-    println!("Encrypted connections observed: {}", total);
+    println!("Encrypted/maybe-encrypted connections observed: {}", total);
     for (name, counter) in PROTO_NAMES.iter().zip(PROTO_COUNTS.iter()) {
         println!(
             "  {:<10} {}",
