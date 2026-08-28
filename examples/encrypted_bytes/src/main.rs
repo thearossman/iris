@@ -6,20 +6,30 @@
 //! payload -- see "`MaybeQuic`/`MaybeZoom`/`MaybeIperf3` bytes" below), plus total TCP and UDP
 //! traffic.
 //!
-//! ## Byte unit: L4 payload, not wire bytes
-//! Every count in this app comes from `L4Pdu::length()` (`pdu.ctxt.length`), the TCP/UDP
-//! payload size once `core/src/conntrack/pdu.rs` strips the Ethernet/IP/TCP/UDP headers.
-//! Header-only segments -- pure ACKs, empty UDP encapsulations -- have a `length()` of 0.
-//! `EncBytes`, `TransportBytes`, and the built-in `ByteCount` behind `MaybeQuic`/`MaybeZoom`
-//! all read this same `pdu.length()`, so every ratio this app prints is apples-to-apples with
+//! ## Byte unit: on-wire bytes, headers included
+//! Every count in this app comes from `Mbuf::data_len()` (`pdu.mbuf.data_len()`), the length
+//! of the whole captured frame -- Ethernet, IP, and TCP/UDP headers included, plus the L4
+//! payload. `EncBytes` and `TransportBytes` below read it directly off the `L4Pdu` each one
+//! updates from. `MaybeQuic`/`MaybeZoom`/`MaybeIperf3`'s totals come from a local `WireBytes`
+//! datatype (below) reading that same value, standing in for the shared
+//! `iris_datatypes::ByteCount`, which is defined to *exclude* headers
+//! (`datatypes/src/conn_fts.rs`) and would otherwise put those three rows on a different unit
+//! than the rest of this app. Every ratio this app prints is therefore apples-to-apples with
 //! every other ratio it prints.
 //!
-//! It is NOT the same unit as the runtime's own startup banner, `Processed: N pkts, M bytes`
-//! (`core/src/runtime/offline.rs`), which sums `mbuf.data_len()` -- the full captured frame,
-//! headers included. On `traces/small_flows.pcap` that banner reports 9,216,531 bytes; this
-//! app's own TCP+UDP total for the same trace is 8,367,195. The ~850KB gap is header and
-//! pure-ACK overhead this app deliberately excludes, not traffic it failed to see -- don't
-//! divide one number by the other.
+//! This is now the same unit as the runtime's own startup banner, `Processed: N pkts, M bytes`
+//! (`core/src/runtime/offline.rs`), which sums that same `mbuf.data_len()` over every captured
+//! frame. The two totals still won't necessarily match, though: the banner sums *every* frame
+//! the runtime saw, including non-TCP/UDP traffic (ARP, ICMP, malformed packets) this app never
+//! tracks, while `TransportBytes` below only sums frames belonging to a TCP or UDP connection.
+//! This app's own TCP+UDP total is therefore a lower bound on the banner's total, not
+//! necessarily equal to it.
+//!
+//! Because full frames are counted, a pure ACK or an empty UDP encapsulation is no longer
+//! zero-weight the way it was under the old L4-payload-only accounting: its Ethernet/IP/TCP
+//! header bytes still count toward whichever bucket its packet falls into (`handshake`/
+//! `payload` for `EncBytes`, `tcp`/`udp` for `TransportBytes`), same as any other packet on the
+//! connection.
 //!
 //! ## Handshake vs. payload split
 //! This deliberately does NOT use `L4Pdu::app_body_offset()`/`pdu.ctxt.app_offset`, despite
@@ -54,8 +64,9 @@
 //! filter pattern matches -- for an L7 subscription, at `L7OnDisc`. But the packet that
 //! *triggers* discovery has already been dispatched at `InL4Conn` by that pre-reassembly
 //! update, while the callback is still `Matching`. Counting there dropped each connection's
-//! first data packet outright: on `traces/tls_single_flow.pcap` that was the whole 214-byte
-//! ClientHello, and protocols whose discovery spans several packets (QUIC) lost more.
+//! first data packet outright: on `traces/tls_single_flow.pcap` that was the connection's whole
+//! first packet -- the ClientHello frame, headers included -- and protocols whose discovery
+//! spans several packets (QUIC) lost more.
 //! Datatypes update unconditionally, so these totals cover the connection from its first
 //! byte. The numbers therefore mean "all bytes of a connection that turned out to be TLS",
 //! not "bytes observed after we knew it was TLS".
@@ -111,9 +122,9 @@
 //! sequence can clear both within the same window.
 //!
 //! ## `--min-bytes`
-//! Passing `--min-bytes N` excludes any connection whose own total L4 payload byte count (see
-//! "Byte unit" above; handshake + payload for `EncBytes`, tcp + udp for `TransportBytes`) is
-//! not more than `N` --
+//! Passing `--min-bytes N` excludes any connection whose own total on-wire byte count (see
+//! "Byte unit" above; handshake + payload for `EncBytes`, tcp + udp for `TransportBytes`, the
+//! single total for `WireBytes`) is not more than `N` --
 //! its packets never reach any global counter at all, rather than being counted and then
 //! subtracted out. The check happens once per connection, in each callback's own
 //! `L4Terminated` handler, using that connection's own running total; the two callbacks never
@@ -127,7 +138,6 @@ use iris_core::protocols::packet::udp::UDP_PROTOCOL;
 use iris_core::protocols::stream::SessionProto;
 use iris_core::subscription::Tracked;
 use iris_core::{config::load_config, L4Pdu, Runtime};
-use iris_datatypes::ByteCount;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -144,8 +154,8 @@ struct Args {
     )]
     config: PathBuf,
 
-    /// Only count a connection (and the packets in it) if its total L4 payload byte count
-    /// (see module docs -- headers and pure ACKs are excluded) is more than N. 0 (the default)
+    /// Only count a connection (and the packets in it) if its total on-wire byte count
+    /// (see module docs -- full packets, headers included) is more than N. 0 (the default)
     /// counts every connection.
     #[clap(short, long, value_name = "N", default_value_t = 0)]
     min_bytes: usize,
@@ -234,10 +244,7 @@ impl EncBytes {
 
     #[datatype_fn("EncBytes,level=InL4Conn")]
     fn update(&mut self, pdu: &L4Pdu) {
-        let len = pdu.length();
-        if len == 0 {
-            return;
-        }
+        let len = pdu.mbuf.data_len();
         if self.in_payload {
             self.payload_bytes += len;
         } else {
@@ -355,10 +362,7 @@ struct TransportBytes {
 impl TransportBytes {
     #[datatype_fn("TransportBytes,level=InL4Conn")]
     fn update(&mut self, pdu: &L4Pdu) {
-        let len = pdu.length();
-        if len == 0 {
-            return;
-        }
+        let len = pdu.mbuf.data_len();
         match pdu.ctxt.proto {
             TCP_PROTOCOL => self.tcp_bytes += len,
             UDP_PROTOCOL => self.udp_bytes += len,
@@ -393,13 +397,43 @@ fn record_transport_bytes(bytes: &TransportBytes) {
     UDP_BYTES.fetch_add(bytes.udp_bytes, Ordering::Relaxed);
 }
 
+/// Per-connection total on-wire byte count, standing in for the shared `iris_datatypes::ByteCount`
+/// for `MaybeQuic`/`MaybeZoom`/`MaybeIperf3`. `ByteCount` is defined to exclude headers
+/// (`datatypes/src/conn_fts.rs`), which would put these three rows on a different unit than
+/// `EncBytes`/`TransportBytes` above -- see "Byte unit" in the module docs.
+#[datatype]
+struct WireBytes {
+    total_bytes: usize,
+}
+
+impl WireBytes {
+    fn total(&self) -> usize {
+        self.total_bytes
+    }
+
+    #[datatype_fn("WireBytes,level=InL4Conn")]
+    fn update(&mut self, pdu: &L4Pdu) {
+        self.total_bytes += pdu.mbuf.data_len();
+    }
+}
+
+impl Tracked for WireBytes {
+    fn new(_first_pkt: &L4Pdu) -> Self {
+        Self { total_bytes: 0 }
+    }
+
+    fn clear(&mut self) {
+        self.total_bytes = 0;
+    }
+}
+
 /// `MaybeQuic`/`MaybeZoom` are heuristic filters, not real L7 parsers, so there's no handshake
 /// to split out -- the whole connection's bytes count as payload. See the module docs.
 ///
 /// `proto` is checked first: a connection a real parser already claimed (see `enc_totals`) is
 /// skipped here, so it isn't double-counted in both its protocol's row and this one.
 #[callback("MaybeQuic,level=L4Terminated")]
-fn record_maybe_quic_bytes(bytes: &ByteCount, proto: &SessionProto) {
+fn record_maybe_quic_bytes(bytes: &WireBytes, proto: &SessionProto) {
     if enc_totals(proto).is_some() {
         return;
     }
@@ -411,7 +445,7 @@ fn record_maybe_quic_bytes(bytes: &ByteCount, proto: &SessionProto) {
 }
 
 #[callback("MaybeZoom,level=L4Terminated")]
-fn record_maybe_zoom_bytes(bytes: &ByteCount, proto: &SessionProto) {
+fn record_maybe_zoom_bytes(bytes: &WireBytes, proto: &SessionProto) {
     if enc_totals(proto).is_some() {
         return;
     }
@@ -423,7 +457,7 @@ fn record_maybe_zoom_bytes(bytes: &ByteCount, proto: &SessionProto) {
 }
 
 #[callback("MaybeIperf3,level=L4Terminated")]
-fn record_maybe_iperf3_bytes(bytes: &ByteCount) {
+fn record_maybe_iperf3_bytes(bytes: &WireBytes) {
     let total = bytes.total();
     if !clears_min_bytes(total, MIN_BYTES.load(Ordering::Relaxed)) {
         return;
@@ -476,13 +510,14 @@ fn main() {
     let transport_total = tcp_bytes + udp_bytes;
 
     println!(
-        "\n(Byte counts below are L4 payload bytes -- Ethernet/IP/TCP/UDP headers and pure \
-         ACKs excluded. Not the same unit as this runtime's own \"Processed: N pkts, M bytes\" \
-         line above, which counts full wire bytes; see the module docs.)"
+        "\n(Byte counts below are on-wire bytes -- full captured frames, Ethernet/IP/TCP/UDP \
+         headers included. Same unit as this runtime's own \"Processed: N pkts, M bytes\" line \
+         above (both sum a packet's full `mbuf.data_len()`), though the two totals still won't \
+         necessarily match; see the module docs.)"
     );
     if args.min_bytes > 0 {
         println!(
-            "\n(Connections with {} or fewer total L4 payload bytes are excluded from every \
+            "\n(Connections with {} or fewer total on-wire bytes are excluded from every \
              count below.)",
             args.min_bytes
         );
