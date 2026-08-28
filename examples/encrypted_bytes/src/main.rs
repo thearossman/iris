@@ -1,8 +1,9 @@
 //! Counts bytes across all of Iris's encrypted stream protocols (TLS, SSH, QUIC,
 //! WireGuard, IKE), split into cleartext handshake bytes vs. encrypted payload bytes, plus
-//! heuristically-detected mid-stream QUIC and Zoom media traffic (`MaybeQuic`/`MaybeZoom`,
-//! counted entirely as payload -- see "`MaybeQuic`/`MaybeZoom` bytes" below), plus total TCP
-//! and UDP traffic.
+//! CAPWAP (see "CAPWAP bytes" below, on why it's here despite not being an encrypted
+//! protocol itself), plus heuristically-detected mid-stream QUIC and Zoom media traffic
+//! (`MaybeQuic`/`MaybeZoom`, counted entirely as payload -- see "`MaybeQuic`/`MaybeZoom`
+//! bytes" below), plus total TCP and UDP traffic.
 //!
 //! ## Handshake vs. payload split
 //! This deliberately does NOT use `L4Pdu::app_body_offset()`/`pdu.ctxt.app_offset`, despite
@@ -11,7 +12,7 @@
 //! (`core/src/conntrack/conn/conn_layers.rs`), and `process_stream` is only invoked while
 //! the L7 layer's `Actions::Parse` bit is set. That bit is cleared as soon as headers
 //! finish for any parser reporting `ParsingState::Stop` -- which is TLS, SSH, WireGuard,
-//! and IKE (only QUIC reports `Parsing`). So for four of the five protocols here,
+//! IKE, and CAPWAP (only QUIC reports `Parsing`). So for five of the six protocols here,
 //! `app_offset` is never touched again after the handshake packet and just sits at its
 //! per-packet default of `None` on every later packet, even ones deep in the encrypted
 //! payload -- indistinguishable from "still in the handshake". (There's a second wrinkle
@@ -42,6 +43,15 @@
 //! Datatypes update unconditionally, so these totals cover the connection from its first
 //! byte. The numbers therefore mean "all bytes of a connection that turned out to be TLS",
 //! not "bytes observed after we knew it was TLS".
+//!
+//! ## CAPWAP bytes
+//! CAPWAP (`core/src/protocols/stream/capwap`) is included alongside the other four
+//! protocols in this list even though it isn't itself an encryption protocol: its control
+//! and data channels are cleartext by default, and are only DTLS-encrypted (detected, not
+//! decrypted -- see the parser's module docs) when the preamble says so. It's counted here
+//! because it has the same shape as TLS/SSH/WireGuard/IKE for this app's purposes -- a
+//! single-fixed-header parser reporting `ParsingState::Stop` -- so `CAPWAP_BYTES`'
+//! `payload` bucket means "bytes after the CAPWAP header", not "encrypted bytes".
 //!
 //! ## `MaybeQuic`/`MaybeZoom` bytes
 //! `MaybeQuic` and `MaybeZoom` (`datatypes/src/maybe_quic.rs`, `datatypes/src/maybe_zoom.rs`)
@@ -142,6 +152,7 @@ lazy_static! {
     static ref QUIC_BYTES: ByteTotals = ByteTotals::new();
     static ref WIREGUARD_BYTES: ByteTotals = ByteTotals::new();
     static ref IKE_BYTES: ByteTotals = ByteTotals::new();
+    static ref CAPWAP_BYTES: ByteTotals = ByteTotals::new();
     static ref MAYBE_QUIC_BYTES: ByteTotals = ByteTotals::new();
     static ref MAYBE_ZOOM_BYTES: ByteTotals = ByteTotals::new();
     static ref TCP_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -153,7 +164,7 @@ lazy_static! {
 /// This is a `Tracked` datatype, not accumulation inside the callback, and that distinction
 /// is load-bearing -- see "Why a datatype and not a callback" in the module docs. It reacts
 /// only to generic `L4Pdu`/state-transition events, so it never needs to know which of the
-/// five protocols it is looking at; `record_enc_bytes` reads `SessionProto` at teardown to
+/// six protocols it is looking at; `record_enc_bytes` reads `SessionProto` at teardown to
 /// decide which bucket the result lands in.
 #[datatype]
 struct EncBytes {
@@ -208,9 +219,9 @@ impl Tracked for EncBytes {
     }
 }
 
-/// The filter's OR predicate registers all five parsers; `SessionProto`, read once the
+/// The filter's OR predicate registers all six parsers; `SessionProto`, read once the
 /// connection is torn down, says which one actually matched.
-#[callback("tls or ssh or quic or wireguard or ike,level=L4Terminated")]
+#[callback("tls or ssh or quic or wireguard or ike or capwap,level=L4Terminated")]
 fn record_enc_bytes(bytes: &EncBytes, proto: &SessionProto) {
     let totals = match proto {
         SessionProto::Tls => &*TLS_BYTES,
@@ -218,6 +229,7 @@ fn record_enc_bytes(bytes: &EncBytes, proto: &SessionProto) {
         SessionProto::Quic => &*QUIC_BYTES,
         SessionProto::Wireguard => &*WIREGUARD_BYTES,
         SessionProto::Ike => &*IKE_BYTES,
+        SessionProto::Capwap => &*CAPWAP_BYTES,
         _ => return,
     };
     // Below the bar: none of this connection's bytes are added, not even to a "dropped"
@@ -353,6 +365,7 @@ fn main() {
     print_proto("QUIC", &QUIC_BYTES, transport_total);
     print_proto("WireGuard", &WIREGUARD_BYTES, transport_total);
     print_proto("IKE", &IKE_BYTES, transport_total);
+    print_proto("CAPWAP", &CAPWAP_BYTES, transport_total);
     print_proto("MaybeQUIC", &MAYBE_QUIC_BYTES, transport_total);
     print_proto("MaybeZoom", &MAYBE_ZOOM_BYTES, transport_total);
 
