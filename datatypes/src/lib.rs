@@ -17,6 +17,9 @@ pub use http_transaction::HttpTransaction;
 pub mod ike_header;
 pub use ike_header::IkeHeader;
 
+pub mod maybe_iperf3;
+pub use maybe_iperf3::*;
+
 pub mod maybe_quic;
 pub use maybe_quic::*;
 
