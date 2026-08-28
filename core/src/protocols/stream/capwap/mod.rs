@@ -109,10 +109,17 @@ pub enum Channel {
 /// Parsed CAPWAP connection summary.
 ///
 /// ## Scope
-/// Every field describes the **first** CAPWAP message observed on the connection. Iris
-/// delivers the session as soon as the transport header (and, on the control channel, the
-/// control header) has been parsed and does not parse further packets on the connection, so
-/// later messages are not reflected here.
+/// Every field describes the message that finalized parsing on the connection -- normally
+/// the first one, since Iris delivers the session as soon as the transport header (and, on
+/// the control channel, the control header) has been parsed and does not parse further
+/// packets on the connection afterward. The one exception is a plaintext Discovery
+/// Request/Response on the control channel, which doesn't finalize by itself (see
+/// [`Capwap::update`] -- CAPWAP's own spec guarantees Discovery is unencrypted and precedes
+/// DTLS setup, so stopping there would make `preamble_type`/`is_dtls` permanently misreport
+/// an about-to-be-encrypted connection as unencrypted).
+/// Whichever message actually finalizes parsing (or, if the connection ends first, the last
+/// Discovery message observed) is what every field reflects; later messages past that point
+/// are never seen.
 #[derive(Debug, Default, Serialize)]
 pub struct Capwap {
     version: u8,
