@@ -32,6 +32,7 @@ lazy_static! {
         let ssh      = g.add_node(protocol!("ssh"));
         let wireguard = g.add_node(protocol!("wireguard"));
         let ike      = g.add_node(protocol!("ike"));
+        let capwap   = g.add_node(protocol!("capwap"));
         // define valid outer layers for each protocol header
         g.extend_with_edges([
             (ipv4, ethernet),
@@ -45,6 +46,7 @@ lazy_static! {
             (ssh, tcp),
             (wireguard, udp),
             (ike, udp),
+            (capwap, udp),
         ]);
         g
     };
@@ -1253,6 +1255,9 @@ mod tests {
         assert!(has_path(&protocol!("ike"), &protocol!("udp")));
         assert!(has_path(&protocol!("ike"), &protocol!("ipv6")));
         assert!(!has_path(&protocol!("ike"), &protocol!("tcp")));
+        assert!(has_path(&protocol!("capwap"), &protocol!("udp")));
+        assert!(has_path(&protocol!("capwap"), &protocol!("ipv4")));
+        assert!(!has_path(&protocol!("capwap"), &protocol!("tcp")));
     }
 
     #[test]
