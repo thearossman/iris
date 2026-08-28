@@ -30,6 +30,14 @@
 //!
 //! This filter only inspects UDP traffic on [`QUIC_PORTS`].
 //!
+//! Because a long header now counts as evidence, the fingerprint on its own
+//! matches connections the `quic` parser already identifies. To keep the two
+//! populations disjoint -- so a connection is not reported once as `quic` and
+//! again as a heuristic guess -- [`MaybeQuic::unclaimed`] vetoes the connection
+//! at `L7OnDisc` as soon as any parser claims it. What is left is what the
+//! parsers missed: mid-stream QUIC, and anything whose version or greased bits
+//! the `quic` probe cannot conclude on.
+//!
 //! This filter requires at least two distinct first-byte values among the
 //! unambiguously-QUIC packets before accepting. This avoids false positives
 //! from other protocols that pin their first byte in the same `0x40..=0x7f`
@@ -40,6 +48,7 @@
 use iris_compiler::{filter, filter_fn};
 use iris_core::protocols::packet::udp::UDP_PROTOCOL;
 use iris_core::protocols::stream::quic::is_quic_version;
+use iris_core::protocols::stream::SessionProto;
 use iris_core::subscription::{FilterResult, StreamingFilter};
 use iris_core::L4Pdu;
 
@@ -249,6 +258,49 @@ impl MaybeQuic {
             self.record(data);
         }
         self.decide()
+    }
+
+    /// Vetoes the connection once a parser has identified it, so that
+    /// `MaybeQuic` reports only what the parsers missed.
+    ///
+    /// `SessionProto` resolves at `L7OnDisc`, which is dispatched as soon as
+    /// discovery concludes -- on the first packet or two of a connection whose
+    /// handshake is visible, and so always before [`MaybeQuic::update`] can
+    /// reach [`MAYBE_QUIC_REQUIRED_MATCHES`] and accept. Returning `Drop` here
+    /// also deactivates the filter, so `update` stops being called for the rest
+    /// of the connection.
+    ///
+    /// Mid-stream QUIC -- the population this filter exists for -- never gets
+    /// here: the `quic` probe answers `Unsure` for a short header and never
+    /// concludes, so `L7OnDisc` is not dispatched at all and the heuristic
+    /// runs to its own verdict.
+    ///
+    /// One case still overlaps: a connection whose long-header packet arrives
+    /// after the window has already closed on an accept. There is no veto left
+    /// to apply at that point, and the accept was made on its own evidence.
+    #[cfg_attr(not(feature = "skip_expand"), filter_fn("MaybeQuic,level=L7OnDisc"))]
+    pub fn unclaimed(&self, proto: &SessionProto) -> FilterResult {
+        match proto {
+            // A parser claimed the connection; it is already reported as that
+            // protocol, and a heuristic guess on top would double-count it.
+            SessionProto::Tls
+            | SessionProto::Dns
+            | SessionProto::Http
+            | SessionProto::Quic
+            | SessionProto::Ssh
+            | SessionProto::Wireguard
+            | SessionProto::Ike => FilterResult::Drop,
+            // Nothing has claimed it: `Probing` while discovery is still
+            // running, `Null` once every registered parser has declined.
+            SessionProto::Null | SessionProto::Probing => FilterResult::Continue,
+            // `ConnParser::protocol` never yields the transport-layer variants
+            // -- they exist for the filter AST -- but they are listed rather
+            // than wildcarded so that adding an L7 parser is a compile error
+            // here instead of a silent hole in the veto.
+            SessionProto::Ipv4 | SessionProto::Ipv6 | SessionProto::Tcp | SessionProto::Udp => {
+                FilterResult::Continue
+            }
+        }
     }
 
     /// Reached only if the connection terminated before the window filled.
@@ -492,6 +544,52 @@ mod tests {
         }
         // 11 seen, 9 unambiguous + 2 greased.
         assert_eq!(f.matches(), 11);
+        assert!(matches!(f.decide(), FilterResult::Accept));
+    }
+
+    #[test]
+    fn a_parser_identifying_the_connection_vetoes_the_heuristic() {
+        let f = MaybeQuic::new_for_test();
+        // Any parser claiming the connection takes it out of `MaybeQuic`'s
+        // population -- not just the `quic` parser.
+        for proto in [
+            SessionProto::Quic,
+            SessionProto::Tls,
+            SessionProto::Dns,
+            SessionProto::Http,
+            SessionProto::Ssh,
+            SessionProto::Wireguard,
+            SessionProto::Ike,
+        ] {
+            assert!(
+                matches!(f.unclaimed(&proto), FilterResult::Drop),
+                "{:?} should veto",
+                proto
+            );
+        }
+        // Unclaimed: discovery still running, or every parser declined.
+        for proto in [SessionProto::Probing, SessionProto::Null] {
+            assert!(
+                matches!(f.unclaimed(&proto), FilterResult::Continue),
+                "{:?} should not veto",
+                proto
+            );
+        }
+    }
+
+    #[test]
+    fn the_veto_leaves_an_already_matching_connection_to_its_own_verdict() {
+        // The veto is a `Continue`/`Drop` decision only: it never accepts, and
+        // an unclaimed connection carries on accumulating evidence.
+        let mut f = MaybeQuic::new_for_test();
+        for _ in 0..(MAYBE_QUIC_REQUIRED_MATCHES - 1) {
+            f.record(&[0x41]);
+        }
+        assert!(matches!(
+            f.unclaimed(&SessionProto::Null),
+            FilterResult::Continue
+        ));
+        f.record(&[0x52]);
         assert!(matches!(f.decide(), FilterResult::Accept));
     }
 
