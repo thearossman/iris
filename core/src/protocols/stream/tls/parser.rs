@@ -54,20 +54,10 @@ impl ConnParsable for TlsParser {
     }
 
     fn probe(&self, pdu: &L4Pdu) -> ProbeResult {
-        if pdu.length() <= 2 {
-            return ProbeResult::Unsure;
-        }
-
         let offset = pdu.offset();
         let length = pdu.length();
         if let Ok(data) = (pdu.mbuf_ref()).get_data_slice(offset, length) {
-            // First byte is record type (between 0x14 and 0x17, 0x16 is handhake) Second is TLS
-            // version major (0x3) Third is TLS version minor (0x0 for SSLv3, 0x1 for TLSv1.0, etc.)
-            // Does not support versions <= SSLv2
-            match (data[0], data[1], data[2]) {
-                (0x14..=0x17, 0x03, 0..=3) => ProbeResult::Certain,
-                _ => ProbeResult::NotForUs,
-            }
+            classify_probe(data)
         } else {
             log::warn!("Malformed packet");
             ProbeResult::Error
@@ -103,6 +93,101 @@ impl ConnParsable for TlsParser {
     }
 }
 
+/// Bytes needed to tell an SSLv2-format ClientHello apart from other traffic whose first byte
+/// happens to have the high bit set.
+const SSLV2_PROBE_LEN: usize = 5;
+
+/// Classifies the first bytes of a (possibly reassembled) TCP segment as TLS, an SSLv2-format
+/// ClientHello, or neither. Factored out of [`TlsParser::probe`] so it can be unit-tested over
+/// raw bytes without an `Mbuf`.
+pub(crate) fn classify_probe(data: &[u8]) -> ProbeResult {
+    match data {
+        // TLS/SSLv3 record: content type (0x16 is Handshake), version major, version minor.
+        // Does not support versions <= SSLv2 in this form.
+        [0x14..=0x17, 0x03, 0..=3, ..] => ProbeResult::Certain,
+        // SSLv2-format ClientHello (RFC 5246 Appendix E.2, the backward-compatible hello some
+        // clients still send): a 2-byte length header with the high bit set (no padding byte),
+        // then msg_type = 1 (CLIENT-HELLO) and a 3.x client version.
+        [b0, _, 0x01, 0x03, 0..=3, ..] if b0 & 0x80 != 0 => ProbeResult::Certain,
+        // High bit set but too few bytes yet to confirm the SSLv2 form.
+        [b0, ..] if b0 & 0x80 != 0 && data.len() < SSLV2_PROBE_LEN => ProbeResult::Unsure,
+        // Too few bytes to classify at all.
+        _ if data.len() < 3 => ProbeResult::Unsure,
+        _ => ProbeResult::NotForUs,
+    }
+}
+
+/// Errors from [`parse_sslv2_client_hello`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SslV2Error {
+    /// Not enough bytes yet to parse the full message.
+    Incomplete,
+    /// Bytes were present but did not form a valid SSLv2 ClientHello.
+    Malformed,
+}
+
+/// A parsed SSLv2-format ClientHello (RFC 5246 Appendix E.2).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SslV2ClientHello {
+    pub(crate) version: u16,
+    /// Each cipher spec is 3 bytes; v3-compatible specs have a leading byte of 0.
+    pub(crate) cipher_specs: Vec<u32>,
+    pub(crate) session_id: Vec<u8>,
+    pub(crate) challenge: Vec<u8>,
+}
+
+/// Parses an SSLv2-format ClientHello at the start of `data`. On success, returns the number of
+/// bytes consumed (the 2-byte length header plus the message body) along with the parsed hello.
+pub(crate) fn parse_sslv2_client_hello(
+    data: &[u8],
+) -> Result<(usize, SslV2ClientHello), SslV2Error> {
+    if data.len() < 2 {
+        return Err(SslV2Error::Incomplete);
+    }
+    let hdr = u16::from_be_bytes([data[0], data[1]]);
+    if hdr & 0x8000 == 0 {
+        return Err(SslV2Error::Malformed);
+    }
+    let msg_len = (hdr & 0x7fff) as usize;
+    let total_len = 2 + msg_len;
+    if data.len() < total_len {
+        return Err(SslV2Error::Incomplete);
+    }
+    let body = &data[2..total_len];
+    // msg_type(1) + version(2) + cipher_spec_len(2) + session_id_len(2) + challenge_len(2)
+    if body.len() < 9 || body[0] != 0x01 {
+        return Err(SslV2Error::Malformed);
+    }
+    let version = u16::from_be_bytes([body[1], body[2]]);
+    let cipher_spec_len = u16::from_be_bytes([body[3], body[4]]) as usize;
+    let session_id_len = u16::from_be_bytes([body[5], body[6]]) as usize;
+    let challenge_len = u16::from_be_bytes([body[7], body[8]]) as usize;
+    if 9 + cipher_spec_len + session_id_len + challenge_len != body.len() {
+        return Err(SslV2Error::Malformed);
+    }
+    if !cipher_spec_len.is_multiple_of(3) {
+        return Err(SslV2Error::Malformed);
+    }
+    let mut off = 9;
+    let cipher_specs = body[off..off + cipher_spec_len]
+        .chunks_exact(3)
+        .map(|c| u32::from_be_bytes([0, c[0], c[1], c[2]]))
+        .collect();
+    off += cipher_spec_len;
+    let session_id = body[off..off + session_id_len].to_vec();
+    off += session_id_len;
+    let challenge = body[off..off + challenge_len].to_vec();
+    Ok((
+        total_len,
+        SslV2ClientHello {
+            version,
+            cipher_specs,
+            session_id,
+            challenge,
+        },
+    ))
+}
+
 // ------------------------------------------------------------
 
 impl Tls {
@@ -120,6 +205,31 @@ impl Tls {
             record_buffer: vec![],
             last_body_offset: None,
         }
+    }
+
+    /// Applies a parsed SSLv2-format ClientHello (see [`parse_sslv2_client_hello`]) as this
+    /// connection's `ClientHello` and advances the state machine as if a v3 ClientHello had just
+    /// been parsed, so the rest of the handshake (ServerHello, ChangeCipherSpec, ...) proceeds
+    /// through the normal v3 state machine.
+    ///
+    /// Extensions, compression methods, and SNI are not part of the SSLv2 wire format, so those
+    /// fields are left empty -- `sni()` correctly returns `""` for these handshakes.
+    fn parse_sslv2_handshake(&mut self, hello: SslV2ClientHello) {
+        self.client_hello = Some(ClientHello {
+            version: TlsVersion(hello.version),
+            random: hello.challenge,
+            session_id: hello.session_id,
+            // Only the v3-compatible specs (leading byte 0) have a `TlsCipherSuiteID`;
+            // SSLv2-only suites such as SSL2_RC4_128_WITH_MD5 (0x010080) are dropped.
+            cipher_suites: hello
+                .cipher_specs
+                .iter()
+                .filter(|c| *c >> 16 == 0)
+                .map(|c| TlsCipherSuiteID(*c as u16))
+                .collect(),
+            ..ClientHello::default()
+        });
+        self.state = TlsState::ClientHello;
     }
 
     /// Parse a ClientHello message.
@@ -524,6 +634,27 @@ impl Tls {
             }
         };
         let mut cur_data = tcp_buffer;
+
+        // Before the very first record, check for an SSLv2-format ClientHello (see
+        // `classify_probe`/`parse_sslv2_client_hello`) instead of a v3 record. This can only be
+        // the first message of a connection, so it is only attempted once, gated on `state`.
+        if self.state == TlsState::None {
+            match parse_sslv2_client_hello(cur_data) {
+                Ok((consumed, hello)) => {
+                    self.parse_sslv2_handshake(hello);
+                    cur_data = &cur_data[consumed..];
+                }
+                Err(SslV2Error::Incomplete) => {
+                    self.tcp_buffer.extend_from_slice(cur_data);
+                    return status;
+                }
+                Err(SslV2Error::Malformed) => {
+                    // Not an SSLv2 hello either (or a corrupt one); fall through to the normal
+                    // v3 record parser below.
+                }
+            }
+        }
+
         while !cur_data.is_empty() {
             // parse each TLS record in the TCP segment (there could be multiple)
             match parse_tls_raw_record(cur_data) {
@@ -549,5 +680,155 @@ impl Tls {
             }
         }
         status
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SSLv2-format ClientHello, captured as frame 4032 of `traces/small_flows.pcap` (stream
+    /// 164). 15 cipher specs (9 v3-compatible, 6 SSLv2-only), no session ID, 16-byte challenge.
+    const SSLV2_CLIENT_HELLO: &str = "8046010301002d00000010000005000004000\
+00a0000090000640000620000080000030000060100800700c00300800600400200800400807cbdca33481976efd43\
+5e26b20110ea7";
+
+    /// TLS 1.0 ServerHello record replying to the above, captured as frame 4033 (same stream).
+    const SERVER_HELLO_RECORD: &str = "160301004a020000460301401be48602ade029e17774e544b9c99cb4\
+31315e02dd779d154a9609ba5da870201ca0e4f64c6351ae2f8e4ee1e6766a0a88d5d8c55cae98c5e481f22a69bf905\
+8000500";
+
+    /// A second, distinct SSLv2-format ClientHello, captured as frame 4884 (stream 218).
+    const SSLV2_CLIENT_HELLO_2: &str = "804c01030000330000001000000400000500000a0100800700c0030\
+08000000906004000006400006200000300000602008004008000001300001200006373d2cf902a02321147358f7b8\
+014b688";
+
+    /// A v3 record whose body is entirely empty -- the legitimate 5-byte first segment some
+    /// clients send (e.g. streams 176/203/204/209/212/247/284 in `small_flows.pcap`).
+    const EMPTY_V3_RECORD: &str = "1603010000";
+
+    fn hex(s: &str) -> Vec<u8> {
+        hex::decode(s).unwrap()
+    }
+
+    #[test]
+    fn classify_probe_recognizes_v3_records() {
+        assert_eq!(classify_probe(&hex(EMPTY_V3_RECORD)), ProbeResult::Certain);
+        assert_eq!(
+            classify_probe(&hex(SERVER_HELLO_RECORD)),
+            ProbeResult::Certain
+        );
+    }
+
+    #[test]
+    fn classify_probe_recognizes_sslv2_client_hello() {
+        assert_eq!(
+            classify_probe(&hex(SSLV2_CLIENT_HELLO)),
+            ProbeResult::Certain
+        );
+        assert_eq!(
+            classify_probe(&hex(SSLV2_CLIENT_HELLO_2)),
+            ProbeResult::Certain
+        );
+    }
+
+    #[test]
+    fn classify_probe_unsure_on_short_input() {
+        let full = hex(SSLV2_CLIENT_HELLO);
+        for n in 0..SSLV2_PROBE_LEN {
+            assert_eq!(
+                classify_probe(&full[..n]),
+                ProbeResult::Unsure,
+                "expected Unsure at length {n}"
+            );
+        }
+        assert_eq!(classify_probe(&[]), ProbeResult::Unsure);
+        assert_eq!(classify_probe(&[0x16]), ProbeResult::Unsure);
+        assert_eq!(classify_probe(&[0x16, 0x03]), ProbeResult::Unsure);
+    }
+
+    #[test]
+    fn classify_probe_rejects_other_traffic() {
+        assert_eq!(classify_probe(b"GET / HTTP/1.1\r\n"), ProbeResult::NotForUs);
+        // High bit set, but not the SSLv2 ClientHello shape (msg_type != 1).
+        assert_eq!(
+            classify_probe(&[0x80, 0x10, 0x02, 0x03, 0x01, 0x00]),
+            ProbeResult::NotForUs
+        );
+        // SSLv2-shaped, but the embedded client version isn't a recognized 3.x.
+        assert_eq!(
+            classify_probe(&[0x80, 0x10, 0x01, 0x02, 0x00, 0x00]),
+            ProbeResult::NotForUs
+        );
+    }
+
+    #[test]
+    fn parse_sslv2_client_hello_decodes_real_capture() {
+        let data = hex(SSLV2_CLIENT_HELLO);
+        let (consumed, hello) = parse_sslv2_client_hello(&data).expect("should parse");
+        assert_eq!(consumed, data.len());
+        assert_eq!(consumed, 72);
+        assert_eq!(hello.version, 0x0301);
+        assert_eq!(hello.cipher_specs.len(), 15);
+        assert_eq!(
+            hello.cipher_specs.iter().filter(|c| *c >> 16 == 0).count(),
+            9,
+            "9 of the 15 cipher specs are v3-compatible (leading byte 0)"
+        );
+        assert!(hello.session_id.is_empty());
+        assert_eq!(hello.challenge.len(), 16);
+    }
+
+    #[test]
+    fn parse_sslv2_client_hello_incomplete() {
+        let data = hex(SSLV2_CLIENT_HELLO);
+        for n in 1..data.len() {
+            assert_eq!(
+                parse_sslv2_client_hello(&data[..n]),
+                Err(SslV2Error::Incomplete),
+                "expected Incomplete at length {n}"
+            );
+        }
+        assert_eq!(parse_sslv2_client_hello(&[]), Err(SslV2Error::Incomplete));
+    }
+
+    #[test]
+    fn parse_sslv2_client_hello_rejects_malformed() {
+        // High bit not set: not this format at all.
+        assert_eq!(
+            parse_sslv2_client_hello(&[0x00, 0x02, 0x01, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00]),
+            Err(SslV2Error::Malformed)
+        );
+        // High bit set, but msg_type != 1 (CLIENT-HELLO).
+        assert_eq!(
+            parse_sslv2_client_hello(&[0x80, 0x07, 0x02, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00]),
+            Err(SslV2Error::Malformed)
+        );
+        // Declared sub-lengths (cipher_spec_len=3, session_id_len=0, challenge_len=0) don't add
+        // up to the declared message length (9, i.e. just the fixed 9-byte header).
+        assert_eq!(
+            parse_sslv2_client_hello(&[
+                0x80, 0x09, 0x01, 0x03, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00
+            ]),
+            Err(SslV2Error::Malformed)
+        );
+    }
+
+    #[test]
+    fn sslv2_hello_feeds_normal_v3_state_machine() {
+        let mut tls = Tls::new();
+
+        let client_to_server = true;
+        let server_to_client = false;
+
+        let status = tls.parse_tcp_level(&hex(SSLV2_CLIENT_HELLO), client_to_server);
+        assert_eq!(status, ParseResult::Continue(0));
+        assert_eq!(tls.client_version(), 0x0301);
+        assert!(!tls.is_invalid());
+
+        let status = tls.parse_tcp_level(&hex(SERVER_HELLO_RECORD), server_to_client);
+        assert_eq!(status, ParseResult::Continue(0));
+        assert_eq!(tls.server_version(), 0x0301);
+        assert!(!tls.is_invalid());
     }
 }
