@@ -4,6 +4,21 @@
 //! (`MaybeQuic`/`MaybeZoom`/`MaybeIperf3`, counted entirely as payload -- see
 //! "`MaybeQuic`/`MaybeZoom`/`MaybeIperf3` bytes" below), plus total TCP and UDP traffic.
 //!
+//! ## Byte unit: L4 payload, not wire bytes
+//! Every count in this app comes from `L4Pdu::length()` (`pdu.ctxt.length`), the TCP/UDP
+//! payload size once `core/src/conntrack/pdu.rs` strips the Ethernet/IP/TCP/UDP headers.
+//! Header-only segments -- pure ACKs, empty UDP encapsulations -- have a `length()` of 0.
+//! `EncBytes`, `TransportBytes`, and the built-in `ByteCount` behind `MaybeQuic`/`MaybeZoom`
+//! all read this same `pdu.length()`, so every ratio this app prints is apples-to-apples with
+//! every other ratio it prints.
+//!
+//! It is NOT the same unit as the runtime's own startup banner, `Processed: N pkts, M bytes`
+//! (`core/src/runtime/offline.rs`), which sums `mbuf.data_len()` -- the full captured frame,
+//! headers included. On `traces/small_flows.pcap` that banner reports 9,216,531 bytes; this
+//! app's own TCP+UDP total for the same trace is 8,367,195. The ~850KB gap is header and
+//! pure-ACK overhead this app deliberately excludes, not traffic it failed to see -- don't
+//! divide one number by the other.
+//!
 //! ## Handshake vs. payload split
 //! This deliberately does NOT use `L4Pdu::app_body_offset()`/`pdu.ctxt.app_offset`, despite
 //! that looking like the obvious per-packet signal. It isn't reliable for this purpose:
@@ -54,9 +69,27 @@
 //! in the same `MAYBE_IPERF3_BYTES` total here since a connection is only ever judged by one
 //! of the two.
 //!
+//! Neither filter consults the real parsers' results, so a connection the `quic` parser
+//! identifies can also satisfy `MaybeQuic` (e.g. one stray long-header packet among its first
+//! `MAYBE_QUIC_WINDOW` payload packets still clears `MAYBE_QUIC_MIN_FRACTION`). The generated
+//! `L4Terminated` dispatch does not chain these as `else if` -- a custom filter predicate is
+//! never mutually exclusive with a protocol predicate (`Predicate::is_excl`,
+//! `core/src/filter/ast.rs`) -- so both `record_enc_bytes` and `record_maybe_quic_bytes` would
+//! otherwise fire for the same connection. `enc_totals` is the single source of truth for
+//! "a real parser already claimed this connection"; both `record_maybe_quic_bytes` and
+//! `record_maybe_zoom_bytes` skip a connection it recognizes, so every connection lands in at
+//! most one of the seven protocol rows.
+//!
+//! `MaybeQuic` and `MaybeZoom` need no such guard against each other: their first-byte tests
+//! are disjoint (`ZOOM_FIRST_BYTES` all have their top two bits `00`; a QUIC short header
+//! requires `01`), and their accept thresholds sum to more than one
+//! (`MAYBE_QUIC_MIN_FRACTION` + `MAYBE_ZOOM_MIN_FRACTION` = 0.9 + 0.95 > 1.0), so no packet
+//! sequence can clear both within the same window.
+//!
 //! ## `--min-bytes`
-//! Passing `--min-bytes N` excludes any connection whose own total byte count (handshake +
-//! payload for `EncBytes`, tcp + udp for `TransportBytes`) is not more than `N` --
+//! Passing `--min-bytes N` excludes any connection whose own total L4 payload byte count (see
+//! "Byte unit" above; handshake + payload for `EncBytes`, tcp + udp for `TransportBytes`) is
+//! not more than `N` --
 //! its packets never reach any global counter at all, rather than being counted and then
 //! subtracted out. The check happens once per connection, in each callback's own
 //! `L4Terminated` handler, using that connection's own running total; the two callbacks never
@@ -87,8 +120,9 @@ struct Args {
     )]
     config: PathBuf,
 
-    /// Only count a connection (and the packets in it) if its total byte count is more than N.
-    /// 0 (the default) counts every connection.
+    /// Only count a connection (and the packets in it) if its total L4 payload byte count
+    /// (see module docs -- headers and pure ACKs are excluded) is more than N. 0 (the default)
+    /// counts every connection.
     #[clap(short, long, value_name = "N", default_value_t = 0)]
     min_bytes: usize,
 }
@@ -214,17 +248,59 @@ impl Tracked for EncBytes {
     }
 }
 
+/// The `ByteTotals` bucket a connection identified as `proto` by a real L7 parser lands in, or
+/// `None` if no such parser claimed it (`SessionProto::Null`/`Probing`, or another protocol
+/// this app doesn't track). This is the single source of truth for "a real parser already
+/// claimed this connection" -- both `record_maybe_quic_bytes` and `record_maybe_zoom_bytes`
+/// call it to skip connections it recognizes. See "`MaybeQuic`/`MaybeZoom` bytes" above.
+fn enc_totals(proto: &SessionProto) -> Option<&'static ByteTotals> {
+    match proto {
+        SessionProto::Tls => Some(&*TLS_BYTES),
+        SessionProto::Ssh => Some(&*SSH_BYTES),
+        SessionProto::Quic => Some(&*QUIC_BYTES),
+        SessionProto::Wireguard => Some(&*WIREGUARD_BYTES),
+        SessionProto::Ike => Some(&*IKE_BYTES),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod enc_totals_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_every_tracked_protocol() {
+        for proto in [
+            SessionProto::Tls,
+            SessionProto::Ssh,
+            SessionProto::Quic,
+            SessionProto::Wireguard,
+            SessionProto::Ike,
+        ] {
+            assert!(
+                enc_totals(&proto).is_some(),
+                "enc_totals should recognize {proto:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_undiscovered_and_unhandled_protocols() {
+        for proto in [SessionProto::Null, SessionProto::Probing, SessionProto::Dns] {
+            assert!(
+                enc_totals(&proto).is_none(),
+                "enc_totals should not recognize {proto:?}"
+            );
+        }
+    }
+}
+
 /// The filter's OR predicate registers all five parsers; `SessionProto`, read once the
 /// connection is torn down, says which one actually matched.
 #[callback("tls or ssh or quic or wireguard or ike,level=L4Terminated")]
 fn record_enc_bytes(bytes: &EncBytes, proto: &SessionProto) {
-    let totals = match proto {
-        SessionProto::Tls => &*TLS_BYTES,
-        SessionProto::Ssh => &*SSH_BYTES,
-        SessionProto::Quic => &*QUIC_BYTES,
-        SessionProto::Wireguard => &*WIREGUARD_BYTES,
-        SessionProto::Ike => &*IKE_BYTES,
-        _ => return,
+    let Some(totals) = enc_totals(proto) else {
+        return;
     };
     // Below the bar: none of this connection's bytes are added, not even to a "dropped"
     // bucket -- excluded connections are invisible to every printed total.
@@ -285,8 +361,14 @@ fn record_transport_bytes(bytes: &TransportBytes) {
 
 /// `MaybeQuic`/`MaybeZoom` are heuristic filters, not real L7 parsers, so there's no handshake
 /// to split out -- the whole connection's bytes count as payload. See the module docs.
+///
+/// `proto` is checked first: a connection a real parser already claimed (see `enc_totals`) is
+/// skipped here, so it isn't double-counted in both its protocol's row and this one.
 #[callback("MaybeQuic,level=L4Terminated")]
-fn record_maybe_quic_bytes(bytes: &ByteCount) {
+fn record_maybe_quic_bytes(bytes: &ByteCount, proto: &SessionProto) {
+    if enc_totals(proto).is_some() {
+        return;
+    }
     let total = bytes.total();
     if !clears_min_bytes(total, MIN_BYTES.load(Ordering::Relaxed)) {
         return;
@@ -295,7 +377,10 @@ fn record_maybe_quic_bytes(bytes: &ByteCount) {
 }
 
 #[callback("MaybeZoom,level=L4Terminated")]
-fn record_maybe_zoom_bytes(bytes: &ByteCount) {
+fn record_maybe_zoom_bytes(bytes: &ByteCount, proto: &SessionProto) {
+    if enc_totals(proto).is_some() {
+        return;
+    }
     let total = bytes.total();
     if !clears_min_bytes(total, MIN_BYTES.load(Ordering::Relaxed)) {
         return;
@@ -356,9 +441,15 @@ fn main() {
     let udp_bytes = UDP_BYTES.load(Ordering::Relaxed);
     let transport_total = tcp_bytes + udp_bytes;
 
+    println!(
+        "\n(Byte counts below are L4 payload bytes -- Ethernet/IP/TCP/UDP headers and pure \
+         ACKs excluded. Not the same unit as this runtime's own \"Processed: N pkts, M bytes\" \
+         line above, which counts full wire bytes; see the module docs.)"
+    );
     if args.min_bytes > 0 {
         println!(
-            "\n(Connections with {} or fewer total bytes are excluded from every count below.)",
+            "\n(Connections with {} or fewer total L4 payload bytes are excluded from every \
+             count below.)",
             args.min_bytes
         );
     }
