@@ -1,8 +1,8 @@
 //! Counts bytes across all of Iris's encrypted stream protocols (TLS, SSH, QUIC,
 //! WireGuard, IKE), split into cleartext handshake bytes vs. encrypted payload bytes, plus
-//! heuristically-detected mid-stream QUIC and Zoom media traffic (`MaybeQuic`/`MaybeZoom`,
-//! counted entirely as payload -- see "`MaybeQuic`/`MaybeZoom` bytes" below), plus total TCP
-//! and UDP traffic.
+//! heuristically-detected mid-stream QUIC and Zoom media traffic and iperf3 traffic
+//! (`MaybeQuic`/`MaybeZoom`/`MaybeIperf3`, counted entirely as payload -- see
+//! "`MaybeQuic`/`MaybeZoom`/`MaybeIperf3` bytes" below), plus total TCP and UDP traffic.
 //!
 //! ## Handshake vs. payload split
 //! This deliberately does NOT use `L4Pdu::app_body_offset()`/`pdu.ctxt.app_offset`, despite
@@ -43,11 +43,16 @@
 //! byte. The numbers therefore mean "all bytes of a connection that turned out to be TLS",
 //! not "bytes observed after we knew it was TLS".
 //!
-//! ## `MaybeQuic`/`MaybeZoom` bytes
-//! `MaybeQuic` and `MaybeZoom` (`datatypes/src/maybe_quic.rs`, `datatypes/src/maybe_zoom.rs`)
-//! are heuristic streaming filters, not real L7 parsers -- they never fire `L7EndHdrs`, so
-//! there's no handshake/payload boundary to detect for them. Every byte on a connection they
-//! accept is counted as payload; `handshake` stays 0 for `MAYBE_QUIC_BYTES`/`MAYBE_ZOOM_BYTES`.
+//! ## `MaybeQuic`/`MaybeZoom`/`MaybeIperf3` bytes
+//! `MaybeQuic`, `MaybeZoom`, and `MaybeIperf3` (`datatypes/src/maybe_quic.rs`,
+//! `datatypes/src/maybe_zoom.rs`, `datatypes/src/maybe_iperf3.rs`) are heuristic streaming
+//! filters, not real L7 parsers -- they never fire `L7EndHdrs`, so there's no handshake/payload
+//! boundary to detect for them. Every byte on a connection they accept is counted as payload;
+//! `handshake` stays 0 for `MAYBE_QUIC_BYTES`/`MAYBE_ZOOM_BYTES`/`MAYBE_IPERF3_BYTES`.
+//! `MaybeIperf3` itself covers both a real fingerprint (its UDP path) and a much weaker,
+//! best-effort heuristic (its TCP path) -- see that filter's own module docs; both paths land
+//! in the same `MAYBE_IPERF3_BYTES` total here since a connection is only ever judged by one
+//! of the two.
 //!
 //! ## `--min-bytes`
 //! Passing `--min-bytes N` excludes any connection whose own total byte count (handshake +
@@ -144,6 +149,7 @@ lazy_static! {
     static ref IKE_BYTES: ByteTotals = ByteTotals::new();
     static ref MAYBE_QUIC_BYTES: ByteTotals = ByteTotals::new();
     static ref MAYBE_ZOOM_BYTES: ByteTotals = ByteTotals::new();
+    static ref MAYBE_IPERF3_BYTES: ByteTotals = ByteTotals::new();
     static ref TCP_BYTES: AtomicUsize = AtomicUsize::new(0);
     static ref UDP_BYTES: AtomicUsize = AtomicUsize::new(0);
 }
@@ -297,6 +303,15 @@ fn record_maybe_zoom_bytes(bytes: &ByteCount) {
     MAYBE_ZOOM_BYTES.add(0, total);
 }
 
+#[callback("MaybeIperf3,level=L4Terminated")]
+fn record_maybe_iperf3_bytes(bytes: &ByteCount) {
+    let total = bytes.total();
+    if !clears_min_bytes(total, MIN_BYTES.load(Ordering::Relaxed)) {
+        return;
+    }
+    MAYBE_IPERF3_BYTES.add(0, total);
+}
+
 /// Returns `100 * numerator / denominator` as a percentage, or `None` if `denominator` is
 /// zero (e.g. a protocol that was never observed in this trace).
 fn pct(numerator: usize, denominator: usize) -> Option<f64> {
@@ -355,6 +370,7 @@ fn main() {
     print_proto("IKE", &IKE_BYTES, transport_total);
     print_proto("MaybeQUIC", &MAYBE_QUIC_BYTES, transport_total);
     print_proto("MaybeZoom", &MAYBE_ZOOM_BYTES, transport_total);
+    print_proto("MaybeIperf3", &MAYBE_IPERF3_BYTES, transport_total);
 
     println!("\n=== Total transport-layer traffic ===");
     println!("TCP: {}", fmt_pct(pct(tcp_bytes, transport_total)));
