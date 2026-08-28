@@ -56,8 +56,9 @@
 //!
 //! ## `--min-bytes`
 //! As in `encrypted_bytes`: passing `--min-bytes N` excludes any connection whose own total
-//! byte count is not more than `N` from every counter and every slice -- checked once per
-//! connection, at `L4Terminated`, using that connection's own running total. Default is 0.
+//! L4 payload byte count (see "Byte unit" below) is not more than `N` from every counter and
+//! every slice -- checked once per connection, at `L4Terminated`, using that connection's own
+//! running total. Default is 0.
 //!
 //! ## Column overlap
 //! As in `encrypted_bytes`: a TLS connection's bytes land in both the `tls_*` columns and
@@ -75,6 +76,17 @@
 //! connection it recognizes, so every connection lands in at most one protocol/maybe_* column.
 //! `MaybeQuic` and `MaybeZoom` need no such guard against each other -- see `encrypted_bytes`'s
 //! module docs for why their heuristics are structurally disjoint.
+//!
+//! ## Byte unit: L4 payload, not wire bytes
+//! As in `encrypted_bytes`: every column here -- the stdout table, the CSV, and the summary
+//! percentages below -- comes from `L4Pdu::length()` (`pdu.ctxt.length`), the TCP/UDP payload
+//! size once `core/src/conntrack/pdu.rs` strips the Ethernet/IP/TCP/UDP headers; pure ACKs and
+//! other header-only segments contribute 0. This is NOT the same unit as the runtime's own
+//! `Processed: N pkts, M bytes` startup banner (`core/src/runtime/offline.rs`), which counts
+//! full wire bytes (`mbuf.data_len()`) -- on `traces/small_flows.pcap` that banner reports
+//! 9,216,531 bytes against this app's own TCP+UDP total of 8,367,195 for the same trace. Don't
+//! divide one by the other, and don't compare the `tcp_bytes`/`udp_bytes` CSV columns against a
+//! packet-capture tool's byte counts without accounting for the gap.
 //!
 //! ## Timestamps are processing time, not capture time
 //! As in `concurrent_conns`: `L4Pdu::ts` comes from `Instant::now()` when a packet is
@@ -120,8 +132,9 @@ struct Args {
     #[clap(long, value_name = "SECS", default_value_t = 48 * 3600)]
     max_duration_secs: u64,
 
-    /// Only count a connection (and the packets in it) if its total byte count is more than N.
-    /// 0 (the default) counts every connection.
+    /// Only count a connection (and the packets in it) if its total L4 payload byte count
+    /// (see module docs -- headers and pure ACKs are excluded) is more than N. 0 (the default)
+    /// counts every connection.
     #[clap(short, long, value_name = "N", default_value_t = 0)]
     min_bytes: usize,
 
@@ -133,7 +146,8 @@ struct Args {
     max_conn_slices: usize,
 
     /// Path to also write the per-slice byte counts as CSV, one row per slice, columns
-    /// `slice_start_s,<proto>_handshake,<proto>_payload,...,tcp_bytes,udp_bytes`.
+    /// `slice_start_s,<proto>_handshake,<proto>_payload,...,tcp_bytes,udp_bytes`. All byte
+    /// columns are L4 payload bytes -- see "Byte unit" in the module docs.
     #[clap(
         short,
         long,
@@ -879,6 +893,11 @@ fn main() {
         .collect();
     let last = last_nonzero_slice(&all_totals, &transport_totals);
 
+    println!(
+        "(Byte counts below and in the CSV are L4 payload bytes -- Ethernet/IP/TCP/UDP headers \
+         and pure ACKs excluded. Not the same unit as this runtime's own \"Processed: N pkts, \
+         M bytes\" line above, which counts full wire bytes; see the module docs.)"
+    );
     println!("=== Bytes per {}ms slice, by protocol ===", args.slice_ms);
     if let Some(last) = last {
         // Indexes in lockstep across `all_totals` (already zipped with `PROTO_NAMES`) and both
@@ -918,7 +937,8 @@ fn main() {
 
     if args.min_bytes > 0 {
         println!(
-            "\n(Connections with {} or fewer total bytes are excluded from every count below.)",
+            "\n(Connections with {} or fewer total L4 payload bytes are excluded from every \
+             count below.)",
             args.min_bytes
         );
     }

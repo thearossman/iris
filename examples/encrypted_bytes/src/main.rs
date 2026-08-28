@@ -4,6 +4,21 @@
 //! counted entirely as payload -- see "`MaybeQuic`/`MaybeZoom` bytes" below), plus total TCP
 //! and UDP traffic.
 //!
+//! ## Byte unit: L4 payload, not wire bytes
+//! Every count in this app comes from `L4Pdu::length()` (`pdu.ctxt.length`), the TCP/UDP
+//! payload size once `core/src/conntrack/pdu.rs` strips the Ethernet/IP/TCP/UDP headers.
+//! Header-only segments -- pure ACKs, empty UDP encapsulations -- have a `length()` of 0.
+//! `EncBytes`, `TransportBytes`, and the built-in `ByteCount` behind `MaybeQuic`/`MaybeZoom`
+//! all read this same `pdu.length()`, so every ratio this app prints is apples-to-apples with
+//! every other ratio it prints.
+//!
+//! It is NOT the same unit as the runtime's own startup banner, `Processed: N pkts, M bytes`
+//! (`core/src/runtime/offline.rs`), which sums `mbuf.data_len()` -- the full captured frame,
+//! headers included. On `traces/small_flows.pcap` that banner reports 9,216,531 bytes; this
+//! app's own TCP+UDP total for the same trace is 8,367,195. The ~850KB gap is header and
+//! pure-ACK overhead this app deliberately excludes, not traffic it failed to see -- don't
+//! divide one number by the other.
+//!
 //! ## Handshake vs. payload split
 //! This deliberately does NOT use `L4Pdu::app_body_offset()`/`pdu.ctxt.app_offset`, despite
 //! that looking like the obvious per-packet signal. It isn't reliable for this purpose:
@@ -67,8 +82,9 @@
 //! sequence can clear both within the same window.
 //!
 //! ## `--min-bytes`
-//! Passing `--min-bytes N` excludes any connection whose own total byte count (handshake +
-//! payload for `EncBytes`, tcp + udp for `TransportBytes`) is not more than `N` --
+//! Passing `--min-bytes N` excludes any connection whose own total L4 payload byte count (see
+//! "Byte unit" above; handshake + payload for `EncBytes`, tcp + udp for `TransportBytes`) is
+//! not more than `N` --
 //! its packets never reach any global counter at all, rather than being counted and then
 //! subtracted out. The check happens once per connection, in each callback's own
 //! `L4Terminated` handler, using that connection's own running total; the two callbacks never
@@ -99,8 +115,9 @@ struct Args {
     )]
     config: PathBuf,
 
-    /// Only count a connection (and the packets in it) if its total byte count is more than N.
-    /// 0 (the default) counts every connection.
+    /// Only count a connection (and the packets in it) if its total L4 payload byte count
+    /// (see module docs -- headers and pure ACKs are excluded) is more than N. 0 (the default)
+    /// counts every connection.
     #[clap(short, long, value_name = "N", default_value_t = 0)]
     min_bytes: usize,
 }
@@ -409,9 +426,15 @@ fn main() {
     let udp_bytes = UDP_BYTES.load(Ordering::Relaxed);
     let transport_total = tcp_bytes + udp_bytes;
 
+    println!(
+        "\n(Byte counts below are L4 payload bytes -- Ethernet/IP/TCP/UDP headers and pure \
+         ACKs excluded. Not the same unit as this runtime's own \"Processed: N pkts, M bytes\" \
+         line above, which counts full wire bytes; see the module docs.)"
+    );
     if args.min_bytes > 0 {
         println!(
-            "\n(Connections with {} or fewer total bytes are excluded from every count below.)",
+            "\n(Connections with {} or fewer total L4 payload bytes are excluded from every \
+             count below.)",
             args.min_bytes
         );
     }
