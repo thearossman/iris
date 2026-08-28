@@ -1,6 +1,7 @@
 //! Counts bytes across all of Iris's encrypted stream protocols (TLS, SSH, QUIC,
 //! WireGuard, IKE), split into cleartext handshake bytes vs. encrypted payload bytes, plus
-//! heuristically-detected mid-stream QUIC and Zoom media traffic and iperf3 traffic
+//! CAPWAP (see "CAPWAP bytes" below, on why it's here despite not being an encrypted
+//! protocol itself), plus heuristically-detected mid-stream QUIC, Zoom, and iperf3 traffic
 //! (`MaybeQuic`/`MaybeZoom`/`MaybeIperf3`, counted entirely as payload -- see
 //! "`MaybeQuic`/`MaybeZoom`/`MaybeIperf3` bytes" below), plus total TCP and UDP traffic.
 //!
@@ -26,7 +27,7 @@
 //! (`core/src/conntrack/conn/conn_layers.rs`), and `process_stream` is only invoked while
 //! the L7 layer's `Actions::Parse` bit is set. That bit is cleared as soon as headers
 //! finish for any parser reporting `ParsingState::Stop` -- which is TLS, SSH, WireGuard,
-//! and IKE (only QUIC reports `Parsing`). So for four of the five protocols here,
+//! IKE, and CAPWAP (only QUIC reports `Parsing`). So for five of the six protocols here,
 //! `app_offset` is never touched again after the handshake packet and just sits at its
 //! per-packet default of `None` on every later packet, even ones deep in the encrypted
 //! payload -- indistinguishable from "still in the handshake". (There's a second wrinkle
@@ -58,6 +59,15 @@
 //! byte. The numbers therefore mean "all bytes of a connection that turned out to be TLS",
 //! not "bytes observed after we knew it was TLS".
 //!
+//! ## CAPWAP bytes
+//! CAPWAP (`core/src/protocols/stream/capwap`) is included alongside the other four
+//! protocols in this list even though it isn't itself an encryption protocol: its control
+//! and data channels are cleartext by default, and are only DTLS-encrypted (detected, not
+//! decrypted -- see the parser's module docs) when the preamble says so. It's counted here
+//! because it has the same shape as TLS/SSH/WireGuard/IKE for this app's purposes -- a
+//! single-fixed-header parser reporting `ParsingState::Stop` -- so `CAPWAP_BYTES`'
+//! `payload` bucket means "bytes after the CAPWAP header", not "encrypted bytes".
+//!
 //! ## `MaybeQuic`/`MaybeZoom`/`MaybeIperf3` bytes
 //! `MaybeQuic`, `MaybeZoom`, and `MaybeIperf3` (`datatypes/src/maybe_quic.rs`,
 //! `datatypes/src/maybe_zoom.rs`, `datatypes/src/maybe_iperf3.rs`) are heuristic streaming
@@ -76,9 +86,11 @@
 //! never mutually exclusive with a protocol predicate (`Predicate::is_excl`,
 //! `core/src/filter/ast.rs`) -- so both `record_enc_bytes` and `record_maybe_quic_bytes` would
 //! otherwise fire for the same connection. `enc_totals` is the single source of truth for
-//! "a real parser already claimed this connection"; both `record_maybe_quic_bytes` and
-//! `record_maybe_zoom_bytes` skip a connection it recognizes, so every connection lands in at
-//! most one of the seven protocol rows.
+//! "a real parser already claimed this connection" -- CAPWAP included; both
+//! `record_maybe_quic_bytes` and `record_maybe_zoom_bytes` skip a connection it recognizes, so
+//! every connection lands in at most one of the eight protocol rows (the six real-parser rows
+//! plus `MaybeQuic`/`MaybeZoom`). `MaybeIperf3` has no such guard, so it's the one row that can
+//! still double-count against any of the others.
 //!
 //! `MaybeQuic` and `MaybeZoom` need no such guard against each other: their first-byte tests
 //! are disjoint (`ZOOM_FIRST_BYTES` all have their top two bits `00`; a QUIC short header
@@ -181,6 +193,7 @@ lazy_static! {
     static ref QUIC_BYTES: ByteTotals = ByteTotals::new();
     static ref WIREGUARD_BYTES: ByteTotals = ByteTotals::new();
     static ref IKE_BYTES: ByteTotals = ByteTotals::new();
+    static ref CAPWAP_BYTES: ByteTotals = ByteTotals::new();
     static ref MAYBE_QUIC_BYTES: ByteTotals = ByteTotals::new();
     static ref MAYBE_ZOOM_BYTES: ByteTotals = ByteTotals::new();
     static ref MAYBE_IPERF3_BYTES: ByteTotals = ByteTotals::new();
@@ -193,7 +206,7 @@ lazy_static! {
 /// This is a `Tracked` datatype, not accumulation inside the callback, and that distinction
 /// is load-bearing -- see "Why a datatype and not a callback" in the module docs. It reacts
 /// only to generic `L4Pdu`/state-transition events, so it never needs to know which of the
-/// five protocols it is looking at; `record_enc_bytes` reads `SessionProto` at teardown to
+/// six protocols it is looking at; `record_enc_bytes` reads `SessionProto` at teardown to
 /// decide which bucket the result lands in.
 #[datatype]
 struct EncBytes {
@@ -252,7 +265,8 @@ impl Tracked for EncBytes {
 /// `None` if no such parser claimed it (`SessionProto::Null`/`Probing`, or another protocol
 /// this app doesn't track). This is the single source of truth for "a real parser already
 /// claimed this connection" -- both `record_maybe_quic_bytes` and `record_maybe_zoom_bytes`
-/// call it to skip connections it recognizes. See "`MaybeQuic`/`MaybeZoom` bytes" above.
+/// call it to skip connections it recognizes. See "`MaybeQuic`/`MaybeZoom`/`MaybeIperf3` bytes"
+/// above.
 fn enc_totals(proto: &SessionProto) -> Option<&'static ByteTotals> {
     match proto {
         SessionProto::Tls => Some(&*TLS_BYTES),
@@ -260,6 +274,7 @@ fn enc_totals(proto: &SessionProto) -> Option<&'static ByteTotals> {
         SessionProto::Quic => Some(&*QUIC_BYTES),
         SessionProto::Wireguard => Some(&*WIREGUARD_BYTES),
         SessionProto::Ike => Some(&*IKE_BYTES),
+        SessionProto::Capwap => Some(&*CAPWAP_BYTES),
         _ => None,
     }
 }
@@ -276,6 +291,7 @@ mod enc_totals_tests {
             SessionProto::Quic,
             SessionProto::Wireguard,
             SessionProto::Ike,
+            SessionProto::Capwap,
         ] {
             assert!(
                 enc_totals(&proto).is_some(),
@@ -295,9 +311,9 @@ mod enc_totals_tests {
     }
 }
 
-/// The filter's OR predicate registers all five parsers; `SessionProto`, read once the
+/// The filter's OR predicate registers all six parsers; `SessionProto`, read once the
 /// connection is torn down, says which one actually matched.
-#[callback("tls or ssh or quic or wireguard or ike,level=L4Terminated")]
+#[callback("tls or ssh or quic or wireguard or ike or capwap,level=L4Terminated")]
 fn record_enc_bytes(bytes: &EncBytes, proto: &SessionProto) {
     let Some(totals) = enc_totals(proto) else {
         return;
@@ -459,6 +475,7 @@ fn main() {
     print_proto("QUIC", &QUIC_BYTES, transport_total);
     print_proto("WireGuard", &WIREGUARD_BYTES, transport_total);
     print_proto("IKE", &IKE_BYTES, transport_total);
+    print_proto("CAPWAP", &CAPWAP_BYTES, transport_total);
     print_proto("MaybeQUIC", &MAYBE_QUIC_BYTES, transport_total);
     print_proto("MaybeZoom", &MAYBE_ZOOM_BYTES, transport_total);
     print_proto("MaybeIperf3", &MAYBE_IPERF3_BYTES, transport_total);

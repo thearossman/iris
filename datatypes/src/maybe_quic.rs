@@ -289,7 +289,8 @@ impl MaybeQuic {
             | SessionProto::Quic
             | SessionProto::Ssh
             | SessionProto::Wireguard
-            | SessionProto::Ike => FilterResult::Drop,
+            | SessionProto::Ike
+            | SessionProto::Capwap => FilterResult::Drop,
             // Nothing has claimed it: `Probing` while discovery is still
             // running, `Null` once every registered parser has declined.
             SessionProto::Null | SessionProto::Probing => FilterResult::Continue,
