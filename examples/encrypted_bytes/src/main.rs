@@ -1,9 +1,10 @@
 //! Counts bytes across all of Iris's encrypted stream protocols (TLS, SSH, QUIC,
-//! WireGuard, IKE), split into cleartext handshake bytes vs. encrypted payload bytes, plus
-//! CAPWAP (see "CAPWAP bytes" below, on why it's here despite not being an encrypted
-//! protocol itself), plus heuristically-detected mid-stream QUIC, Zoom, and iperf3 traffic
-//! (`MaybeQuic`/`MaybeZoom`/`MaybeIperf3`, counted entirely as payload -- see
-//! "`MaybeQuic`/`MaybeZoom`/`MaybeIperf3` bytes" below), plus total TCP and UDP traffic.
+//! WireGuard, IKE, and DTLS-encapsulated CAPWAP -- see "CAPWAP bytes" below, on why only the
+//! DTLS-encapsulated half of CAPWAP counts as "encrypted" here), split into cleartext
+//! handshake bytes vs. encrypted payload bytes, plus heuristically-detected mid-stream QUIC,
+//! Zoom, and iperf3 traffic (`MaybeQuic`/`MaybeZoom`/`MaybeIperf3`, counted entirely as
+//! payload -- see "`MaybeQuic`/`MaybeZoom`/`MaybeIperf3` bytes" below), plus total TCP and UDP
+//! traffic.
 //!
 //! ## Byte unit: L4 payload, not wire bytes
 //! Every count in this app comes from `L4Pdu::length()` (`pdu.ctxt.length`), the TCP/UDP
@@ -61,12 +62,23 @@
 //!
 //! ## CAPWAP bytes
 //! CAPWAP (`core/src/protocols/stream/capwap`) is included alongside the other four
-//! protocols in this list even though it isn't itself an encryption protocol: its control
-//! and data channels are cleartext by default, and are only DTLS-encrypted (detected, not
-//! decrypted -- see the parser's module docs) when the preamble says so. It's counted here
-//! because it has the same shape as TLS/SSH/WireGuard/IKE for this app's purposes -- a
-//! single-fixed-header parser reporting `ParsingState::Stop` -- so `CAPWAP_BYTES`'
-//! `payload` bucket means "bytes after the CAPWAP header", not "encrypted bytes".
+//! protocols in this list, but only its DTLS-encapsulated traffic: the CAPWAP term in
+//! `record_enc_bytes`'s filter is `capwap.preamble_type = 1`, not bare `capwap`, so a
+//! connection is counted here only if its preamble declared DTLS ([`Capwap::is_dtls`],
+//! detected structurally by checking that what follows the header looks like a DTLS record --
+//! never decrypted or handshake-verified; see the parser's module docs). `is_dtls()` itself
+//! is a `bool` and can't be used directly as a filter predicate (the DSL's `Value` enum has no
+//! boolean variant); `preamble_type = 1` is `is_dtls()` spelled the way the filter can express
+//! it.
+//!
+//! Plaintext CAPWAP -- the common case, since both its channels are cleartext by default --
+//! is deliberately excluded: unlike DTLS CAPWAP, it isn't encrypted, so counting it here would
+//! misrepresent `CAPWAP_BYTES`'s `payload` bucket as "encrypted bytes" when it wasn't.
+//! Excluded connections aren't lost, just not broken out into their own row: their bytes still
+//! land in the unconditional `tcp`/`udp` transport totals (`record_transport_bytes`) below.
+//! CAPWAP is grouped with TLS/SSH/WireGuard/IKE here (rather than off on its own) because,
+//! DTLS-encapsulated or not, it has the same shape for this app's purposes -- a
+//! single-fixed-header parser reporting `ParsingState::Stop`.
 //!
 //! ## `MaybeQuic`/`MaybeZoom`/`MaybeIperf3` bytes
 //! `MaybeQuic`, `MaybeZoom`, and `MaybeIperf3` (`datatypes/src/maybe_quic.rs`,
@@ -313,7 +325,13 @@ mod enc_totals_tests {
 
 /// The filter's OR predicate registers all six parsers; `SessionProto`, read once the
 /// connection is torn down, says which one actually matched.
-#[callback("tls or ssh or quic or wireguard or ike or capwap,level=L4Terminated")]
+///
+/// The CAPWAP term is `capwap.preamble_type = 1`, not bare `capwap`, so that only
+/// DTLS-encapsulated CAPWAP connections are counted here -- see "CAPWAP bytes" in the module
+/// docs. `preamble_type = 1` is `is_dtls()` spelled as a filter predicate: `is_dtls()` itself
+/// returns `bool`, which the filter DSL can't compare against a literal (see
+/// `core/src/filter/ast.rs`'s `Value` enum), but the `u8` it's derived from can.
+#[callback("tls or ssh or quic or wireguard or ike or capwap.preamble_type = 1,level=L4Terminated")]
 fn record_enc_bytes(bytes: &EncBytes, proto: &SessionProto) {
     let Some(totals) = enc_totals(proto) else {
         return;
