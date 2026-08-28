@@ -49,6 +49,23 @@
 //! there's no handshake/payload boundary to detect for them. Every byte on a connection they
 //! accept is counted as payload; `handshake` stays 0 for `MAYBE_QUIC_BYTES`/`MAYBE_ZOOM_BYTES`.
 //!
+//! Neither filter consults the real parsers' results, so a connection the `quic` parser
+//! identifies can also satisfy `MaybeQuic` (e.g. one stray long-header packet among its first
+//! `MAYBE_QUIC_WINDOW` payload packets still clears `MAYBE_QUIC_MIN_FRACTION`). The generated
+//! `L4Terminated` dispatch does not chain these as `else if` -- a custom filter predicate is
+//! never mutually exclusive with a protocol predicate (`Predicate::is_excl`,
+//! `core/src/filter/ast.rs`) -- so both `record_enc_bytes` and `record_maybe_quic_bytes` would
+//! otherwise fire for the same connection. `enc_totals` is the single source of truth for
+//! "a real parser already claimed this connection"; both `record_maybe_quic_bytes` and
+//! `record_maybe_zoom_bytes` skip a connection it recognizes, so every connection lands in at
+//! most one of the seven protocol rows.
+//!
+//! `MaybeQuic` and `MaybeZoom` need no such guard against each other: their first-byte tests
+//! are disjoint (`ZOOM_FIRST_BYTES` all have their top two bits `00`; a QUIC short header
+//! requires `01`), and their accept thresholds sum to more than one
+//! (`MAYBE_QUIC_MIN_FRACTION` + `MAYBE_ZOOM_MIN_FRACTION` = 0.9 + 0.95 > 1.0), so no packet
+//! sequence can clear both within the same window.
+//!
 //! ## `--min-bytes`
 //! Passing `--min-bytes N` excludes any connection whose own total byte count (handshake +
 //! payload for `EncBytes`, tcp + udp for `TransportBytes`) is not more than `N` --
@@ -208,17 +225,59 @@ impl Tracked for EncBytes {
     }
 }
 
+/// The `ByteTotals` bucket a connection identified as `proto` by a real L7 parser lands in, or
+/// `None` if no such parser claimed it (`SessionProto::Null`/`Probing`, or another protocol
+/// this app doesn't track). This is the single source of truth for "a real parser already
+/// claimed this connection" -- both `record_maybe_quic_bytes` and `record_maybe_zoom_bytes`
+/// call it to skip connections it recognizes. See "`MaybeQuic`/`MaybeZoom` bytes" above.
+fn enc_totals(proto: &SessionProto) -> Option<&'static ByteTotals> {
+    match proto {
+        SessionProto::Tls => Some(&*TLS_BYTES),
+        SessionProto::Ssh => Some(&*SSH_BYTES),
+        SessionProto::Quic => Some(&*QUIC_BYTES),
+        SessionProto::Wireguard => Some(&*WIREGUARD_BYTES),
+        SessionProto::Ike => Some(&*IKE_BYTES),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod enc_totals_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_every_tracked_protocol() {
+        for proto in [
+            SessionProto::Tls,
+            SessionProto::Ssh,
+            SessionProto::Quic,
+            SessionProto::Wireguard,
+            SessionProto::Ike,
+        ] {
+            assert!(
+                enc_totals(&proto).is_some(),
+                "enc_totals should recognize {proto:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_undiscovered_and_unhandled_protocols() {
+        for proto in [SessionProto::Null, SessionProto::Probing, SessionProto::Dns] {
+            assert!(
+                enc_totals(&proto).is_none(),
+                "enc_totals should not recognize {proto:?}"
+            );
+        }
+    }
+}
+
 /// The filter's OR predicate registers all five parsers; `SessionProto`, read once the
 /// connection is torn down, says which one actually matched.
 #[callback("tls or ssh or quic or wireguard or ike,level=L4Terminated")]
 fn record_enc_bytes(bytes: &EncBytes, proto: &SessionProto) {
-    let totals = match proto {
-        SessionProto::Tls => &*TLS_BYTES,
-        SessionProto::Ssh => &*SSH_BYTES,
-        SessionProto::Quic => &*QUIC_BYTES,
-        SessionProto::Wireguard => &*WIREGUARD_BYTES,
-        SessionProto::Ike => &*IKE_BYTES,
-        _ => return,
+    let Some(totals) = enc_totals(proto) else {
+        return;
     };
     // Below the bar: none of this connection's bytes are added, not even to a "dropped"
     // bucket -- excluded connections are invisible to every printed total.
@@ -279,8 +338,14 @@ fn record_transport_bytes(bytes: &TransportBytes) {
 
 /// `MaybeQuic`/`MaybeZoom` are heuristic filters, not real L7 parsers, so there's no handshake
 /// to split out -- the whole connection's bytes count as payload. See the module docs.
+///
+/// `proto` is checked first: a connection a real parser already claimed (see `enc_totals`) is
+/// skipped here, so it isn't double-counted in both its protocol's row and this one.
 #[callback("MaybeQuic,level=L4Terminated")]
-fn record_maybe_quic_bytes(bytes: &ByteCount) {
+fn record_maybe_quic_bytes(bytes: &ByteCount, proto: &SessionProto) {
+    if enc_totals(proto).is_some() {
+        return;
+    }
     let total = bytes.total();
     if !clears_min_bytes(total, MIN_BYTES.load(Ordering::Relaxed)) {
         return;
@@ -289,7 +354,10 @@ fn record_maybe_quic_bytes(bytes: &ByteCount) {
 }
 
 #[callback("MaybeZoom,level=L4Terminated")]
-fn record_maybe_zoom_bytes(bytes: &ByteCount) {
+fn record_maybe_zoom_bytes(bytes: &ByteCount, proto: &SessionProto) {
+    if enc_totals(proto).is_some() {
+        return;
+    }
     let total = bytes.total();
     if !clears_min_bytes(total, MIN_BYTES.load(Ordering::Relaxed)) {
         return;

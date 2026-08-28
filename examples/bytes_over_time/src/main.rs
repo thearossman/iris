@@ -64,6 +64,18 @@
 //! `tcp_bytes` (via a *separate* `TransportBytes`-style datatype tracking the same packets).
 //! The protocol columns and the transport columns are not meant to be summed together.
 //!
+//! The `maybe_quic_*`/`maybe_zoom_*` columns, however, *are* disjoint from the five real
+//! protocol columns: `MaybeQuic`/`MaybeZoom` never consult the real parsers' results, so a
+//! connection the `quic` parser identifies can also satisfy `MaybeQuic`, and the generated
+//! `L4Terminated` dispatch does not chain a custom filter predicate against a protocol
+//! predicate as mutually exclusive (`Predicate::is_excl`, `core/src/filter/ast.rs`) -- both
+//! `record_enc_series` and `record_maybe_quic_series` would otherwise fire for the same
+//! connection. `proto_index` is the single source of truth for "a real parser already claimed
+//! this connection"; both `record_maybe_quic_series` and `record_maybe_zoom_series` skip a
+//! connection it recognizes, so every connection lands in at most one protocol/maybe_* column.
+//! `MaybeQuic` and `MaybeZoom` need no such guard against each other -- see `encrypted_bytes`'s
+//! module docs for why their heuristics are structurally disjoint.
+//!
 //! ## Timestamps are processing time, not capture time
 //! As in `concurrent_conns`: `L4Pdu::ts` comes from `Instant::now()` when a packet is
 //! processed, not from any timestamp recorded in a capture file. For offline pcap replay an
@@ -662,14 +674,23 @@ fn record_enc_series(series: &ByteSeries, proto: &SessionProto) {
     flush_series(series, &all_series[idx], &PROTO_CONN_COUNTS[idx]);
 }
 
+/// `proto` is checked first: a connection a real parser already claimed (see the
+/// "Column overlap" module docs) is skipped here, so it isn't double-counted in both its
+/// protocol's column and this one.
 #[callback("MaybeQuic,level=L4Terminated")]
-fn record_maybe_quic_series(series: &ByteSeries) {
+fn record_maybe_quic_series(series: &ByteSeries, proto: &SessionProto) {
+    if proto_index(proto).is_some() {
+        return;
+    }
     let all_series = PROTO_SERIES.get().expect("PROTO_SERIES initialized");
     flush_series(series, &all_series[5], &PROTO_CONN_COUNTS[5]);
 }
 
 #[callback("MaybeZoom,level=L4Terminated")]
-fn record_maybe_zoom_series(series: &ByteSeries) {
+fn record_maybe_zoom_series(series: &ByteSeries, proto: &SessionProto) {
+    if proto_index(proto).is_some() {
+        return;
+    }
     let all_series = PROTO_SERIES.get().expect("PROTO_SERIES initialized");
     flush_series(series, &all_series[6], &PROTO_CONN_COUNTS[6]);
 }
