@@ -10,6 +10,17 @@
 //! [`classify_probe`] treats a structurally valid transport header plus a plausible
 //! base-spec control header as unambiguous (certain regardless of port), and otherwise falls
 //! back to the port as a tiebreaker, in the same spirit as the IKE parser.
+//!
+//! ## Discovery doesn't finalize a session
+//! [RFC 5415] §2.3 guarantees that a connection's Discovery Request/Response messages are
+//! always sent in the clear, and that every other control message MUST be DTLS-protected --
+//! so a control-channel connection whose first observed message is plaintext Discovery isn't
+//! necessarily unencrypted overall; DTLS setup and the encrypted Join/Configuration exchange
+//! typically follow right after, on the same connection. [`Capwap::update`] accounts for
+//! this: Discovery Request/Response don't finalize the session by themselves ([`is_discovery`]
+//! decides), so [`preamble_type`](super::Capwap::preamble_type)/[`is_dtls`](super::Capwap::is_dtls)
+//! end up reflecting whatever message actually settles the connection's encryption status,
+//! not just whichever one happened to arrive first.
 
 use super::{Capwap, Channel, MsgType};
 use crate::conntrack::pdu::L4Pdu;
@@ -247,17 +258,29 @@ pub(crate) fn classify_probe(
     }
 }
 
+/// Returns `true` if `msg_type_id` is a Discovery Request (1) or Discovery Response (2) --
+/// the only two CAPWAP control messages [RFC 5415] guarantees are never DTLS-protected. See
+/// [`Capwap::update`] for why that matters.
+fn is_discovery(msg_type_id: u32) -> bool {
+    matches!(msg_type_id, 1 | 2)
+}
+
 impl Capwap {
-    /// Parses `data` as a CAPWAP message and populates the session summary. `channel_hint`
+    /// Parses `data` as a CAPWAP message and folds it into the session summary. `channel_hint`
     /// is the channel implied by the UDP ports the message was observed on (or `Unknown` if
     /// neither matched); see [`Channel`] for how it's used to resolve the channel when a
-    /// control header is absent or present unexpectedly. Returns `HeadersDone` on a
-    /// successful parse, since the transport (and, when applicable, control) header carries
-    /// everything of interest in this scope.
+    /// control header is absent or present unexpectedly.
     ///
-    /// The session is removed and delivered on `HeadersDone`, after which this is not called
-    /// again -- so the summary describes the first CAPWAP message only. See [`Capwap`] for
-    /// the implications.
+    /// Returns `HeadersDone` -- and is not called again on this connection -- for most
+    /// messages, since the transport (and, when applicable, control) header carries
+    /// everything of interest in this scope. The exception is a plaintext Discovery
+    /// Request/Response on the control channel: [RFC 5415] guarantees Discovery is
+    /// unencrypted and precedes DTLS setup, so finalizing on it here would permanently and
+    /// incorrectly report a connection that's about to go DTLS as unencrypted. For that case
+    /// this returns `Continue` instead, so the caller keeps calling `update` on later packets
+    /// until one arrives that actually settles the connection's encryption status (most
+    /// commonly a DTLS record) or the connection ends -- see [`Capwap`] for what's delivered
+    /// in the latter case.
     pub(crate) fn update(&mut self, data: &[u8], channel_hint: Channel) -> ParseResult {
         let Some(fields) = parse_transport_header(data) else {
             return ParseResult::Skipped;
@@ -291,24 +314,39 @@ impl Capwap {
             Channel::Data => {
                 self.channel = Channel::Data;
                 self.msg_type = MsgType::None;
+                ParseResult::HeadersDone(0)
             }
             Channel::Control => match parse_control_header(rest) {
-                Some(c) => self.apply_control_header(c),
+                Some(c) => self.apply_control_header_and_decide(c),
                 None => {
                     self.channel = Channel::Control;
                     self.msg_type = MsgType::None;
+                    ParseResult::HeadersDone(0)
                 }
             },
             Channel::Unknown => match parse_base_spec_control_header(rest) {
-                Some(c) => self.apply_control_header(c),
+                Some(c) => self.apply_control_header_and_decide(c),
                 None => {
                     self.channel = Channel::Data;
                     self.msg_type = MsgType::None;
+                    ParseResult::HeadersDone(0)
                 }
             },
         }
+    }
 
-        ParseResult::HeadersDone(0)
+    /// Applies a parsed control header to the session and decides whether it finalizes
+    /// parsing: a Discovery Request/Response defers (`Continue`) so a later, more decisive
+    /// message on the same connection can supersede it; everything else finalizes
+    /// (`HeadersDone`) immediately. See [`Capwap::update`] and [`is_discovery`].
+    fn apply_control_header_and_decide(&mut self, fields: ControlHeaderFields) -> ParseResult {
+        let defer = is_discovery(fields.msg_type_id);
+        self.apply_control_header(fields);
+        if defer {
+            ParseResult::Continue(0)
+        } else {
+            ParseResult::HeadersDone(0)
+        }
     }
 
     fn apply_control_header(&mut self, fields: ControlHeaderFields) {
@@ -475,9 +513,32 @@ mod tests {
         data
     }
 
+    fn discovery_response() -> Vec<u8> {
+        let mut data = build_transport_header(0, 2, 3, 7, 1, 0, 0x1234, 0);
+        data.extend_from_slice(&build_control_header(0, 2, 5, 0));
+        data
+    }
+
+    /// A Join Request -- like Discovery, a plaintext control-channel message, but (unlike
+    /// Discovery) one that finalizes parsing immediately, since [RFC 5415] only exempts
+    /// Discovery Request/Response from the DTLS-protection requirement.
+    fn join_request() -> Vec<u8> {
+        let mut data = build_transport_header(0, 2, 3, 7, 1, 0, 0x1234, 0);
+        data.extend_from_slice(&build_control_header(0, 3, 5, 0));
+        data
+    }
+
+    /// A DTLS Handshake record (ClientHello), DTLS 1.2 -- the message that would normally
+    /// follow Discovery once the WTP starts securing the control channel.
+    fn dtls_client_hello() -> Vec<u8> {
+        let mut data = build_transport_header(1, 2, 3, 7, 1, 0, 0x1234, 0);
+        data.extend_from_slice(&[22, 0xFE, 0xFD]);
+        data
+    }
+
     #[test]
-    fn parses_plaintext_control_channel_discovery_request() {
-        let data = discovery_request();
+    fn parses_plaintext_control_channel_join_request() {
+        let data = join_request();
         let mut capwap = Capwap::new();
         assert_eq!(
             capwap.update(&data, Channel::Control),
@@ -494,10 +555,94 @@ mod tests {
         assert_eq!(capwap.fragment_id(), 0x1234);
         assert_eq!(capwap.fragment_offset(), 0);
         assert_eq!(capwap.vendor_id(), 0);
-        assert_eq!(capwap.msg_type_id(), 1);
-        assert_eq!(capwap.msg_type(), MsgType::DiscoveryRequest);
+        assert_eq!(capwap.msg_type_id(), 3);
+        assert_eq!(capwap.msg_type(), MsgType::JoinRequest);
         assert_eq!(capwap.seq_num(), 5);
         assert_eq!(capwap.msg_element_length(), 0);
+        assert_eq!(capwap.channel(), Channel::Control);
+    }
+
+    #[test]
+    fn discovery_request_defers_finalization() {
+        let data = discovery_request();
+        let mut capwap = Capwap::new();
+        assert_eq!(
+            capwap.update(&data, Channel::Control),
+            ParseResult::Continue(0)
+        );
+        // Best-effort snapshot: reflects the Discovery message seen so far, even though
+        // parsing hasn't finalized.
+        assert_eq!(capwap.msg_type(), MsgType::DiscoveryRequest);
+        assert_eq!(capwap.channel(), Channel::Control);
+    }
+
+    #[test]
+    fn discovery_response_also_defers_finalization() {
+        let data = discovery_response();
+        let mut capwap = Capwap::new();
+        assert_eq!(
+            capwap.update(&data, Channel::Control),
+            ParseResult::Continue(0)
+        );
+        assert_eq!(capwap.msg_type(), MsgType::DiscoveryResponse);
+    }
+
+    #[test]
+    fn repeated_discovery_messages_keep_deferring() {
+        let mut capwap = Capwap::new();
+        assert_eq!(
+            capwap.update(&discovery_request(), Channel::Control),
+            ParseResult::Continue(0)
+        );
+        assert_eq!(
+            capwap.update(&discovery_request(), Channel::Control),
+            ParseResult::Continue(0)
+        );
+        assert_eq!(capwap.msg_type(), MsgType::DiscoveryRequest);
+    }
+
+    #[test]
+    fn discovery_then_dtls_finalizes_as_encrypted() {
+        let mut capwap = Capwap::new();
+        assert_eq!(
+            capwap.update(&discovery_request(), Channel::Control),
+            ParseResult::Continue(0)
+        );
+        assert!(!capwap.is_dtls());
+
+        assert_eq!(
+            capwap.update(&dtls_client_hello(), Channel::Control),
+            ParseResult::HeadersDone(0)
+        );
+        assert!(capwap.is_dtls());
+        assert_eq!(capwap.preamble_type(), 1);
+    }
+
+    #[test]
+    fn discovery_then_non_discovery_control_message_finalizes() {
+        let mut capwap = Capwap::new();
+        assert_eq!(
+            capwap.update(&discovery_request(), Channel::Control),
+            ParseResult::Continue(0)
+        );
+        assert_eq!(
+            capwap.update(&join_request(), Channel::Control),
+            ParseResult::HeadersDone(0)
+        );
+        assert_eq!(capwap.msg_type(), MsgType::JoinRequest);
+        assert!(!capwap.is_dtls());
+    }
+
+    #[test]
+    fn discovery_on_unknown_port_defers_and_marks_control_channel() {
+        let data = discovery_request();
+        let mut capwap = Capwap::new();
+        assert_eq!(
+            capwap.update(&data, Channel::Unknown),
+            ParseResult::Continue(0)
+        );
+        // A valid base-spec control header, even a deferred one, is enough to resolve the
+        // channel to `Control`.
         assert_eq!(capwap.channel(), Channel::Control);
     }
 
