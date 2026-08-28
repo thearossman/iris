@@ -493,7 +493,7 @@ fn main() {
     print_proto("QUIC", &QUIC_BYTES, transport_total);
     print_proto("WireGuard", &WIREGUARD_BYTES, transport_total);
     print_proto("IKE", &IKE_BYTES, transport_total);
-    print_proto("CAPWAP", &CAPWAP_BYTES, transport_total);
+    print_proto("CAPWAP-DTLS", &CAPWAP_BYTES, transport_total);
     print_proto("MaybeQUIC", &MAYBE_QUIC_BYTES, transport_total);
     print_proto("MaybeZoom", &MAYBE_ZOOM_BYTES, transport_total);
     print_proto("MaybeIperf3", &MAYBE_IPERF3_BYTES, transport_total);

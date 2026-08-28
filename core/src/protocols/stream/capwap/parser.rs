@@ -1,13 +1,22 @@
 //! CAPWAP transport/control header parser.
 //!
-//! [RFC 5415](https://datatracker.ietf.org/doc/rfc5415/) §4.3 defines the transport header
-//! shared by both channels; §4.5.1 defines the control header, present only on messages sent
-//! on the control channel (UDP port 5246). The data channel (UDP port 5247) carries only the
-//! transport header before 802.11/802.3 payload.
+//! [RFC 5415](https://datatracker.ietf.org/doc/rfc5415/) §4.1's one-byte preamble (Version +
+//! Type nibbles) selects between two, differently-shaped cleartext headers -- see
+//! [`CapwapHeader`] -- shared by both the control channel (UDP port 5246) and the data
+//! channel (UDP port 5247):
+//!
+//! - Type 0: the full plaintext CAPWAP Header (§4.3): HLEN, RID, WBID, the T/F/L/W/M/K flags,
+//!   Fragment ID/Offset, and the optional Radio MAC/Wireless Specific Information fields.
+//!   §4.5.1 additionally defines a control header, present only on control-channel messages,
+//!   immediately following it.
+//! - Type 1: just the 4-byte CAPWAP DTLS Header (§4.2) -- the preamble byte plus 24 reserved
+//!   bits, nothing else -- immediately followed by a DTLS record. Everything the plaintext
+//!   header would carry is *inside* that DTLS record, i.e. encrypted, and unavailable to this
+//!   parser (see [`Capwap::update`]).
 //!
 //! CAPWAP's plaintext preamble byte is `0x00`, which is far too common in arbitrary UDP
 //! payloads for a structural match alone to be [`ProbeResult::Certain`] -- so
-//! [`classify_probe`] treats a structurally valid transport header plus a plausible
+//! [`classify_probe`] treats a structurally valid plaintext header plus a plausible
 //! base-spec control header as unambiguous (certain regardless of port), and otherwise falls
 //! back to the port as a tiebreaker, in the same spirit as the IKE parser.
 //!
@@ -32,10 +41,13 @@ use crate::protocols::stream::{
 const CAPWAP_CONTROL_PORT: u16 = 5246;
 const CAPWAP_DATA_PORT: u16 = 5247;
 
-/// Size of the fixed part of the transport header, before the optional Radio MAC Address and
-/// Wireless Specific Information fields.
-const MIN_TRANSPORT_HEADER_LEN: usize = 8;
-/// Minimum valid HLEN (the transport header, in 4-byte words, must cover at least the fixed
+/// Size of the cleartext CAPWAP DTLS Header ([RFC 5415] §4.2): the one-byte preamble plus 24
+/// reserved bits, and nothing else. The DTLS record begins immediately after it.
+const CAPWAP_DTLS_HEADER_LEN: usize = 4;
+/// Size of the fixed part of the plaintext CAPWAP Header ([RFC 5415] §4.3), before the
+/// optional Radio MAC Address and Wireless Specific Information fields.
+const MIN_PLAINTEXT_HEADER_LEN: usize = 8;
+/// Minimum valid HLEN (the plaintext header, in 4-byte words, must cover at least the fixed
 /// part above).
 const MIN_HLEN: u8 = 2;
 /// Size of the fixed control header.
@@ -44,11 +56,35 @@ const CONTROL_HEADER_LEN: usize = 8;
 /// Base-spec control message types occupy 1..=26; see [`super::MsgType`].
 const BASE_SPEC_MSG_TYPE_RANGE: std::ops::RangeInclusive<u32> = 1..=26;
 
-/// Fields decoded from a CAPWAP transport header.
+/// The cleartext CAPWAP header at the start of a UDP payload. Which of the two wire formats
+/// applies is decided by the Type nibble of the preamble byte ([RFC 5415] §4.1) -- they are
+/// *different lengths and different layouts*, not variations on one header; see the module
+/// docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TransportHeaderFields {
-    pub(crate) version: u8,
-    pub(crate) preamble_type: u8,
+pub(crate) enum CapwapHeader {
+    /// Preamble Type 1: a 4-byte CAPWAP DTLS Header ([RFC 5415] §4.2), carrying no fields
+    /// beyond the preamble itself. Everything the plaintext header would have held is inside
+    /// the DTLS record and unavailable without decrypting it.
+    Dtls,
+    /// Preamble Type 0: the full plaintext CAPWAP Header ([RFC 5415] §4.3).
+    Plaintext(PlaintextHeaderFields),
+}
+
+impl CapwapHeader {
+    /// Length of the cleartext header, i.e. the offset at which its payload begins -- a DTLS
+    /// record for [`CapwapHeader::Dtls`], a control header or wireless payload otherwise.
+    fn header_len(&self) -> usize {
+        match self {
+            CapwapHeader::Dtls => CAPWAP_DTLS_HEADER_LEN,
+            CapwapHeader::Plaintext(fields) => fields.header_len,
+        }
+    }
+}
+
+/// Fields decoded from a plaintext CAPWAP Header ([RFC 5415] §4.3). Only ever populated for
+/// preamble Type 0 -- see [`CapwapHeader`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlaintextHeaderFields {
     pub(crate) hlen: u8,
     pub(crate) header_len: usize,
     pub(crate) rid: u8,
@@ -61,6 +97,12 @@ pub(crate) struct TransportHeaderFields {
     pub(crate) fragment_offset: u16,
     pub(crate) radio_mac: Option<Vec<u8>>,
     pub(crate) wireless_info: Option<Vec<u8>>,
+    /// `true` if every bit [RFC 5415] §4.3 reserves is zero, as a conforming sender sets
+    /// them. Deliberately *not* a validity requirement -- §4.2 and §4.3 both require
+    /// receivers to ignore bits they don't define, so a set reserved bit must not make the
+    /// parse fail. It is still a useful plausibility signal when guessing whether unknown UDP
+    /// traffic is CAPWAP at all, so [`classify_probe`] uses it to withhold certainty.
+    pub(crate) reserved_bits_clear: bool,
 }
 
 /// Fields decoded from a CAPWAP control header.
@@ -98,22 +140,44 @@ fn read_optional_field(data: &[u8], pos: usize, header_len: usize) -> Option<(Ve
     Some((data[value_start..value_end].to_vec(), next))
 }
 
-/// Parses `data` as a CAPWAP transport header. Returns `None` if `data` is too short, the
-/// version is not 0, the preamble type is not 0 (plaintext) or 1 (DTLS), `HLEN` is less than
-/// the minimum, the header (per `HLEN`) extends past `data`, any reserved bit is set, or an
-/// optional Radio MAC / Wireless Specific Information field is malformed or runs past the
-/// header.
-pub(crate) fn parse_transport_header(data: &[u8]) -> Option<TransportHeaderFields> {
-    if data.len() < MIN_TRANSPORT_HEADER_LEN {
+/// Parses the cleartext CAPWAP header at the start of `data`, dispatching on the preamble's
+/// Type nibble ([RFC 5415] §4.1). Returns `None` if `data` is empty, the version is not 0,
+/// or the type is neither 0 (plaintext) nor 1 (DTLS) -- and, for each type, if that format's
+/// own parse fails.
+pub(crate) fn parse_header(data: &[u8]) -> Option<CapwapHeader> {
+    let preamble = *data.first()?;
+    if preamble >> 4 != 0 {
         return None;
     }
+    match preamble & 0x0F {
+        0 => parse_plaintext_header(data).map(CapwapHeader::Plaintext),
+        1 => parse_dtls_header(data),
+        _ => None,
+    }
+}
 
-    let version = data[0] >> 4;
-    if version != 0 {
+/// Parses `data` as a 4-byte CAPWAP DTLS Header ([RFC 5415] §4.2). The caller has already
+/// validated the preamble byte, so all that remains is a length check: the header carries no
+/// other fields, just 24 reserved bits.
+///
+/// Those reserved bits are deliberately not validated. §4.2 requires senders to zero them but
+/// equally requires that "Receivers MUST ignore all bits not defined for the version of the
+/// protocol they support" -- so rejecting a packet over them would be non-conforming.
+fn parse_dtls_header(data: &[u8]) -> Option<CapwapHeader> {
+    if data.len() < CAPWAP_DTLS_HEADER_LEN {
         return None;
     }
-    let preamble_type = data[0] & 0x0F;
-    if preamble_type > 1 {
+    Some(CapwapHeader::Dtls)
+}
+
+/// Parses `data` as a plaintext CAPWAP Header ([RFC 5415] §4.3). The caller has already
+/// validated the preamble byte. Returns `None` if `data` is too short, `HLEN` is less than the
+/// minimum, the header (per `HLEN`) extends past `data`, or an optional Radio MAC / Wireless
+/// Specific Information field is malformed or runs past the header.
+///
+/// Reserved bits do not cause a rejection -- see [`PlaintextHeaderFields::reserved_bits_clear`].
+fn parse_plaintext_header(data: &[u8]) -> Option<PlaintextHeaderFields> {
+    if data.len() < MIN_PLAINTEXT_HEADER_LEN {
         return None;
     }
 
@@ -131,9 +195,6 @@ pub(crate) fn parse_transport_header(data: &[u8]) -> Option<TransportHeaderField
     let payload_type = data[2] & 0x01;
 
     let flags = data[3];
-    if flags & 0x07 != 0 {
-        return None;
-    }
     let is_fragment = flags & 0x80 != 0;
     let last_fragment = flags & 0x40 != 0;
     let wireless_info_flag = flags & 0x20 != 0;
@@ -142,12 +203,10 @@ pub(crate) fn parse_transport_header(data: &[u8]) -> Option<TransportHeaderField
 
     let fragment_id = u16::from_be_bytes([data[4], data[5]]);
     let frag_raw = u16::from_be_bytes([data[6], data[7]]);
-    if frag_raw & 0x07 != 0 {
-        return None;
-    }
     let fragment_offset = frag_raw >> 3;
+    let reserved_bits_clear = flags & 0x07 == 0 && frag_raw & 0x07 == 0;
 
-    let mut pos = MIN_TRANSPORT_HEADER_LEN;
+    let mut pos = MIN_PLAINTEXT_HEADER_LEN;
     let mut radio_mac = None;
     if radio_mac_flag {
         let (value, next) = read_optional_field(data, pos, header_len)?;
@@ -160,9 +219,7 @@ pub(crate) fn parse_transport_header(data: &[u8]) -> Option<TransportHeaderField
         wireless_info = Some(value);
     }
 
-    Some(TransportHeaderFields {
-        version,
-        preamble_type,
+    Some(PlaintextHeaderFields {
         hlen,
         header_len,
         rid,
@@ -175,6 +232,7 @@ pub(crate) fn parse_transport_header(data: &[u8]) -> Option<TransportHeaderField
         fragment_offset,
         radio_mac,
         wireless_info,
+        reserved_bits_clear,
     })
 }
 
@@ -230,31 +288,41 @@ pub(crate) fn classify_probe(
     on_control_port: bool,
     on_data_port: bool,
 ) -> ProbeResult {
-    let Some(fields) = parse_transport_header(data) else {
+    let Some(header) = parse_header(data) else {
         return ProbeResult::NotForUs;
     };
     let on_known_port = on_control_port || on_data_port;
-    let rest = &data[fields.header_len..];
+    let rest = &data[header.header_len()..];
 
-    if fields.preamble_type == 1 {
-        return if looks_like_dtls_record(rest) {
-            if on_known_port {
-                ProbeResult::Certain
+    match header {
+        CapwapHeader::Dtls => {
+            if looks_like_dtls_record(rest) {
+                if on_known_port {
+                    ProbeResult::Certain
+                } else {
+                    ProbeResult::Unsure
+                }
             } else {
-                ProbeResult::Unsure
+                ProbeResult::NotForUs
             }
-        } else {
-            ProbeResult::NotForUs
-        };
-    }
-
-    if parse_base_spec_control_header(rest).is_some() {
-        return ProbeResult::Certain;
-    }
-    if on_known_port {
-        ProbeResult::Certain
-    } else {
-        ProbeResult::Unsure
+        }
+        CapwapHeader::Plaintext(fields) => {
+            if parse_base_spec_control_header(rest).is_some() {
+                return ProbeResult::Certain;
+            }
+            if on_known_port {
+                return ProbeResult::Certain;
+            }
+            // Off port, no control header to lean on: a conforming sender always clears
+            // these bits, so a set one is a (non-fatal, per RFC 5415 -- see
+            // `PlaintextHeaderFields::reserved_bits_clear`) sign this probably isn't CAPWAP
+            // at all, weak enough to withhold even `Unsure` for arbitrary off-port UDP.
+            if fields.reserved_bits_clear {
+                ProbeResult::Unsure
+            } else {
+                ProbeResult::NotForUs
+            }
+        }
     }
 }
 
@@ -282,56 +350,74 @@ impl Capwap {
     /// commonly a DTLS record) or the connection ends -- see [`Capwap`] for what's delivered
     /// in the latter case.
     pub(crate) fn update(&mut self, data: &[u8], channel_hint: Channel) -> ParseResult {
-        let Some(fields) = parse_transport_header(data) else {
+        let Some(header) = parse_header(data) else {
             return ParseResult::Skipped;
         };
 
-        self.version = fields.version;
-        self.preamble_type = fields.preamble_type;
-        self.hlen = fields.hlen;
-        self.rid = fields.rid;
-        self.wbid = fields.wbid;
-        self.payload_type = fields.payload_type;
-        self.is_fragment = fields.is_fragment;
-        self.last_fragment = fields.last_fragment;
-        self.keep_alive = fields.keep_alive;
-        self.fragment_id = fields.fragment_id;
-        self.fragment_offset = fields.fragment_offset;
-        self.radio_mac = fields.radio_mac;
-        self.wireless_info = fields.wireless_info;
-
-        if fields.preamble_type == 1 {
-            // DTLS: the transport header is in the clear, but everything after it is an
-            // encrypted DTLS record -- there is no control header to extract. See the
-            // module docs.
-            self.channel = channel_hint;
-            self.msg_type = MsgType::None;
-            return ParseResult::HeadersDone(0);
-        }
-
-        let rest = &data[fields.header_len..];
-        match channel_hint {
-            Channel::Data => {
-                self.channel = Channel::Data;
-                self.msg_type = MsgType::None;
+        match header {
+            CapwapHeader::Dtls => {
+                // DTLS: the 4-byte CAPWAP DTLS Header is in the clear, but everything after
+                // it -- including what would otherwise be the transport header's HLEN/RID/
+                // WBID/flags/fragment fields -- is inside the encrypted DTLS record. See the
+                // module docs. Reset every plaintext-only field to "unavailable" rather than
+                // leaving it at whatever an earlier deferred Discovery message set it to.
+                self.version = 0;
+                self.preamble_type = 1;
+                self.hlen = 0;
+                self.rid = 0;
+                self.wbid = 0;
+                self.payload_type = 0;
+                self.is_fragment = false;
+                self.last_fragment = false;
+                self.keep_alive = false;
+                self.fragment_id = 0;
+                self.fragment_offset = 0;
+                self.radio_mac = None;
+                self.wireless_info = None;
+                self.channel = channel_hint;
+                self.clear_control_header();
                 ParseResult::HeadersDone(0)
             }
-            Channel::Control => match parse_control_header(rest) {
-                Some(c) => self.apply_control_header_and_decide(c),
-                None => {
-                    self.channel = Channel::Control;
-                    self.msg_type = MsgType::None;
-                    ParseResult::HeadersDone(0)
+            CapwapHeader::Plaintext(fields) => {
+                self.version = 0;
+                self.preamble_type = 0;
+                self.hlen = fields.hlen;
+                self.rid = fields.rid;
+                self.wbid = fields.wbid;
+                self.payload_type = fields.payload_type;
+                self.is_fragment = fields.is_fragment;
+                self.last_fragment = fields.last_fragment;
+                self.keep_alive = fields.keep_alive;
+                self.fragment_id = fields.fragment_id;
+                self.fragment_offset = fields.fragment_offset;
+                self.radio_mac = fields.radio_mac;
+                self.wireless_info = fields.wireless_info;
+
+                let rest = &data[fields.header_len..];
+                match channel_hint {
+                    Channel::Data => {
+                        self.channel = Channel::Data;
+                        self.clear_control_header();
+                        ParseResult::HeadersDone(0)
+                    }
+                    Channel::Control => match parse_control_header(rest) {
+                        Some(c) => self.apply_control_header_and_decide(c),
+                        None => {
+                            self.channel = Channel::Control;
+                            self.clear_control_header();
+                            ParseResult::HeadersDone(0)
+                        }
+                    },
+                    Channel::Unknown => match parse_base_spec_control_header(rest) {
+                        Some(c) => self.apply_control_header_and_decide(c),
+                        None => {
+                            self.channel = Channel::Data;
+                            self.clear_control_header();
+                            ParseResult::HeadersDone(0)
+                        }
+                    },
                 }
-            },
-            Channel::Unknown => match parse_base_spec_control_header(rest) {
-                Some(c) => self.apply_control_header_and_decide(c),
-                None => {
-                    self.channel = Channel::Data;
-                    self.msg_type = MsgType::None;
-                    ParseResult::HeadersDone(0)
-                }
-            },
+            }
         }
     }
 
@@ -357,6 +443,20 @@ impl Capwap {
         self.seq_num = fields.seq_num;
         self.msg_element_length = fields.msg_element_length;
         self.channel = Channel::Control;
+    }
+
+    /// Resets every control-header-derived field to "no control header extracted." Used
+    /// whenever a message finalizes the session without one -- a DTLS record, a data-channel
+    /// message, or a control-channel message whose control header didn't parse -- so fields
+    /// an earlier *deferred* Discovery message set (see [`Capwap::update`]) can't leak into
+    /// the final summary.
+    fn clear_control_header(&mut self) {
+        self.vendor_id = 0;
+        self.msg_type_value = 0;
+        self.msg_type_id = 0;
+        self.msg_type = MsgType::None;
+        self.seq_num = 0;
+        self.msg_element_length = 0;
     }
 }
 
@@ -409,7 +509,9 @@ impl ConnParsable for CapwapParser {
     fn probe(&self, pdu: &L4Pdu) -> ProbeResult {
         let offset = pdu.offset();
         let length = pdu.length();
-        if length < MIN_TRANSPORT_HEADER_LEN {
+        // Shorter than this, `data` can't hold even the smaller of the two valid preamble
+        // formats (the 4-byte CAPWAP DTLS Header) -- not worth a real probe.
+        if length < CAPWAP_DTLS_HEADER_LEN {
             return ProbeResult::Unsure;
         }
 
@@ -528,10 +630,18 @@ mod tests {
         data
     }
 
+    /// Builds a 4-byte CAPWAP DTLS Header ([RFC 5415] §4.2): the preamble byte (version 0,
+    /// type 1) followed by 24 reserved bits. This is the *entire* cleartext header for a
+    /// DTLS-encapsulated packet -- there is no HLEN/RID/WBID/flags/fragment fields; those
+    /// would-be transport-header bytes are inside the encrypted DTLS record instead.
+    fn build_dtls_header() -> Vec<u8> {
+        vec![0x01, 0x00, 0x00, 0x00]
+    }
+
     /// A DTLS Handshake record (ClientHello), DTLS 1.2 -- the message that would normally
     /// follow Discovery once the WTP starts securing the control channel.
     fn dtls_client_hello() -> Vec<u8> {
-        let mut data = build_transport_header(1, 2, 3, 7, 1, 0, 0x1234, 0);
+        let mut data = build_dtls_header();
         data.extend_from_slice(&[22, 0xFE, 0xFD]);
         data
     }
@@ -619,6 +729,36 @@ mod tests {
     }
 
     #[test]
+    fn discovery_then_dtls_clears_stale_control_header_fields() {
+        // The deferred Discovery Request populates vendor_id/msg_type_id/seq_num/etc via
+        // apply_control_header. Regression test: finalizing on the DTLS message that follows
+        // must not let those values leak through, even though msg_type() alone already
+        // reported `None` before this fix.
+        let mut capwap = Capwap::new();
+        assert_eq!(
+            capwap.update(&discovery_request(), Channel::Control),
+            ParseResult::Continue(0)
+        );
+        assert_eq!(capwap.msg_type_id(), 1);
+
+        assert_eq!(
+            capwap.update(&dtls_client_hello(), Channel::Control),
+            ParseResult::HeadersDone(0)
+        );
+        assert_eq!(capwap.vendor_id(), 0);
+        assert_eq!(capwap.msg_type_value(), 0);
+        assert_eq!(capwap.msg_type_id(), 0);
+        assert_eq!(capwap.msg_type(), MsgType::None);
+        assert_eq!(capwap.seq_num(), 0);
+        assert_eq!(capwap.msg_element_length(), 0);
+        // Plaintext-only transport-header fields from the Discovery message must not leak
+        // through either.
+        assert_eq!(capwap.hlen(), 0);
+        assert_eq!(capwap.rid(), 0);
+        assert_eq!(capwap.wbid(), 0);
+    }
+
+    #[test]
     fn discovery_then_non_discovery_control_message_finalizes() {
         let mut capwap = Capwap::new();
         assert_eq!(
@@ -631,6 +771,28 @@ mod tests {
         );
         assert_eq!(capwap.msg_type(), MsgType::JoinRequest);
         assert!(!capwap.is_dtls());
+    }
+
+    #[test]
+    fn discovery_then_truncated_control_message_clears_stale_fields() {
+        // Regression test for the same staleness bug as
+        // `discovery_then_dtls_clears_stale_control_header_fields`, via the other code path
+        // that finalizes without a control header: a control-channel message too short for
+        // `parse_control_header` to extract one.
+        let mut capwap = Capwap::new();
+        assert_eq!(
+            capwap.update(&discovery_request(), Channel::Control),
+            ParseResult::Continue(0)
+        );
+        assert_eq!(capwap.msg_type_id(), 1);
+
+        let truncated = build_transport_header(0, 2, 0, 0, 0, 0, 0, 0); // no control header
+        assert_eq!(
+            capwap.update(&truncated, Channel::Control),
+            ParseResult::HeadersDone(0)
+        );
+        assert_eq!(capwap.msg_type_id(), 0);
+        assert_eq!(capwap.msg_type(), MsgType::None);
     }
 
     #[test]
@@ -724,41 +886,61 @@ mod tests {
         data.push(6);
         data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
         data.push(0);
-        assert_eq!(parse_transport_header(&data), None);
+        assert_eq!(parse_plaintext_header(&data), None);
     }
 
     #[test]
     fn rejects_hlen_below_minimum() {
         let data = build_transport_header(0, 1, 0, 0, 0, 0, 0, 0);
-        assert_eq!(parse_transport_header(&data), None);
+        assert_eq!(parse_plaintext_header(&data), None);
     }
 
     #[test]
     fn rejects_hlen_extending_past_data() {
         // HLEN=3 (12 bytes) but only 8 bytes of data.
         let data = build_transport_header(0, 3, 0, 0, 0, 0, 0, 0);
-        assert_eq!(parse_transport_header(&data), None);
+        assert_eq!(parse_plaintext_header(&data), None);
     }
 
     #[test]
-    fn rejects_nonzero_header_reserved_bits() {
+    fn nonzero_header_reserved_bits_do_not_reject_but_are_flagged() {
+        // RFC 5415 §4.3/§4.2 both require receivers to ignore bits they don't define, so a
+        // set reserved bit must not fail the parse -- only `reserved_bits_clear` reflects it,
+        // for `classify_probe` to use as a plausibility signal.
         let mut data = build_transport_header(0, 2, 0, 0, 0, 0, 0, 0);
         data[3] |= 0x01; // set a reserved bit in byte 3
-        assert_eq!(parse_transport_header(&data), None);
+        let fields = parse_plaintext_header(&data).expect("still parses");
+        assert!(!fields.reserved_bits_clear);
     }
 
     #[test]
-    fn rejects_nonzero_fragment_reserved_bits() {
+    fn nonzero_fragment_reserved_bits_do_not_reject_but_are_flagged() {
         let mut data = build_transport_header(0, 2, 0, 0, 0, 0, 0, 0);
         data[7] |= 0x01; // set a reserved bit in byte 7
-        assert_eq!(parse_transport_header(&data), None);
+        let fields = parse_plaintext_header(&data).expect("still parses");
+        assert!(!fields.reserved_bits_clear);
     }
 
     #[test]
     fn rejects_nonzero_version() {
         let mut data = build_transport_header(0, 2, 0, 0, 0, 0, 0, 0);
         data[0] |= 0x10; // version = 1
-        assert_eq!(parse_transport_header(&data), None);
+        assert_eq!(parse_header(&data), None);
+    }
+
+    #[test]
+    fn dtls_header_is_always_four_bytes_regardless_of_trailing_bytes() {
+        // Regression test for a bug where the DTLS path read an 8-byte plaintext-shaped
+        // transport header (HLEN etc.) before the DTLS record, when RFC 5415 §4.2 says the
+        // CAPWAP DTLS Header is always exactly 4 bytes and everything after it -- including
+        // bytes that might look like transport-header fields -- is inside the encrypted DTLS
+        // record, unavailable without decrypting it.
+        let mut data = vec![0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // looks like an
+                                                                             // 8-byte plaintext header (HLEN=2) but the preamble's Type nibble is 1 (DTLS).
+        data.extend_from_slice(&[22, 0xFE, 0xFD]); // DTLS record actually starts at offset 4.
+        let header = parse_header(&data).expect("valid DTLS header");
+        assert_eq!(header, CapwapHeader::Dtls);
+        assert_eq!(header.header_len(), CAPWAP_DTLS_HEADER_LEN);
     }
 
     #[test]
@@ -783,10 +965,21 @@ mod tests {
 
     #[test]
     fn probe_detects_dtls_encapsulated_capwap_on_control_port() {
-        let mut data = build_transport_header(1, 2, 0, 0, 0, 0, 0, 0);
-        data.extend_from_slice(&[22, 0xFE, 0xFD]); // DTLS Handshake record, DTLS 1.2
+        let data = dtls_client_hello();
         assert_eq!(classify_probe(&data, true, false), ProbeResult::Certain);
         assert_eq!(classify_probe(&data, false, false), ProbeResult::Unsure);
+    }
+
+    #[test]
+    fn probe_is_not_for_us_off_port_when_reserved_bits_set_and_no_control_header() {
+        // A bare data-channel-shaped header (no control header to lean on) with a reserved
+        // bit set: still parses (receivers must ignore undefined bits), but is too weak a
+        // signal to even guess `Unsure` about arbitrary off-port UDP. On a known port, the
+        // port itself is enough evidence regardless.
+        let mut data = build_transport_header(0, 2, 0, 0, 0, K, 0, 0);
+        data[3] |= 0x01;
+        assert_eq!(classify_probe(&data, false, false), ProbeResult::NotForUs);
+        assert_eq!(classify_probe(&data, false, true), ProbeResult::Certain);
     }
 
     #[test]
