@@ -109,9 +109,14 @@ impl QuicPacket {
     }
 
     /// Returns the packet type of the Quic packet
+    /// Returns an error for a short-header packet, and for a long header whose
+    /// version leaves the type bits undefined (Version Negotiation, or a
+    /// greased version).
     pub fn packet_type(&self) -> Result<LongHeaderPacketType, QuicError> {
         match &self.long_header {
-            Some(long_header) => Ok(long_header.packet_type),
+            Some(long_header) => long_header
+                .packet_type
+                .ok_or(QuicError::UnknowLongHeaderPacketType),
             None => Err(QuicError::NoLongHeader),
         }
     }

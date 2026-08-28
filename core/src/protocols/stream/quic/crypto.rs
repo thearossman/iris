@@ -222,7 +222,14 @@ fn derive_initial_secret(secret: &[u8], version: u32) -> hkdf::Prk {
     let salt = match QuicVersion::from_u32(version) {
         QuicVersion::Rfc9000 => &INITIAL_SALT_RFC9000,
         QuicVersion::Rfc9369 => &INITIAL_SALT_RFC9369,
-        QuicVersion::Draft29 => &INITIAL_SALT_DRAFT29,
+        // The initial salt was set at draft-29 and unchanged through
+        // draft-34; v1 introduced a new one.
+        QuicVersion::Draft29
+        | QuicVersion::Draft30
+        | QuicVersion::Draft31
+        | QuicVersion::Draft32
+        | QuicVersion::Draft33
+        | QuicVersion::Draft34 => &INITIAL_SALT_DRAFT29,
         QuicVersion::Draft27 | QuicVersion::Draft28 | QuicVersion::Mvfst27 => &INITIAL_SALT_DRAFT27,
         _ => &INITIAL_SALT_RFC9000,
     };
