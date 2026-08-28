@@ -1,28 +1,52 @@
 //! A streaming filter that heuristically accepts connections that look like
-//! QUIC: on UDP port 443, not clearly another protocol, and initial packets
-//! with (potential) QUIC short headers.
+//! QUIC: on UDP, on a port QUIC is expected on, not clearly another protocol,
+//! and with initial packets whose first byte is consistent with a QUIC header.
 //!
-//! Per RFC 9000, the first byte of a QUIC short header starts with bits
-//! `01`. Long-header packets (Initial, Handshake, 0-RTT, Retry) have both
-//! bits set and do not match, but the Iris `quic` parser should pick those up.
+//! Per RFC 9000 Section 17.3 the first byte of a QUIC short header starts with
+//! bits `01`: header form 0, fixed bit 1. Header protection (Section 5.4.1)
+//! masks only the low five bits, so those two bits are directly observable, and
+//! the low five are pseudorandom per packet -- which the distinct-byte check
+//! below relies on.
 //!
-//! This filter only inspects UDP traffic on [`QUIC_PORT`] (443).
+//! Three shapes count as evidence of QUIC (see [`Shape`]):
+//!
+//! - **Short header** -- `01` in the top two bits.
+//! - **Long header** (Section 17.2) -- high bit set *and* a version Iris
+//!   recognizes. A long header is *stronger* evidence than a short header, since
+//!   the version is a 32-bit exact match, so it is scored as a match rather than
+//!   against the connection. Two cases make this matter in practice: a capture
+//!   that starts mid-handshake, and coalesced datagrams (Section 12.2), where a
+//!   long-header packet may sit ahead of the 1-RTT packet and hide it from a
+//!   first-byte test.
+//! - **Greased short header** -- an endpoint whose peer advertised
+//!   `grease_quic_bit` may set the fixed bit to any value on its 1-RTT packets
+//!   (RFC 9287), so roughly half of a greasing endpoint's packets have it clear.
+//!   These are credited only once the connection has shown at least one
+//!   unambiguous QUIC packet, and only when the datagram is large enough to hold
+//!   a 1-RTT packet: greasing requires a negotiated transport parameter, and a
+//!   greasing endpoint still emits fixed-bit-set packets, so with no such packet
+//!   in the connection the fixed-bit-clear ones are some other protocol. STUN,
+//!   for one, pins its own top two bits to `00`.
+//!
+//! This filter only inspects UDP traffic on [`QUIC_PORTS`].
 //!
 //! This filter requires at least two distinct first-byte values among the
-//! matched packets before accepting. This avoids false positives
+//! unambiguously-QUIC packets before accepting. This avoids false positives
 //! from other protocols that pin their first byte in the same `0x40..=0x7f`
-//! range (e.g., some BitTorrent, OpenVPN, and IPv4-in-UDP packets).
+//! range (e.g., some BitTorrent, OpenVPN, TURN ChannelData, and IPv4-in-UDP
+//! packets).
 
 #[allow(unused_imports)]
 use iris_compiler::{filter, filter_fn};
 use iris_core::protocols::packet::udp::UDP_PROTOCOL;
+use iris_core::protocols::stream::quic::is_quic_version;
 use iris_core::subscription::{FilterResult, StreamingFilter};
 use iris_core::L4Pdu;
 
 /// Number of payload-bearing packets inspected before making a decision.
 pub const MAYBE_QUIC_WINDOW: usize = 12;
 /// Fraction of the first [`MAYBE_QUIC_WINDOW`] payload-bearing packets that
-/// must look like QUIC short headers for the connection to be accepted.
+/// must look like QUIC headers for the connection to be accepted.
 /// Mid-stream QUIC is very nearly all short headers, so this is set high.
 /// The slack tolerates one stray packet.
 pub const MAYBE_QUIC_MIN_FRACTION: f64 = 0.9;
@@ -30,37 +54,95 @@ pub const MAYBE_QUIC_MIN_FRACTION: f64 = 0.9;
 /// before [`MAYBE_QUIC_WINDOW`] was reached. Shorter connections carry too
 /// little evidence to classify and are dropped.
 pub const MAYBE_QUIC_MIN_PKTS: usize = 6;
-/// UDP port QUIC traffic is expected on.
-pub const QUIC_PORT: u16 = 443;
+/// UDP ports QUIC traffic is expected on: 443 (HTTP/3), 853 (DNS-over-QUIC,
+/// RFC 9250), 4433 (the de-facto QUIC interop/test port), and 8443 (alternate
+/// HTTPS/HTTP-3). A connection on any other port is dropped without inspection.
+pub const QUIC_PORTS: [u16; 4] = [443, 853, 4433, 8443];
+/// Smallest datagram that can carry a 1-RTT packet: one header byte, a
+/// zero-length destination connection ID, and the four packet-number bytes plus
+/// 16-byte sample that RFC 9000 Section 5.4.2 requires header protection to be
+/// able to sample. Used to keep short non-QUIC datagrams out of the greased
+/// [`Shape::GreasedShortHeader`] bucket, where the fixed bit is no help.
+pub const MIN_1RTT_DATAGRAM_LEN: usize = 21;
 
-/// Check that first byte starts with `01`
-#[inline]
-fn is_quic_short_header(payload: &[u8]) -> bool {
-    matches!(payload.first(), Some(b) if b & 0xc0 == 0x40)
+/// Number of matching packets required within a full window of
+/// [`MAYBE_QUIC_WINDOW`] packets to meet [`MAYBE_QUIC_MIN_FRACTION`], i.e.
+/// `ceil(MAYBE_QUIC_WINDOW * MAYBE_QUIC_MIN_FRACTION)`.
+pub const MAYBE_QUIC_REQUIRED_MATCHES: usize = {
+    let exact = MAYBE_QUIC_WINDOW as f64 * MAYBE_QUIC_MIN_FRACTION;
+    let truncated = exact as usize;
+    if (truncated as f64) < exact {
+        truncated + 1
+    } else {
+        truncated
+    }
+};
+
+/// How a datagram's first byte -- plus, for the shapes where the QUIC
+/// invariants pin a version field or a minimum size, its length -- classifies
+/// against the QUIC packet headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// Short header with the fixed bit set: `01` in the top two bits.
+    ShortHeader,
+    /// Long header carrying a version Iris recognizes. The fixed bit is not
+    /// checked here -- it may be greased too (RFC 9287) -- because the 32-bit
+    /// version is a far stronger discriminator on its own.
+    LongHeader,
+    /// Short *form* with the fixed bit cleared, large enough to be a 1-RTT
+    /// packet: a possible RFC 9287 greased packet. Only credible in a
+    /// connection that has also shown a [`Shape::ShortHeader`] or
+    /// [`Shape::LongHeader`] packet.
+    GreasedShortHeader,
+    /// Nothing that looks like QUIC.
+    Other,
 }
 
-/// Number of short headers required within a full window of
-/// [`MAYBE_QUIC_WINDOW`] packets to meet [`MAYBE_QUIC_MIN_FRACTION`].
+/// Classifies one datagram's payload by its first byte and length.
 #[inline]
-fn required_short_hdrs() -> usize {
-    (MAYBE_QUIC_WINDOW as f64 * MAYBE_QUIC_MIN_FRACTION).ceil() as usize
+fn classify(payload: &[u8]) -> Shape {
+    let Some(&first) = payload.first() else {
+        return Shape::Other;
+    };
+    if first & 0x80 != 0 {
+        // Long header: bytes 1..5 are the version (RFC 8999 Section 5.1).
+        if payload.len() < 5 {
+            return Shape::Other;
+        }
+        let version = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+        if is_quic_version(version) {
+            Shape::LongHeader
+        } else {
+            Shape::Other
+        }
+    } else if first & 0x40 != 0 {
+        Shape::ShortHeader
+    } else if payload.len() >= MIN_1RTT_DATAGRAM_LEN {
+        Shape::GreasedShortHeader
+    } else {
+        Shape::Other
+    }
 }
 
 /// Accepts a connection once at least [`MAYBE_QUIC_MIN_FRACTION`] of its
-/// first [`MAYBE_QUIC_WINDOW`] payload-bearing packets (UDP, port
-/// [`QUIC_PORT`]) start with what looks like a QUIC short header, and
-/// those matches don't all share a single first-byte value. Non-UDP or
-/// non-QUIC-port connections are dropped immediately.
+/// first [`MAYBE_QUIC_WINDOW`] payload-bearing packets (UDP, on one of
+/// [`QUIC_PORTS`]) look like QUIC packet headers, and those matches don't all
+/// share a single first-byte value. Non-UDP or non-QUIC-port connections are
+/// dropped immediately.
 #[cfg_attr(not(feature = "skip_expand"), filter)]
 #[derive(Debug)]
 pub struct MaybeQuic {
     /// Payload-bearing packets inspected so far.
     seen: usize,
-    /// Of those, how many started with a QUIC short header.
-    short_hdrs: usize,
-    /// First byte of the first matched packet, to detect a constant value.
+    /// Of those, how many were unambiguously QUIC-shaped: a short header with
+    /// the fixed bit set, or a long header with a recognized version.
+    quic_like: usize,
+    /// Of those, how many were fixed-bit-clear short-form datagrams big enough
+    /// to be greased 1-RTT packets. Credited only if `quic_like` is nonzero.
+    greased: usize,
+    /// First byte of the first `quic_like` packet, to detect a constant value.
     first_byte: Option<u8>,
-    /// True once a matched packet's first byte differs from `first_byte`.
+    /// True once a `quic_like` packet's first byte differs from `first_byte`.
     distinct_seen: bool,
 }
 
@@ -68,7 +150,8 @@ impl StreamingFilter for MaybeQuic {
     fn new(_first_packet: &L4Pdu) -> Self {
         Self {
             seen: 0,
-            short_hdrs: 0,
+            quic_like: 0,
+            greased: 0,
             first_byte: None,
             distinct_seen: false,
         }
@@ -76,7 +159,8 @@ impl StreamingFilter for MaybeQuic {
 
     fn clear(&mut self) {
         self.seen = 0;
-        self.short_hdrs = 0;
+        self.quic_like = 0;
+        self.greased = 0;
         self.first_byte = None;
         self.distinct_seen = false;
     }
@@ -86,32 +170,61 @@ impl MaybeQuic {
     /// Updates counts from one payload
     fn record(&mut self, data: &[u8]) {
         self.seen += 1;
-        if !is_quic_short_header(data) {
-            return;
-        }
-        self.short_hdrs += 1;
-        if !self.distinct_seen {
-            match self.first_byte {
-                None => self.first_byte = Some(data[0]),
-                Some(b) if b != data[0] => self.distinct_seen = true,
-                _ => {}
+        match classify(data) {
+            Shape::ShortHeader | Shape::LongHeader => {
+                self.quic_like += 1;
+                // Greased packets deliberately do not feed the distinct-byte
+                // test: their first byte is drawn from a different range
+                // (`0x00..=0x3f`), so counting them would hand that test a free
+                // second value and let through the flows it exists to reject --
+                // a TURN relay mixing `0x40`-prefixed ChannelData with
+                // `0x00`/`0x01`-prefixed STUN, for one.
+                match self.first_byte {
+                    None => self.first_byte = Some(data[0]),
+                    Some(b) if b != data[0] => self.distinct_seen = true,
+                    _ => {}
+                }
             }
+            Shape::GreasedShortHeader => self.greased += 1,
+            Shape::Other => {}
         }
+    }
+
+    /// Packets credited as QUIC. Greased packets count only once the connection
+    /// has independently shown a real QUIC packet -- see
+    /// [`Shape::GreasedShortHeader`].
+    #[inline]
+    fn matches(&self) -> usize {
+        if self.quic_like == 0 {
+            0
+        } else {
+            self.quic_like + self.greased
+        }
+    }
+
+    /// Upper bound on [`MaybeQuic::matches`] if the rest of the connection
+    /// cooperates. Greased packets already seen become creditable the moment one
+    /// unambiguous QUIC packet arrives, so they must not be written off when
+    /// deciding whether the threshold is still reachable -- otherwise a greasing
+    /// connection whose first two datagrams both have the fixed bit clear is
+    /// dropped before it can prove itself.
+    #[inline]
+    fn reachable_matches(&self) -> usize {
+        self.quic_like + self.greased
     }
 
     /// Resolves the current counts to a `FilterResult`
     fn decide(&self) -> FilterResult {
-        let required = required_short_hdrs();
-        if self.short_hdrs >= required && self.distinct_seen {
+        if self.matches() >= MAYBE_QUIC_REQUIRED_MATCHES && self.distinct_seen {
             return FilterResult::Accept;
         }
         if self.seen >= MAYBE_QUIC_WINDOW {
             // Window exhausted
             return FilterResult::Drop;
         }
-        // Impossible to reach required number of short headers
+        // Impossible to reach the required number of matches
         let remaining = MAYBE_QUIC_WINDOW - self.seen;
-        if self.short_hdrs + remaining < required {
+        if self.reachable_matches() + remaining < MAYBE_QUIC_REQUIRED_MATCHES {
             return FilterResult::Drop;
         }
         // Not enough evidence yet
@@ -120,9 +233,10 @@ impl MaybeQuic {
 
     #[cfg_attr(not(feature = "skip_expand"), filter_fn("MaybeQuic,level=InL4Conn"))]
     pub fn update(&mut self, pdu: &L4Pdu) -> FilterResult {
-        // Drop traffic not on UDP port 443
+        // Drop traffic that isn't UDP on a port QUIC is expected on
         if pdu.ctxt.proto != UDP_PROTOCOL
-            || (pdu.ctxt.src.port() != QUIC_PORT && pdu.ctxt.dst.port() != QUIC_PORT)
+            || !(QUIC_PORTS.contains(&pdu.ctxt.src.port())
+                || QUIC_PORTS.contains(&pdu.ctxt.dst.port()))
         {
             return FilterResult::Drop;
         }
@@ -147,7 +261,7 @@ impl MaybeQuic {
     pub fn terminated(&self) -> FilterResult {
         if self.seen >= MAYBE_QUIC_MIN_PKTS
             && self.distinct_seen
-            && self.short_hdrs as f64 >= self.seen as f64 * MAYBE_QUIC_MIN_FRACTION
+            && self.matches() as f64 >= self.seen as f64 * MAYBE_QUIC_MIN_FRACTION
         {
             FilterResult::Accept
         } else {
@@ -160,20 +274,59 @@ impl MaybeQuic {
 mod tests {
     use super::*;
 
-    #[test]
-    fn short_header_bit_pattern() {
-        assert!(is_quic_short_header(&[0x41, 0x00]));
-        assert!(is_quic_short_header(&[0x40]));
-        assert!(!is_quic_short_header(&[0x00])); // fixed bit clear
-        assert!(!is_quic_short_header(&[0xc0])); // long header (both bits set)
-        assert!(!is_quic_short_header(&[0x80])); // long header
-        assert!(!is_quic_short_header(&[]));
+    /// QUIC v1 long header (Initial), first five bytes: form+fixed bits set,
+    /// then version `0x00000001`.
+    const LONG_HDR_V1: [u8; 5] = [0xc3, 0x00, 0x00, 0x00, 0x01];
+    /// The same long header with the fixed bit greased away (RFC 9287).
+    const LONG_HDR_V1_GREASED: [u8; 5] = [0x83, 0x00, 0x00, 0x00, 0x01];
+
+    /// A fixed-bit-clear short-form datagram long enough to be a greased
+    /// 1-RTT packet.
+    fn greased(first: u8) -> [u8; MIN_1RTT_DATAGRAM_LEN] {
+        let mut buf = [0u8; MIN_1RTT_DATAGRAM_LEN];
+        buf[0] = first;
+        buf
     }
 
     #[test]
-    fn required_short_hdrs_matches_configured_threshold() {
+    fn short_header_bit_pattern() {
+        assert_eq!(classify(&[0x41, 0x00]), Shape::ShortHeader);
+        assert_eq!(classify(&[0x40]), Shape::ShortHeader);
+        assert_eq!(classify(&[0x7f]), Shape::ShortHeader);
+        // Fixed bit clear and too short to be a 1-RTT packet.
+        assert_eq!(classify(&[0x00]), Shape::Other);
+        // Long header, but no room for a version field.
+        assert_eq!(classify(&[0xc0]), Shape::Other);
+        assert_eq!(classify(&[0x80]), Shape::Other);
+        assert_eq!(classify(&[]), Shape::Other);
+    }
+
+    #[test]
+    fn long_header_matches_only_on_a_recognized_version() {
+        assert_eq!(classify(&LONG_HDR_V1), Shape::LongHeader);
+        // The fixed bit may be greased on a long header too; the version
+        // carries the decision.
+        assert_eq!(classify(&LONG_HDR_V1_GREASED), Shape::LongHeader);
+        // QUIC v2 (RFC 9369).
+        assert_eq!(classify(&[0xc0, 0x6b, 0x33, 0x43, 0xcf]), Shape::LongHeader);
+        // RTP: version 2, and the following four bytes are not a QUIC version.
+        assert_eq!(classify(&[0x80, 0x60, 0x12, 0x34, 0x56]), Shape::Other);
+    }
+
+    #[test]
+    fn greased_short_header_needs_room_for_a_1rtt_packet() {
+        assert_eq!(classify(&greased(0x08)), Shape::GreasedShortHeader);
+        // One byte short of the header-protection sampling minimum.
+        assert_eq!(
+            classify(&greased(0x08)[..MIN_1RTT_DATAGRAM_LEN - 1]),
+            Shape::Other
+        );
+    }
+
+    #[test]
+    fn required_matches_derives_from_the_configured_threshold() {
         // 12 * 0.9 = 10.8, so 11 of 12 -- tolerates exactly one stray packet.
-        assert_eq!(required_short_hdrs(), 11);
+        assert_eq!(MAYBE_QUIC_REQUIRED_MATCHES, 11);
     }
 
     #[test]
@@ -249,7 +402,7 @@ mod tests {
     #[test]
     fn decide_accepts_once_a_second_distinct_byte_appears() {
         let mut f = MaybeQuic::new_for_test();
-        for _ in 0..(required_short_hdrs() - 1) {
+        for _ in 0..(MAYBE_QUIC_REQUIRED_MATCHES - 1) {
             f.record(&[0x41]);
         }
         assert!(matches!(f.decide(), FilterResult::Continue));
@@ -257,11 +410,106 @@ mod tests {
         assert!(matches!(f.decide(), FilterResult::Accept));
     }
 
+    #[test]
+    fn long_headers_count_toward_the_threshold() {
+        // A capture that starts mid-handshake: the first datagrams are long
+        // headers. These used to be scored against the connection, dropping it
+        // at the second one.
+        let mut f = MaybeQuic::new_for_test();
+        for _ in 0..4 {
+            f.record(&LONG_HDR_V1);
+            assert!(matches!(f.decide(), FilterResult::Continue));
+        }
+        for b in [0x41, 0x52, 0x4a, 0x5c, 0x43, 0x50, 0x4f] {
+            f.record(&[b]);
+        }
+        // 11 of 11 matched, several distinct first bytes.
+        assert!(matches!(f.decide(), FilterResult::Accept));
+    }
+
+    #[test]
+    fn a_stray_long_header_mid_stream_is_not_held_against_the_connection() {
+        // Handshake packets are still interleaved after 1-RTT traffic begins;
+        // two of them anywhere in the window used to be fatal.
+        let mut f = MaybeQuic::new_for_test();
+        for b in [0x41, 0x52] {
+            f.record(&[b]);
+        }
+        f.record(&LONG_HDR_V1);
+        f.record(&[0x4a]);
+        f.record(&LONG_HDR_V1);
+        assert!(matches!(f.decide(), FilterResult::Continue));
+        for b in [0x5c, 0x43, 0x50, 0x4f, 0x48, 0x5e] {
+            f.record(&[b]);
+        }
+        assert!(matches!(f.decide(), FilterResult::Accept));
+    }
+
+    #[test]
+    fn greased_packets_count_once_the_connection_shows_real_quic() {
+        let mut f = MaybeQuic::new_for_test();
+        // Alternating greased and fixed-bit-set packets, as a connection with
+        // one greasing endpoint looks.
+        for b in [0x41, 0x52, 0x4a, 0x5c, 0x43, 0x50] {
+            f.record(&greased(0x08));
+            f.record(&[b]);
+        }
+        // 12 seen: 6 unambiguous, 6 greased and credited.
+        assert_eq!(f.seen, 12);
+        assert_eq!(f.matches(), 12);
+        assert!(matches!(f.decide(), FilterResult::Accept));
+    }
+
+    #[test]
+    fn greased_packets_alone_are_not_evidence_of_quic() {
+        // STUN pins its top two bits to `00`, and its messages are well over
+        // the 1-RTT minimum. Without a real QUIC packet these earn nothing --
+        // and they must not satisfy the distinct-byte test either.
+        let mut f = MaybeQuic::new_for_test();
+        let mut result = FilterResult::Continue;
+        for b in [0x00, 0x01].into_iter().cycle().take(MAYBE_QUIC_WINDOW) {
+            f.record(&greased(b));
+            result = f.decide();
+        }
+        assert_eq!(f.greased, MAYBE_QUIC_WINDOW);
+        assert_eq!(f.matches(), 0);
+        assert!(!f.distinct_seen);
+        assert!(matches!(result, FilterResult::Drop));
+        assert!(matches!(f.terminated(), FilterResult::Drop));
+    }
+
+    #[test]
+    fn a_greased_opening_does_not_trigger_the_impossibility_drop() {
+        // Both of the first two datagrams have the fixed bit clear -- roughly a
+        // one-in-four opening for a greasing endpoint. Writing them off would
+        // drop the connection here, before any short header arrives.
+        let mut f = MaybeQuic::new_for_test();
+        f.record(&greased(0x08));
+        f.record(&greased(0x08));
+        assert!(matches!(f.decide(), FilterResult::Continue));
+        for b in [0x41, 0x52, 0x4a, 0x5c, 0x43, 0x50, 0x4f, 0x48, 0x5e] {
+            f.record(&[b]);
+        }
+        // 11 seen, 9 unambiguous + 2 greased.
+        assert_eq!(f.matches(), 11);
+        assert!(matches!(f.decide(), FilterResult::Accept));
+    }
+
+    #[test]
+    fn quic_ports_cover_h3_doq_and_the_interop_port() {
+        assert!(QUIC_PORTS.contains(&443));
+        assert!(QUIC_PORTS.contains(&853));
+        assert!(QUIC_PORTS.contains(&4433));
+        assert!(QUIC_PORTS.contains(&8443));
+        assert!(!QUIC_PORTS.contains(&80));
+    }
+
     impl MaybeQuic {
         fn new_for_test() -> Self {
             Self {
                 seen: 0,
-                short_hdrs: 0,
+                quic_like: 0,
+                greased: 0,
                 first_byte: None,
                 distinct_seen: false,
             }
