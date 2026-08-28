@@ -1,15 +1,19 @@
 //! CAPWAP (Control And Provisioning of Wireless Access Points) header parsing.
 //!
-//! Parses the fixed CAPWAP transport header ([RFC 5415](https://datatracker.ietf.org/doc/rfc5415/)
-//! §4.3), shared by both the control channel (UDP port 5246) and the data channel (UDP port
-//! 5247), plus the control header (§4.5.1) when the message is a control message. CAPWAP
-//! payloads -- message elements on the control channel, and 802.11/802.3 frames on the data
-//! channel -- are out of scope and are not extracted.
+//! Parses the cleartext CAPWAP header at the start of a UDP payload, shared by both the
+//! control channel (UDP port 5246) and the data channel (UDP port 5247), plus the control
+//! header ([RFC 5415](https://datatracker.ietf.org/doc/rfc5415/) §4.5.1) when the message is
+//! a control message. CAPWAP payloads -- message elements on the control channel, and
+//! 802.11/802.3 frames on the data channel -- are out of scope and are not extracted.
 //!
-//! CAPWAP optionally tunnels its payload inside DTLS ([RFC 5415] §3, preamble type 1). The
-//! transport header itself is always sent in the clear even when DTLS is in use, so it is
-//! always parsed; the DTLS record that follows it is detected (see [`parser::classify_probe`])
-//! but not decrypted, and no control header is extracted from it.
+//! CAPWAP optionally tunnels its payload inside DTLS ([RFC 5415] §3, preamble type 1). Unlike
+//! protocols that encrypt only the payload after a full cleartext header, a DTLS-encapsulated
+//! CAPWAP packet's cleartext portion is *just* the 4-byte CAPWAP DTLS Header (§4.2) -- HLEN,
+//! RID, WBID, the T/F/L/W/M/K flags, and the Fragment ID/Offset are all inside the encrypted
+//! DTLS record instead, and so are unavailable here (every corresponding accessor reports its
+//! zero/`false`/`None` default for a DTLS-encapsulated message). The DTLS record itself is
+//! detected (see [`parser::classify_probe`]) but not decrypted, and no control header is
+//! extracted from it.
 
 pub mod parser;
 
@@ -167,58 +171,65 @@ impl Capwap {
         self.preamble_type == 1
     }
 
-    /// Returns HLEN: the transport header length in 4-byte words.
+    /// Returns HLEN: the plaintext header length in 4-byte words, or 0 for a
+    /// DTLS-encapsulated message (HLEN is inside the encrypted record -- see the module docs).
     pub fn hlen(&self) -> u8 {
         self.hlen
     }
 
-    /// Returns the Radio ID.
+    /// Returns the Radio ID, or 0 for a DTLS-encapsulated message.
     pub fn rid(&self) -> u8 {
         self.rid
     }
 
-    /// Returns the Wireless Binding ID.
+    /// Returns the Wireless Binding ID, or 0 for a DTLS-encapsulated message.
     pub fn wbid(&self) -> u8 {
         self.wbid
     }
 
-    /// Returns the raw T (payload type) flag from the transport header.
+    /// Returns the raw T (payload type) flag from the plaintext header, or 0 for a
+    /// DTLS-encapsulated message.
     pub fn payload_type(&self) -> u8 {
         self.payload_type
     }
 
     /// Returns `true` if the Fragment (F) flag is set -- the payload is a fragment of a
-    /// larger CAPWAP packet.
+    /// larger CAPWAP packet. Always `false` for a DTLS-encapsulated message.
     pub fn is_fragment(&self) -> bool {
         self.is_fragment
     }
 
-    /// Returns `true` if the Last Fragment (L) flag is set.
+    /// Returns `true` if the Last Fragment (L) flag is set. Always `false` for a
+    /// DTLS-encapsulated message.
     pub fn last_fragment(&self) -> bool {
         self.last_fragment
     }
 
-    /// Returns `true` if the Keep-Alive (K) flag is set (data-channel keep-alive).
+    /// Returns `true` if the Keep-Alive (K) flag is set (data-channel keep-alive). Always
+    /// `false` for a DTLS-encapsulated message.
     pub fn keep_alive(&self) -> bool {
         self.keep_alive
     }
 
-    /// Returns the Fragment ID.
+    /// Returns the Fragment ID, or 0 for a DTLS-encapsulated message.
     pub fn fragment_id(&self) -> u16 {
         self.fragment_id
     }
 
-    /// Returns the Fragment Offset (in 8-byte units, per [RFC 5415]).
+    /// Returns the Fragment Offset (in 8-byte units, per [RFC 5415]), or 0 for a
+    /// DTLS-encapsulated message.
     pub fn fragment_offset(&self) -> u16 {
         self.fragment_offset
     }
 
-    /// Returns the optional Radio MAC Address field, if the M flag was set.
+    /// Returns the optional Radio MAC Address field, if the M flag was set. Always `None` for
+    /// a DTLS-encapsulated message.
     pub fn radio_mac(&self) -> Option<&[u8]> {
         self.radio_mac.as_deref()
     }
 
     /// Returns the optional Wireless Specific Information field, if the W flag was set.
+    /// Always `None` for a DTLS-encapsulated message.
     pub fn wireless_info(&self) -> Option<&[u8]> {
         self.wireless_info.as_deref()
     }
