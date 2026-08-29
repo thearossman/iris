@@ -110,7 +110,8 @@ def plot(rows, title, out_path):
             "'TLS   handshake: ...  payload: ...  of total traffic: ...'."
         )
 
-    names = list(rows.keys())
+    # Columns sorted by total % of transport traffic, largest first.
+    names = sorted(rows.keys(), key=lambda n: sum(rows[n]), reverse=True)
     handshake_vals = [rows[n][0] for n in names]
     payload_vals = [rows[n][1] for n in names]
     totals = [h + p for h, p in zip(handshake_vals, payload_vals)]
