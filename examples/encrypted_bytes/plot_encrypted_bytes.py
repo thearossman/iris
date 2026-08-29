@@ -198,7 +198,7 @@ def plot(rows, out_path):
 
     ax.set_xticks(list(x))
     ax.set_xticklabels(names, color=INK_PRIMARY)
-    ax.set_ylabel("% of total transport traffic", color=INK_PRIMARY)
+    ax.set_ylabel("% of total transport bytes", color=INK_PRIMARY)
 
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)

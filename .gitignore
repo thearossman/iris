@@ -10,3 +10,4 @@ Cargo.lock
 .codex
 *.png
 *.pdf
+__pycache__
