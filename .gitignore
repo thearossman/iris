@@ -8,3 +8,5 @@ Cargo.lock
 *.DS_Store
 .claude
 .codex
+*.png
+*.pdf

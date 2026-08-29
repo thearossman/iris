@@ -198,7 +198,7 @@ def main():
     parser.add_argument(
         "-o",
         "--output",
-        default="encrypted_bytes_chart.png",
+        default="encrypted_bytes_chart.pdf",
         help="Output image path (default: %(default)s)",
     )
     parser.add_argument(
