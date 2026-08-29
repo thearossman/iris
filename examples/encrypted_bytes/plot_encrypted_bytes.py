@@ -11,6 +11,10 @@ traffic" (see `print_proto` in examples/encrypted_bytes/src/main.rs).
 detector's row) are merged into a single "QUIC" column, since they're two
 detection paths for the same protocol.
 
+Any protocol whose own % of total transport traffic is below 1% (configurable
+with `--other-threshold`) is folded into a single "Other" column instead of
+getting its own sliver of a bar.
+
 Requires: matplotlib (`pip install matplotlib`)
 
 Usage:
@@ -40,6 +44,10 @@ LINE_RE = re.compile(
 # Rows merged into a single "QUIC" column -- see module docstring.
 QUIC_ALIASES = ("QUIC", "MaybeQUIC")
 QUIC_MERGED_NAME = "QUIC"
+
+# Rows below this % of total transport traffic are folded into "Other".
+OTHER_THRESHOLD_PCT = 1.0
+OTHER_NAME = "Other"
 
 # Fixed categorical order (palette slots 1 and 2 -- a validated adjacent pair,
 # never reordered/cycled): Payload first (bottom of the stack), Handshake second.
@@ -100,6 +108,29 @@ def parse(text):
         else:
             rows[key] = (handshake_of_total, payload_of_total)
     return rows
+
+
+def group_small(rows, threshold=OTHER_THRESHOLD_PCT):
+    """Fold every row whose total % of transport traffic is below `threshold`
+    into a single combined "Other" row, so a long tail of near-zero protocols
+    doesn't clutter the chart with unreadable slivers.
+
+    Rows are compared and combined on their *total* (handshake + payload);
+    the combined row's handshake/payload split is just the sum of the folded
+    rows' own splits, same as the QUIC/MaybeQUIC merge in `parse`.
+    """
+    kept = OrderedDict()
+    other_handshake = 0.0
+    other_payload = 0.0
+    for name, (handshake, payload) in rows.items():
+        if handshake + payload < threshold:
+            other_handshake += handshake
+            other_payload += payload
+        else:
+            kept[name] = (handshake, payload)
+    if other_handshake or other_payload:
+        kept[OTHER_NAME] = (other_handshake, other_payload)
+    return kept
 
 
 def plot(rows, title, out_path):
@@ -206,6 +237,14 @@ def main():
         default="Encrypted protocol traffic: payload vs. handshake",
         help="Chart title",
     )
+    parser.add_argument(
+        "--other-threshold",
+        type=float,
+        default=OTHER_THRESHOLD_PCT,
+        metavar="PCT",
+        help="Fold protocols below this %% of total transport traffic into a "
+        "single 'Other' column (default: %(default)s). Use 0 to disable.",
+    )
     args = parser.parse_args()
 
     if args.input == "-":
@@ -215,6 +254,7 @@ def main():
             text = f.read()
 
     rows = parse(text)
+    rows = group_small(rows, args.other_threshold)
     plot(rows, args.title, args.output)
 
 
