@@ -15,6 +15,15 @@ Any protocol whose own % of total transport traffic is below 1% (configurable
 with `--other-threshold`) is folded into a single "Other" column instead of
 getting its own sliver of a bar.
 
+A protocol's handshake share is often a small fraction of its own bytes, and
+that share is then scaled again by the protocol's share of total traffic --
+in practice this routinely produces handshake segments a few hundredths to a
+few tenths of a percentage point tall, too thin to render as visible area at
+all. To keep a real, nonzero handshake share from silently disappearing, any
+such segment is floored to a minimum rendered height and paired with a small
+text label giving its true (unfloored) percentage -- see `MIN_VISIBLE_HANDSHAKE_FRAC`
+in `plot()`.
+
 Requires: matplotlib (`pip install matplotlib`)
 
 Usage:
@@ -48,6 +57,13 @@ QUIC_MERGED_NAME = "QUIC"
 # Rows below this % of total transport traffic are folded into "Other".
 OTHER_THRESHOLD_PCT = 1.0
 OTHER_NAME = "Other"
+
+# Any nonzero handshake segment is floored to at least this fraction of the
+# chart's tallest column, so a real-but-tiny handshake share always renders
+# as a visible sliver instead of vanishing under the payload/handshake gap
+# edge. Purely a rendering floor -- the cap label and axis scaling still use
+# the true value; only the drawn bar geometry is exaggerated.
+MIN_VISIBLE_HANDSHAKE_FRAC = 0.008
 
 # Fixed categorical order (palette slots 1 and 2 -- a validated adjacent pair,
 # never reordered/cycled): Payload first (bottom of the stack), Handshake second.
@@ -147,6 +163,17 @@ def plot(rows, out_path):
     payload_vals = [rows[n][1] for n in names]
     totals = [h + p for h, p in zip(handshake_vals, payload_vals)]
 
+    # Floor nonzero handshake segments to a minimum rendered height (see
+    # MIN_VISIBLE_HANDSHAKE_FRAC) so a real handshake share is never drawn as
+    # literally invisible. `rendered_handshake_vals` is for bar geometry only
+    # -- `handshake_vals`/`totals` (the true values) still drive every label.
+    max_total = max(totals) if any(totals) else 1.0
+    min_visible_handshake = max_total * MIN_VISIBLE_HANDSHAKE_FRAC
+    rendered_handshake_vals = [
+        max(h, min_visible_handshake) if h > 0 else 0.0 for h in handshake_vals
+    ]
+    render_tops = [p + rh for p, rh in zip(payload_vals, rendered_handshake_vals)]
+
     # Figure size tracks the column count directly (rather than a wide fixed
     # minimum) so a trace with only a couple of protocols doesn't end up
     # dwarfed by empty canvas on both axes.
@@ -173,7 +200,7 @@ def plot(rows, out_path):
     )
     ax.bar(
         x,
-        handshake_vals,
+        rendered_handshake_vals,
         width=bar_width,
         bottom=payload_vals,
         color=HANDSHAKE_COLOR,
@@ -182,18 +209,41 @@ def plot(rows, out_path):
         label="Handshake",
     )
 
-    # Direct label: each column's total % of transport traffic, on its cap.
-    label_pad = max(totals) * 0.015 if any(totals) else 0.02
-    for xi, total in zip(x, totals):
+    # Direct label: each column's total % of transport traffic, on its cap
+    # (the cap sits at render_top, which is >= the true total whenever the
+    # handshake segment below it got floored).
+    total_label_pad = max_total * 0.045
+    for xi, total, render_top in zip(x, totals, render_tops):
         if total > 0:
             ax.text(
                 xi,
-                total + label_pad,
+                render_top + total_label_pad,
                 f"{total:.2f}%",
                 ha="center",
                 va="bottom",
                 fontsize=9,
                 color=INK_SECONDARY,
+            )
+
+    # Secondary label: the handshake segment's own true % of total traffic,
+    # sitting just above its (possibly floored) sliver -- since the sliver's
+    # rendered height is often exaggerated relative to its real value, the
+    # reader needs the number, not just the area, to read it accurately.
+    handshake_label_pad = max_total * 0.012
+    for xi, handshake, render_top in zip(x, handshake_vals, render_tops):
+        if handshake > 0:
+            # ">2f" rounds anything under 0.01% down to a bare "0.00%", which
+            # reads as "no handshake" -- exactly the misleading impression
+            # this label exists to correct. Say "<0.01%" instead.
+            label = "<0.01%" if handshake < 0.005 else f"{handshake:.2f}%"
+            ax.text(
+                xi,
+                render_top + handshake_label_pad,
+                label,
+                ha="center",
+                va="bottom",
+                fontsize=7,
+                color=HANDSHAKE_COLOR,
             )
 
     ax.set_xticks(list(x))
@@ -209,9 +259,12 @@ def plot(rows, out_path):
     ax.yaxis.grid(True, color=GRIDLINE_COLOR, linewidth=1)
     ax.set_axisbelow(True)
 
-    # Less headroom than a titled chart needs -- just enough for the cap label.
-    top = max(totals) if any(totals) else 1.0
-    ax.set_ylim(0, top * 1.08)
+    # Less headroom than a titled chart needs -- just enough for the two
+    # stacked cap labels (total % and, when present, handshake %). Based on
+    # render_tops (not totals) since a floored handshake sliver can push a
+    # column's rendered cap above its true total.
+    top = max(max(render_tops), max_total)
+    ax.set_ylim(0, top * 1.16)
 
     # Legend: always present with >=2 series -- the dependable identity
     # channel, so the reader never has to color-match unaided.
