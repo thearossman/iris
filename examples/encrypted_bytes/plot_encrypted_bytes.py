@@ -178,7 +178,7 @@ def plot(rows, out_path):
     # minimum) so a trace with only a couple of protocols doesn't end up
     # dwarfed by empty canvas on both axes.
     n = len(names)
-    fig, ax = plt.subplots(figsize=(max(3.5, 1.3 * n), 4.2), dpi=150)
+    fig, ax = plt.subplots(figsize=(max(3.5, 1.3 * n), 3.0), dpi=150)
     fig.patch.set_facecolor(SURFACE_COLOR)
     ax.set_facecolor(SURFACE_COLOR)
 
