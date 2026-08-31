@@ -2,9 +2,19 @@
 
 """Plot bytes_over_time's CSV output as a stacked area chart.
 
-The encrypted protocol series are stacked because they are disjoint protocol buckets. TCP
-and UDP are intentionally not included: those transport totals overlap the protocol series
-(for example, TLS bytes are also TCP bytes), so stacking them would double-count traffic.
+The encrypted protocol series are stacked because they are disjoint protocol buckets.
+
+The `tcp_bytes`/`udp_bytes` transport totals are drawn as well, but as a lightly-shaded
+(TRANSPORT_ALPHA) overlay stacked from zero *over* the protocol stack rather than on top of
+it: they are supersets of the protocol series (TLS bytes are also TCP bytes), so stacking
+them onto the protocol stack would double-count traffic. Stacking TCP and UDP against each
+other is fine -- a connection is one or the other -- so the overlay's upper edge is total
+transport traffic, and the opaque protocol stack showing through it is the encrypted share
+of that traffic. See bytes_over_time's "Column overlap" module docs.
+
+The overlay is drawn only for `--component total`: the transport columns carry no
+handshake/payload split (see main.rs's `TRANSPORT_SERIES`), so overlaying their totals on a
+handshake-only or payload-only protocol stack would compare two different quantities.
 """
 
 import argparse
@@ -24,6 +34,15 @@ PROTOCOLS = [
     ("maybe_quic", "MaybeQUIC"),
     ("maybe_zoom", "MaybeZoom"),
 ]
+
+# CSV column name, legend label. Totals only -- these columns carry no handshake/payload split.
+TRANSPORTS = [
+    ("tcp_bytes", "TCP (all)"),
+    ("udp_bytes", "UDP (all)"),
+]
+
+# Light enough that the opaque protocol stack stays readable through the overlay drawn over it.
+TRANSPORT_ALPHA = 0.5
 
 MINUTES_THRESHOLD_S = 10 * 60
 HOURS_THRESHOLD_S = 3 * 60 * 60
@@ -45,9 +64,11 @@ def parse_figsize(text):
 def read_bytes(path, component):
     offsets = []
     series = {name: [] for name, _ in PROTOCOLS}
+    transport = {name: [] for name, _ in TRANSPORTS}
     required = {"slice_start_s"}
     for name, _ in PROTOCOLS:
         required.update((f"{name}_handshake", f"{name}_payload"))
+    required.update(name for name, _ in TRANSPORTS)
 
     with path.open(newline="") as csv_file:
         reader = csv.DictReader(csv_file)
@@ -71,6 +92,11 @@ def read_bytes(path, component):
                         values[name] = payload
                     else:
                         values[name] = handshake + payload
+                for name, _ in TRANSPORTS:
+                    total = int(row[name])
+                    if total < 0:
+                        raise ValueError("byte counts cannot be negative")
+                    values[name] = total
             except (TypeError, ValueError) as error:
                 raise ValueError(f"invalid data on CSV line {line_number}: {error}") from error
 
@@ -81,8 +107,10 @@ def read_bytes(path, component):
             offsets.append(offset)
             for name, _ in PROTOCOLS:
                 series[name].append(values[name])
+            for name, _ in TRANSPORTS:
+                transport[name].append(values[name])
 
-    return offsets, series
+    return offsets, series, transport
 
 
 def detect_slice_width(offsets):
@@ -137,7 +165,10 @@ def build_parser():
         "--component",
         choices=("total", "handshake", "payload"),
         default="total",
-        help="Byte component to stack (default: total)",
+        help=(
+            "Byte component to stack; the TCP/UDP overlay is drawn only for total "
+            "(default: total)"
+        ),
     )
     parser.add_argument(
         "--figsize",
@@ -157,7 +188,7 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     try:
-        offsets, series = read_bytes(args.csv_path, args.component)
+        offsets, series, transport = read_bytes(args.csv_path, args.component)
     except (OSError, ValueError) as error:
         raise SystemExit(f"error: could not read {args.csv_path}: {error}") from error
 
@@ -175,6 +206,19 @@ def main():
             f"error: {args.csv_path} contains no encrypted {args.component} bytes"
         )
 
+    # The transport columns are handshake+payload totals, so they are only comparable to the
+    # protocol stack when it is a total too -- see the module docstring. Empty buckets are
+    # dropped here for the same reason as the protocol ones (a UDP-free trace, say).
+    transport_plotted = (
+        [
+            (name, label, transport[name])
+            for name, label in TRANSPORTS
+            if any(transport[name])
+        ]
+        if args.component == "total"
+        else []
+    )
+
     slice_width_s = detect_slice_width(offsets)
     # A step series needs a right-hand boundary or its last sample has zero visible width.
     # One-row CSVs do not expose their configured slice width, so give that lone slice a
@@ -185,7 +229,13 @@ def main():
     x_values = [(offset - offsets[0]) / time_divisor for offset in offsets]
     x_values.append(duration_s / time_divisor)
     totals = [sum(values) for values in zip(*(values for _, _, values in plotted))]
-    y_divisor, byte_unit = pick_byte_unit(max(totals))
+    # TCP+UDP is the taller of the two stacks whenever any unencrypted traffic is present, so
+    # both the y-axis units and its limit come from whichever stack actually reaches higher.
+    transport_totals = [
+        sum(values) for values in zip(*(values for _, _, values in transport_plotted))
+    ]
+    y_max = max(max(totals), max(transport_totals, default=0))
+    y_divisor, byte_unit = pick_byte_unit(y_max)
     slice_label = format_slice_width(slice_width_s)
 
     plt.rcParams.update(
@@ -206,15 +256,33 @@ def main():
         alpha=0.9,
     )
 
-    component_label = "" if args.component == "total" else f" {args.component}"
+    # Drawn after (so on top of) the protocol stack, from zero rather than stacked onto it,
+    # and translucent so the protocols underneath stay legible -- see the module docstring.
+    if transport_plotted:
+        ax.stackplot(
+            x_values,
+            *(values + [values[-1]] for _, _, values in transport_plotted),
+            labels=[label for _, label, _ in transport_plotted],
+            step="post",
+            alpha=TRANSPORT_ALPHA,
+        )
+
+    # With the transport overlay in the frame the axis no longer covers encrypted bytes alone.
+    encrypted_prefix = "" if transport_plotted else "encrypted "
+    component_label = "" if args.component == "total" else f"{args.component} "
+    y_label = f"{encrypted_prefix}{component_label}bytes".capitalize()
     ax.set_xlabel(f"Time ({time_unit})")
-    ax.set_ylabel(f"Encrypted{component_label} bytes\nper {slice_label} ({byte_unit})")
+    ax.set_ylabel(f"{y_label}\nper {slice_label} ({byte_unit})")
     ax.yaxis.set_major_formatter(
         FuncFormatter(lambda value, _: f"{value / y_divisor:,.4g}")
     )
-    ax.set_ylim(0, max(totals) * Y_HEADROOM)
+    ax.set_ylim(0, y_max * Y_HEADROOM)
     ax.set_xlim(x_values[0], x_values[-1])
-    ax.legend(loc="upper left", frameon=False, ncol=min(4, len(plotted)))
+    ax.legend(
+        loc="upper left",
+        frameon=False,
+        ncol=min(4, len(plotted) + len(transport_plotted)),
+    )
     fig.tight_layout()
 
     if args.output:
