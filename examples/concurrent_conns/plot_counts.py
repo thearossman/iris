@@ -71,6 +71,39 @@ def trim_warmup_cooldown(offsets, counts, warmup_s, cooldown_s):
     return [t - base for t, _ in kept], [c for _, c in kept]
 
 
+def report_trim(path, raw_offsets, kept_offsets, warmup_mins, cooldown_mins):
+    """Prints what the warmup/cooldown trim actually did, counting each end separately.
+
+    A trim that silently drops nothing is indistinguishable from one that worked, because the
+    kept offsets are re-based to t=0 either way: the axis starts at 0 regardless, so the only
+    visible difference is a shorter run. Saying it outright turns "the flags did nothing" into
+    numbers that can be checked against the run as recorded, and catches the case the trim
+    can't detect on its own -- a slice_start_s column that isn't seconds elapsed since the
+    start of the run, against which both bounds are silently meaningless."""
+    if not warmup_mins and not cooldown_mins:
+        return
+    run_end = raw_offsets[-1]
+    dropped_head = sum(1 for t in raw_offsets if t < warmup_mins * 60)
+    dropped_tail = sum(1 for t in raw_offsets if t > run_end - cooldown_mins * 60)
+    for mins, flag, dropped in (
+        (warmup_mins, "--warmup-mins", dropped_head),
+        (cooldown_mins, "--cooldown-mins", dropped_tail),
+    ):
+        if mins and not dropped:
+            print(
+                f"warning: {flag} {mins:g} dropped no rows. {path}'s slice_start_s column runs "
+                f"{raw_offsets[0]:,.10g}..{run_end:,.10g}, and the trim reads it as seconds "
+                "elapsed since the start of the run."
+            )
+    raw_span = run_end - raw_offsets[0]
+    kept_span = kept_offsets[-1] - kept_offsets[0]
+    print(
+        f"Trimmed a {warmup_mins:g}-minute warmup and a {cooldown_mins:g}-minute cooldown: "
+        f"dropped {dropped_head} rows from the start and {dropped_tail} from the end, "
+        f"plotting {kept_span / 60:.1f} of {raw_span / 60:.1f} minutes."
+    )
+
+
 def detect_slice_width(offsets):
     """The run's slice width in seconds, taken as the median gap between consecutive rows.
     Returns None for a series too short to have a gap."""
@@ -199,6 +232,7 @@ def main():
     unit, divisor = pick_time_unit(offsets[-1])
     slice_width_s = detect_slice_width(offsets)
 
+    raw_offsets = offsets
     offsets, counts = trim_warmup_cooldown(
         offsets, counts, args.warmup_mins * 60, args.cooldown_mins * 60
     )
@@ -208,6 +242,9 @@ def main():
             f"and {args.cooldown_mins:g}-minute cooldown; nothing left to plot."
         )
         return
+    report_trim(
+        args.csv_path, raw_offsets, offsets, args.warmup_mins, args.cooldown_mins
+    )
 
     flows = [count * 2 for count in counts]
     scaled_offsets = [t / divisor for t in offsets]
