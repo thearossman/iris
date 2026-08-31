@@ -9,10 +9,9 @@ connections, and each one is two unidirectional flows (one per five-tuple direct
 
 The figure is laid out for a paper: short and wide by default, since a roughly steady series
 carries its meaning in its level rather than its vertical structure, and zero-based so the
-magnitude claim is honest. The raw per-slice series is drawn faintly underneath a rolling
-mean, which is what stays legible at print size; a dashed line marks the mean level, labelled
-with the exact figure. Large counts are rescaled into thousands or millions on the tick labels
-only, named in the axis label, so gridlines aren't labelled with seven-digit numbers.
+magnitude claim is honest. A dashed line marks the mean level, labelled with the exact figure.
+Large counts carry their unit in the tick label itself ("1K", "2.5M"), so gridlines aren't
+labelled with seven-digit numbers and a reader can name one without consulting the axis label.
 
 `--warmup-mins`/`--cooldown-mins` drop the ends of the run and re-base the remainder to t=0.
 Both ends are measurement artifacts rather than network behavior: conntrack only counts a
@@ -33,11 +32,13 @@ from matplotlib.ticker import FuncFormatter
 MINUTES_THRESHOLD_S = 10 * 60
 HOURS_THRESHOLD_S = 3 * 60 * 60
 
-# Y-axis tick scaling, largest unit first: a series in the millions reads better as ticks of
-# "1,150" against a "(thousands)" axis label than as "1,150,000" repeated up the gridlines.
-Y_UNITS = [
-    (10_000_000, 1_000_000, "millions"),
-    (10_000, 1_000, "thousands"),
+# Y-axis tick suffixes, largest unit first: a series in the millions reads better as ticks of
+# "1.15M" than as "1,150,000" repeated up the gridlines.
+Y_SUFFIXES = [
+    (1_000_000_000_000, "T"),
+    (1_000_000_000, "B"),
+    (1_000_000, "M"),
+    (1_000, "K"),
 ]
 
 # Headroom above the tallest sample, so the mean annotation has somewhere to sit.
@@ -79,23 +80,6 @@ def detect_slice_width(offsets):
     return diffs[len(diffs) // 2]
 
 
-def rolling_mean(values, window):
-    """Centered rolling mean. Windows shrink at the two ends rather than going undefined, so
-    the smoothed line spans the same x range as the raw series instead of stopping short."""
-    if window <= 1:
-        return list(values)
-    half = window // 2
-    cumsum = [0.0]
-    for v in values:
-        cumsum.append(cumsum[-1] + v)
-    out = []
-    for i in range(len(values)):
-        lo = max(0, i - half)
-        hi = min(len(values), i + half + 1)
-        out.append((cumsum[hi] - cumsum[lo]) / (hi - lo))
-    return out
-
-
 def pick_time_unit(duration_s):
     if duration_s > HOURS_THRESHOLD_S:
         return "hours", 3600.0
@@ -104,12 +88,15 @@ def pick_time_unit(duration_s):
     return "seconds", 1.0
 
 
-def pick_y_unit(max_value):
-    """Divisor and unit name for the y-axis, or (1, None) to plot raw counts."""
-    for threshold, divisor, name in Y_UNITS:
-        if max_value >= threshold:
-            return divisor, name
-    return 1, None
+def fmt_y_tick(value):
+    """A y-axis tick label with its unit built in: 100 -> "100", 1_000 -> "1K",
+    2_500_000 -> "2.5M". The scaled value keeps whatever precision it needs rather than being
+    rounded to a fixed width, so a tick is never labelled with a number it isn't."""
+    magnitude = abs(value)
+    for divisor, suffix in Y_SUFFIXES:
+        if magnitude >= divisor:
+            return f"{value / divisor:,.10g}{suffix}"
+    return f"{value:,.10g}"
 
 
 def fmt_sample_label(slice_width_s):
@@ -123,15 +110,6 @@ def fmt_sample_label(slice_width_s):
     if abs(slice_width_s - 60) < 1e-6:
         return "per-minute"
     return f"per {slice_width_s:g}s"
-
-
-def fmt_window(seconds):
-    """Human-readable smoothing window, for the legend entry."""
-    if seconds >= 3600 and seconds % 3600 == 0:
-        return f"{seconds / 3600:g}-hr"
-    if seconds >= 60 and seconds % 60 == 0:
-        return f"{seconds / 60:g}-min"
-    return f"{seconds:g}-s"
 
 
 def place_legend(fig, ax):
@@ -194,13 +172,6 @@ def main():
         help="Minutes to drop from the end of the run (default: 2)",
     )
     parser.add_argument(
-        "--smooth-secs",
-        type=float,
-        default=60.0,
-        help="Width of the rolling-mean window, in seconds; 0 plots the raw series alone "
-        "(default: 60)",
-    )
-    parser.add_argument(
         "--font-size",
         type=float,
         default=14.0,
@@ -242,10 +213,6 @@ def main():
     scaled_offsets = [t / divisor for t in offsets]
     mean_flows = sum(flows) / len(flows)
 
-    window = 1
-    if args.smooth_secs > 0 and slice_width_s:
-        window = max(1, round(args.smooth_secs / slice_width_s))
-
     # Set before the figure is built, so tight_layout below measures the real text extents.
     # Legend text matches the axis text by default, but stays separately settable so either
     # can be nudged without dragging the other along.
@@ -263,37 +230,17 @@ def main():
     )
 
     fig, ax = plt.subplots(figsize=args.figsize)
-    # One hue for the data, so the faint raw series reads as the same series as the mean
-    # line drawn over it rather than as a second quantity.
+    # The default cycle's first hue, so the series reads as the figure's one quantity and the
+    # grey dashed mean line reads as annotation rather than as a second series.
     color = plt.rcParams["axes.prop_cycle"].by_key()["color"][0]
-    if window > 1:
-        # Raw samples stay visible underneath so the smoothing isn't hiding real variance.
-        ax.step(
-            scaled_offsets,
-            flows,
-            where="post",
-            linewidth=0.5,
-            alpha=0.3,
-            color=color,
-            label=fmt_sample_label(slice_width_s),
-        )
-        ax.plot(
-            scaled_offsets,
-            rolling_mean(flows, window),
-            linewidth=1.2,
-            color=color,
-            label=f"{fmt_window(args.smooth_secs)} rolling mean",
-        )
-    else:
-        ax.step(
-            scaled_offsets,
-            flows,
-            where="post",
-            linewidth=0.8,
-            color=color,
-            label=fmt_sample_label(slice_width_s),
-        )
-    y_divisor, y_unit = pick_y_unit(max(flows))
+    ax.step(
+        scaled_offsets,
+        flows,
+        where="post",
+        linewidth=0.8,
+        color=color,
+        label=fmt_sample_label(slice_width_s),
+    )
     ax.axhline(
         mean_flows,
         linestyle="--",
@@ -305,16 +252,13 @@ def main():
         label=f"mean {mean_flows:,.0f}",
     )
 
-    # Wrapped, and the unit kept on its own line: rotated upright, the label's longest line
-    # has to fit the figure's *height*, which is deliberately small here.
-    ylabel = "Active encrypted\nunidirectional flows"
-    if y_unit:
-        ylabel += f"\n({y_unit})"
+    # Wrapped: rotated upright, the label's longest line has to fit the figure's *height*,
+    # which is deliberately small here.
     ax.set_xlabel(f"Time ({unit})")
-    ax.set_ylabel(ylabel)
+    ax.set_ylabel("Active encrypted\nunidirectional flows")
     ax.set_xlim(scaled_offsets[0], scaled_offsets[-1])
     ax.set_ylim(0, max(flows) * Y_HEADROOM)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / y_divisor:,.10g}"))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: fmt_y_tick(v)))
     fig.tight_layout()
     # The series sits near the top of a zero-based axis, so the lower half is free space.
     place_legend(fig, ax)
