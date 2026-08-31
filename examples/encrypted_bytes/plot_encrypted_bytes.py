@@ -209,42 +209,70 @@ def plot(rows, out_path):
         label="Handshake",
     )
 
-    # Direct label: each column's total % of transport traffic, on its cap
-    # (the cap sits at render_top, which is >= the true total whenever the
-    # handshake segment below it got floored).
-    total_label_pad = max_total * 0.045
-    for xi, total, render_top in zip(x, totals, render_tops):
-        if total > 0:
-            ax.text(
-                xi,
-                render_top + total_label_pad,
-                f"{total:.2f}%",
-                ha="center",
-                va="bottom",
-                fontsize=9,
-                color=INK_SECONDARY,
-            )
-
-    # Secondary label: the handshake segment's own true % of total traffic,
-    # sitting just above its (possibly floored) sliver -- since the sliver's
-    # rendered height is often exaggerated relative to its real value, the
-    # reader needs the number, not just the area, to read it accurately.
-    handshake_label_pad = max_total * 0.012
-    for xi, handshake, render_top in zip(x, handshake_vals, render_tops):
+    # Two stacked labels per column, offset in points (not data units) so
+    # their gap stays constant regardless of figure size or the data's
+    # scale -- a fixed fraction of `max_total` would compress right along
+    # with a shorter figure and start overlapping.
+    #
+    # Bottom line, right above the cap: the handshake segment's own true %
+    # of total traffic -- since a real handshake sliver is often floored to
+    # a visible minimum (see MIN_VISIBLE_HANDSHAKE_FRAC), its rendered area
+    # can be exaggerated relative to its real value, so the reader needs
+    # the number, not just the area, to read it accurately.
+    #
+    # Top line: the payload segment's % of total traffic. Pushed up an
+    # extra LABEL_LINE_GAP_PT above the handshake line only when a
+    # handshake line is actually drawn beneath it; otherwise it sits right
+    # above the cap like the handshake line would have.
+    HANDSHAKE_LABEL_OFFSET_PT = 4
+    LABEL_LINE_GAP_PT = 13
+    for xi, payload, handshake, render_top in zip(
+        x, payload_vals, handshake_vals, render_tops
+    ):
         if handshake > 0:
-            # ">2f" rounds anything under 0.01% down to a bare "0.00%", which
-            # reads as "no handshake" -- exactly the misleading impression
-            # this label exists to correct. Say "<0.01%" instead.
+            # ".2f" rounds anything under 0.01% down to a bare "0.00%",
+            # which reads as "no handshake" -- exactly the misleading
+            # impression this label exists to correct. Say "<0.01%" instead.
             label = "<0.01%" if handshake < 0.005 else f"{handshake:.2f}%"
-            ax.text(
-                xi,
-                render_top + handshake_label_pad,
+            ax.annotate(
                 label,
+                xy=(xi, render_top),
+                xytext=(0, HANDSHAKE_LABEL_OFFSET_PT),
+                textcoords="offset points",
                 ha="center",
                 va="bottom",
                 fontsize=7,
                 color=HANDSHAKE_COLOR,
             )
+        payload_offset = HANDSHAKE_LABEL_OFFSET_PT + (
+            LABEL_LINE_GAP_PT if handshake > 0 else 0
+        )
+        if payload > 0:
+            ax.annotate(
+                f"{payload:.2f}%",
+                xy=(xi, render_top),
+                xytext=(0, payload_offset),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                color=PAYLOAD_COLOR,
+            )
+
+    # The labels above are placed in fixed *point* offsets, not data units,
+    # so the axes' data-to-point scale (which depends on figure size) has to
+    # be known before we can size the headroom above the tallest column --
+    # draw once, then grow the y-limit to fit whatever the renderer actually
+    # produced, rather than guessing a fraction of max_total up front.
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    label_tops = [
+        ax.transData.inverted().transform((0, txt.get_window_extent(renderer).ymax))[
+            1
+        ]
+        for txt in ax.texts
+    ]
+    top = max(label_tops, default=max_total)
 
     ax.set_xticks(list(x))
     ax.set_xticklabels(names, color=INK_PRIMARY)
@@ -259,12 +287,9 @@ def plot(rows, out_path):
     ax.yaxis.grid(True, color=GRIDLINE_COLOR, linewidth=1)
     ax.set_axisbelow(True)
 
-    # Less headroom than a titled chart needs -- just enough for the two
-    # stacked cap labels (total % and, when present, handshake %). Based on
-    # render_tops (not totals) since a floored handshake sliver can push a
-    # column's rendered cap above its true total.
-    top = max(max(render_tops), max_total)
-    ax.set_ylim(0, top * 1.16)
+    # A little extra breathing room above the tallest label so its top
+    # doesn't sit flush against the figure edge.
+    ax.set_ylim(0, top * 1.05)
 
     # Legend: always present with >=2 series -- the dependable identity
     # channel, so the reader never has to color-match unaided.
