@@ -12,7 +12,7 @@ use super::transaction::{DnsQuery, DnsResponse};
 use super::Dns;
 use crate::conntrack::pdu::L4Pdu;
 use crate::protocols::stream::{
-    ConnParsable, ParseResult, ParsingState, ProbeResult, Session, SessionData,
+    ConnParsable, GapResult, ParseResult, ParsingState, ProbeResult, Session, SessionData,
 };
 
 use std::collections::HashMap;
@@ -98,6 +98,13 @@ impl ConnParsable for DnsParser {
     /// We consider DNS to not have a "body"
     fn body_offset(&mut self) -> Option<usize> {
         None
+    }
+
+    /// DNS resynchronizes: each segment is parsed as a self-contained message with
+    /// no state carried across segments, so lost bytes cost the messages they
+    /// contained and nothing more.
+    fn on_gap(&mut self, _dir: bool, _nbytes: u32) -> GapResult {
+        GapResult::Resync
     }
 }
 
