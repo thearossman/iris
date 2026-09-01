@@ -9,8 +9,9 @@
 //! most of those drops are silent -- a `bail!`, an early `return`, or a `log::error!` that a
 //! production run has turned off. On a live high-traffic link they are not rare edge cases:
 //!
-//! * A TCP connection is only ever created from a bare SYN (`Conn::new_tcp`). Every packet of
-//!   a flow that was already in progress when the capture started is dropped, forever -- and
+//! * A TCP connection is created from a bare SYN, or from whatever else the `[conntrack]`
+//!   `init_*` policy adopts (`Conn::new_tcp`). With that policy off -- the default -- every
+//!   packet of a flow already in progress when the capture started is dropped, forever, and
 //!   the flows already in progress are exactly the long-lived, high-byte ones.
 //! * Once the connection table is full, new connections are dropped wholesale.
 //! * A connection no subscription still needs is put in a drop state; its later packets are
@@ -59,9 +60,16 @@ pub struct PacketLedger {
     /// No layer-4 context could be parsed: not IPv4/IPv6, not TCP/UDP, a non-first IP
     /// fragment, or truncated. ARP and ICMP land here.
     pub not_transport: Tally,
-    /// TCP frames belonging to a flow whose SYN was never observed. Iris cannot open a
-    /// connection for these, so every one of them is dropped -- including all subsequent
-    /// packets of that flow, which retry (and fail) connection creation one by one.
+    /// TCP frames whose flow Iris would not open a connection for: no bare SYN was observed,
+    /// and the first packet seen was not one the `[conntrack] init_*` policy adopts. Every one
+    /// is dropped -- including all subsequent packets of that flow, which retry (and fail)
+    /// connection creation one by one.
+    ///
+    /// With every `init_*` flag off (the default) this is the historical SYN-only rule, and on
+    /// a live tap it is usually the largest bucket here: the flows already running when the
+    /// capture started are the long-lived, high-byte ones. Enabling adoption moves traffic
+    /// from here into [`Self::tracked_tcp`], so running once with the flags off and once with
+    /// them on measures exactly what adoption recovers.
     pub dropped_no_syn: Tally,
     /// The SYN-ACKs within [`Self::dropped_no_syn`] -- a *subset*, not an extra bucket.
     ///
@@ -94,14 +102,17 @@ pub struct PacketLedger {
     /// timeout, or by the end-of-run drain.
     pub conns_terminated: u64,
     /// Connections removed *without* delivering `L4Terminated`, because they entered a drop
-    /// state first -- most often TCP reassembly giving up after `max_out_of_order` segments
-    /// piled up behind a sequence hole.
+    /// state first.
     ///
     /// This is the expensive one for any application that accumulates per-connection state
     /// and emits it at `L4Terminated`: the connection's whole accumulated total is discarded,
     /// not just the packets that went missing. One dropped packet early in an elephant flow
-    /// can therefore cost every byte that flow ever carried. A live capture with any RX drop
-    /// at all will show a nonzero count here.
+    /// could therefore cost every byte that flow ever carried.
+    ///
+    /// Out-of-order buffer overflow used to be the main way in. Reassembly now abandons the
+    /// unfillable gap and resumes after it (`TCP_OOO_OVERFLOW`, `TCP_REASSEMBLY_GAPS`) rather
+    /// than discarding the connection, so this should stay near zero; a count that climbs
+    /// means some other path is still throwing connections away.
     pub conns_discarded: u64,
 }
 

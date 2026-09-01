@@ -15,6 +15,20 @@ thread_local! {
     pub(crate) static IGNORED_BY_PACKET_FILTER_BYTE: Cell<u64> = const { Cell::new(0) };
     pub(crate) static DROPPED_MIDDLE_OF_CONNECTION_TCP_PKT: Cell<u64> = const { Cell::new(0) };
     pub(crate) static DROPPED_MIDDLE_OF_CONNECTION_TCP_BYTE: Cell<u64> = const { Cell::new(0) };
+    /// Times a per-direction out-of-order buffer hit `max_out_of_order`.
+    pub(crate) static TCP_OOO_OVERFLOW: Cell<u64> = const { Cell::new(0) };
+    /// Sequence-number gaps that reassembly permanently gave up on.
+    pub(crate) static TCP_REASSEMBLY_GAPS: Cell<u64> = const { Cell::new(0) };
+    /// Stream bytes never observed, summed over all abandoned gaps.
+    pub(crate) static TCP_REASSEMBLY_GAP_BYTES: Cell<u64> = const { Cell::new(0) };
+    /// Segments delivered to subscriptions after an abandoned gap.
+    pub(crate) static TCP_SEGMENTS_AFTER_GAP: Cell<u64> = const { Cell::new(0) };
+    /// Segments dropped because the out-of-order buffer could not be drained.
+    pub(crate) static TCP_OOO_SEGMENT_DROPPED: Cell<u64> = const { Cell::new(0) };
+    /// Times the reassembly deadline expired on a connection stalled behind a gap.
+    pub(crate) static TCP_REASSEMBLY_TIMEOUTS: Cell<u64> = const { Cell::new(0) };
+    /// TCP connections adopted from the middle of a stream (no bare SYN observed).
+    pub(crate) static MIDSTREAM_TCP_ADOPTED: Cell<u64> = const { Cell::new(0) };
     pub(crate) static TOTAL_PKT: Cell<u64> = const { Cell::new(0) };
     pub(crate) static TOTAL_BYTE: Cell<u64> = const { Cell::new(0) };
     pub(crate) static TCP_PKT: Cell<u64> = const { Cell::new(0) };

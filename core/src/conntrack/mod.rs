@@ -17,7 +17,7 @@ pub use conn::conn_layers::Layer;
 pub use conn::conn_state::{LayerState, StateTransition, StateTxData};
 pub use conn::ConnInfo;
 
-use self::conn::{Conn, L4Conn};
+use self::conn::{Conn, InitPolicy, L4Conn};
 use self::conn_id::ConnId;
 use self::pdu::{L4Context, L4Pdu};
 use self::timerwheel::TimerWheel;
@@ -141,7 +141,7 @@ where
                 } else if conn.drop_pdu() {
                     conn.info.clear();
                 } else if conn.terminated() {
-                    conn.terminate(subscription);
+                    conn.terminate(subscription, &self.registry);
                     occupied.remove();
                 } else {
                     // Update inactivity timeout
@@ -152,6 +152,20 @@ where
                         ),
                         L4Conn::Udp(_) => self.config.udp_inactivity_timeout,
                     };
+                    // The wheel schedules each connection once, at insert time. A
+                    // deadline that just moved earlier -- a sequence gap opening,
+                    // swapping in the shorter reassembly timeout -- would otherwise
+                    // go unnoticed until the original, much later bucket. Compare
+                    // absolute deadlines, not windows: windows measured from
+                    // different `last_seen_ts` are not comparable, and the initial
+                    // one is `tcp_establish_timeout`, which is shorter than any
+                    // sensible reassembly timeout. Re-inserting supersedes the old
+                    // entry rather than duplicating it.
+                    let (last_seen_ts, window) = (conn.last_seen_ts, conn.inactivity_window);
+                    if self.timerwheel.expire_time(last_seen_ts, window) < conn.scheduled_expiry {
+                        conn.scheduled_expiry =
+                            self.timerwheel.insert(&conn_id, last_seen_ts, window);
+                    }
                 }
             }
             RawEntryMut::Vacant(_) => {
@@ -161,7 +175,8 @@ where
                         TCP_PROTOCOL => Conn::<T>::new_tcp(
                             self.config.tcp_establish_timeout,
                             self.config.max_out_of_order,
-                            &pdu,
+                            self.config.init,
+                            &mut pdu,
                             self.core_id,
                         ),
                         UDP_PROTOCOL => Conn::<T>::new_udp(
@@ -185,7 +200,7 @@ where
                                 .consume_stream(&mut pdu, subscription, &self.registry);
                         }
                         if !conn.remove_from_table() {
-                            self.timerwheel.insert(
+                            conn.scheduled_expiry = self.timerwheel.insert(
                                 &conn_id,
                                 conn.last_seen_ts,
                                 conn.inactivity_window,
@@ -205,8 +220,12 @@ where
                         }
                     } else {
                         // `new_udp` cannot fail and non-TCP/UDP never reaches here, so the
-                        // only way to land in this arm is `new_tcp` refusing a flow whose SYN
-                        // was never observed. See `stats::PacketLedger::dropped_no_syn`.
+                        // only way to land in this arm is `new_tcp` refusing a first packet
+                        // that is neither a bare SYN nor something `InitPolicy` adopts. With
+                        // every `init_*` flag off (the default) that is the historical
+                        // SYN-only rule; turning them on moves traffic from this bucket into
+                        // `tracked_tcp`, and the difference between two runs is exactly what
+                        // adoption bought. See `stats::PacketLedger::dropped_no_syn`.
                         record(Outcome::DroppedNoSyn, bytes);
                         // Sub-tallies, recorded on top of the bucket above rather than
                         // instead of it -- they say *why* the SYN is missing. See the field
@@ -229,7 +248,7 @@ where
     pub(crate) fn drain(&mut self, subscription: &Subscription<T::Subscribed>) {
         log::info!("Draining Connection table");
         for (_, mut conn) in self.table.drain() {
-            conn.terminate(subscription);
+            conn.terminate(subscription, &self.registry);
         }
     }
 
@@ -239,8 +258,22 @@ where
         subscription: &Subscription<T::Subscribed>,
         now: Instant,
     ) {
-        self.timerwheel
-            .check_inactive(&mut self.table, subscription, now);
+        // Destructured for disjoint field borrows: expiry may need to flush
+        // buffered stream data through the parser registry.
+        let ConnTracker {
+            config,
+            registry,
+            table,
+            timerwheel,
+            ..
+        } = self;
+        timerwheel.check_inactive(
+            table,
+            subscription,
+            registry,
+            config.tcp_inactivity_timeout,
+            now,
+        );
     }
 
     /// Clears the parser registry. Used in testing.
@@ -268,6 +301,8 @@ pub(crate) struct TrackerConfig {
     pub(super) tcp_reassembly_timeout: usize,
     /// Frequency to check for inactive streams (in milliseconds).
     pub(super) timeout_resolution: usize,
+    /// Which in-progress TCP connections to adopt when no bare SYN was observed.
+    pub(super) init: InitPolicy,
 }
 
 impl From<&ConnTrackConfig> for TrackerConfig {
@@ -280,6 +315,12 @@ impl From<&ConnTrackConfig> for TrackerConfig {
             tcp_establish_timeout: config.tcp_establish_timeout,
             tcp_reassembly_timeout: config.tcp_reassembly_timeout,
             timeout_resolution: config.timeout_resolution,
+            init: InitPolicy {
+                synack: config.init_synack,
+                fin: config.init_fin,
+                rst: config.init_rst,
+                data: config.init_data,
+            },
         }
     }
 }

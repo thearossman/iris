@@ -246,14 +246,14 @@ pub enum StateTxData<'a> {
 impl<'a> StateTxData<'a> {
     #[doc(hidden)]
     pub fn from_tx(state: &StateTransition, layer: &'a Layer) -> Self {
-        match layer {
-            Layer::L7(layer) => match state {
-                StateTransition::L7OnDisc => Self::L7OnDisc(layer.get_protocol()),
-                StateTransition::L7EndHdrs => {
-                    Self::L7EndHdrs(layer.sessions.last().expect("L7EndHdrs without session"))
-                }
-                _ => Self::Null,
-            },
+        match state {
+            StateTransition::L7OnDisc => Self::L7OnDisc(layer.last_protocol()),
+            // `L7EndHdrs` can legitimately fire with nothing parsed: on termination
+            // when the parser never completed a session, and when a reassembly gap
+            // forces the parser to finalize. `last_session` falls back to an empty
+            // default rather than panicking on a data-quality event.
+            StateTransition::L7EndHdrs => Self::L7EndHdrs(layer.last_session()),
+            _ => Self::Null,
         }
     }
 

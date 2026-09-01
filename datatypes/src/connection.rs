@@ -216,7 +216,7 @@ impl ConnRecord {
 
 impl Tracked for ConnRecord {
     fn new(first_pkt: &L4Pdu) -> Self {
-        let five_tuple = FiveTuple::from_ctxt(&first_pkt.ctxt);
+        let five_tuple = FiveTuple::from_pdu(first_pkt);
         let now = Instant::now();
         Self {
             five_tuple,
@@ -373,6 +373,13 @@ impl Flow {
     ///
     /// This is not the total number of content gaps ever observed, rather, it represents the total
     /// number of gaps remaining in the final state of the connection.
+    ///
+    /// ## Remarks
+    /// This is the *observational* view, computed from unreassembled packets. It
+    /// counts holes in the sequence space regardless of what reassembly did about
+    /// them. For the gaps reassembly actually gave up on -- the bytes no parser or
+    /// subscription ever saw -- use
+    /// [`ReassemblyStats`](crate::ReassemblyStats).
     #[inline]
     pub fn content_gaps(&self) -> u64 {
         self.chunks.len().saturating_sub(1) as u64
@@ -382,6 +389,10 @@ impl Flow {
     ///
     /// This is not the total size of all content gaps ever observed, rather, it represents the
     /// total number of missing bytes in the final state of the connection.
+    ///
+    /// ## Remarks
+    /// See [`Flow::content_gaps`] on how this relates to
+    /// [`ReassemblyStats`](crate::ReassemblyStats).
     #[inline]
     pub fn missed_bytes(&self) -> u64 {
         self.chunks.windows(2).map(|w| w[1].0 - w[0].1).sum::<u32>() as u64

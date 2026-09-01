@@ -27,8 +27,19 @@ nb_memory_channels = 6
 
 [conntrack]
     max_connections = 10_000_000
+    # On overflow Iris abandons the oldest sequence gap and resumes after it; the
+    # connection is retained, so `conns_discarded` in the packet-accounting ledger
+    # should stay near zero.
     max_out_of_order = 500
     timeout_resolution = 100
     udp_inactivity_timeout = 60_000
     tcp_inactivity_timeout = 300_000
+    tcp_reassembly_timeout = 10_000
     tcp_establish_timeout = 5000
+    # Mid-stream adoption. Off here so this config reproduces the historical
+    # SYN-only behavior; flip them on and diff the ledger's `dropped_no_syn`
+    # against `tracked_tcp` to measure what adoption recovers.
+    init_synack = false
+    init_data = false
+    init_fin = false
+    init_rst = false

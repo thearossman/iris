@@ -88,6 +88,7 @@ fn tracker_config() -> TrackerConfig {
         tcp_establish_timeout: 30,
         tcp_reassembly_timeout: 10,
         timeout_resolution: 10,
+        init: Default::default(),
     }
 }
 
@@ -109,6 +110,8 @@ fn init_ctxt() -> L4Context {
         flags: SYN,
         reassembled: false,
         app_offset: None,
+        gap_before: 0,
+        stream_start_unknown: false,
     }
 }
 

@@ -73,6 +73,13 @@ struct Families {
     ignored_by_packet_filter_byte: Family<CoreId, Counter>,
     dropped_middle_of_connection_tcp_pkt: Family<CoreId, Counter>,
     dropped_middle_of_connection_tcp_byte: Family<CoreId, Counter>,
+    tcp_ooo_overflow: Family<CoreId, Counter>,
+    tcp_ooo_segment_dropped: Family<CoreId, Counter>,
+    tcp_reassembly_gaps: Family<CoreId, Counter>,
+    tcp_reassembly_gap_bytes: Family<CoreId, Counter>,
+    tcp_segments_after_gap: Family<CoreId, Counter>,
+    tcp_reassembly_timeouts: Family<CoreId, Counter>,
+    midstream_tcp_adopted: Family<CoreId, Counter>,
     total_pkt: Family<CoreId, Counter>,
     total_byte: Family<CoreId, Counter>,
     tcp_pkt: Family<CoreId, Counter>,
@@ -192,6 +199,48 @@ pub(crate) static STAT_REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         FAMILIES.dropped_middle_of_connection_tcp_byte.clone(),
     );
     r.register_with_unit(
+        "iris_tcp_ooo_overflow",
+        "Number of times a per-direction out-of-order buffer hit max_out_of_order.",
+        Unit::Other("events".to_string()),
+        FAMILIES.tcp_ooo_overflow.clone(),
+    );
+    r.register_with_unit(
+        "iris_tcp_ooo_segment_dropped",
+        "Number of segments dropped because the out-of-order buffer could not be drained.",
+        Unit::Other("pkts".to_string()),
+        FAMILIES.tcp_ooo_segment_dropped.clone(),
+    );
+    r.register_with_unit(
+        "iris_tcp_reassembly_gaps",
+        "Number of TCP sequence gaps reassembly permanently gave up on.",
+        Unit::Other("gaps".to_string()),
+        FAMILIES.tcp_reassembly_gaps.clone(),
+    );
+    r.register_with_unit(
+        "iris_tcp_reassembly_gap",
+        "Number of stream bytes never observed, summed over all abandoned gaps.",
+        Unit::Bytes,
+        FAMILIES.tcp_reassembly_gap_bytes.clone(),
+    );
+    r.register_with_unit(
+        "iris_tcp_segments_after_gap",
+        "Number of segments delivered to subscriptions after an abandoned gap.",
+        Unit::Other("pkts".to_string()),
+        FAMILIES.tcp_segments_after_gap.clone(),
+    );
+    r.register_with_unit(
+        "iris_tcp_reassembly_timeouts",
+        "Number of times the reassembly deadline expired on a gap-stalled connection.",
+        Unit::Other("events".to_string()),
+        FAMILIES.tcp_reassembly_timeouts.clone(),
+    );
+    r.register_with_unit(
+        "iris_midstream_tcp_adopted",
+        "Number of TCP connections adopted from the middle of a stream.",
+        Unit::Other("conns".to_string()),
+        FAMILIES.midstream_tcp_adopted.clone(),
+    );
+    r.register_with_unit(
         "iris_worker_received",
         "Number of total packets received from dpdk.",
         Unit::Other("pkts".to_string()),
@@ -267,6 +316,13 @@ pub(crate) struct PerCorePrometheusStats {
     ignored_by_packet_filter_byte: Counter,
     dropped_middle_of_connection_tcp_pkt: Counter,
     dropped_middle_of_connection_tcp_byte: Counter,
+    tcp_ooo_overflow: Counter,
+    tcp_ooo_segment_dropped: Counter,
+    tcp_reassembly_gaps: Counter,
+    tcp_reassembly_gap_bytes: Counter,
+    tcp_segments_after_gap: Counter,
+    tcp_reassembly_timeouts: Counter,
+    midstream_tcp_adopted: Counter,
     total_pkt: Counter,
     total_byte: Counter,
     tcp_pkt: Counter,
@@ -298,6 +354,22 @@ pub(crate) fn update_thread_local_stats(core: CoreId) {
                 .dropped_middle_of_connection_tcp_byte
                 .get_or_create(&core)
                 .clone(),
+            tcp_ooo_overflow: FAMILIES.tcp_ooo_overflow.get_or_create(&core).clone(),
+            tcp_ooo_segment_dropped: FAMILIES
+                .tcp_ooo_segment_dropped
+                .get_or_create(&core)
+                .clone(),
+            tcp_reassembly_gaps: FAMILIES.tcp_reassembly_gaps.get_or_create(&core).clone(),
+            tcp_reassembly_gap_bytes: FAMILIES
+                .tcp_reassembly_gap_bytes
+                .get_or_create(&core)
+                .clone(),
+            tcp_segments_after_gap: FAMILIES.tcp_segments_after_gap.get_or_create(&core).clone(),
+            tcp_reassembly_timeouts: FAMILIES
+                .tcp_reassembly_timeouts
+                .get_or_create(&core)
+                .clone(),
+            midstream_tcp_adopted: FAMILIES.midstream_tcp_adopted.get_or_create(&core).clone(),
             total_pkt: FAMILIES.total_pkt.get_or_create(&core).clone(),
             total_byte: FAMILIES.total_byte.get_or_create(&core).clone(),
             tcp_pkt: FAMILIES.tcp_pkt.get_or_create(&core).clone(),
@@ -321,6 +393,24 @@ pub(crate) fn update_thread_local_stats(core: CoreId) {
         pr.dropped_middle_of_connection_tcp_byte
             .inc_by(DROPPED_MIDDLE_OF_CONNECTION_TCP_BYTE.get());
         DROPPED_MIDDLE_OF_CONNECTION_TCP_BYTE.set(0);
+        pr.tcp_ooo_overflow.inc_by(TCP_OOO_OVERFLOW.get());
+        TCP_OOO_OVERFLOW.set(0);
+        pr.tcp_ooo_segment_dropped
+            .inc_by(TCP_OOO_SEGMENT_DROPPED.get());
+        TCP_OOO_SEGMENT_DROPPED.set(0);
+        pr.tcp_reassembly_gaps.inc_by(TCP_REASSEMBLY_GAPS.get());
+        TCP_REASSEMBLY_GAPS.set(0);
+        pr.tcp_reassembly_gap_bytes
+            .inc_by(TCP_REASSEMBLY_GAP_BYTES.get());
+        TCP_REASSEMBLY_GAP_BYTES.set(0);
+        pr.tcp_segments_after_gap
+            .inc_by(TCP_SEGMENTS_AFTER_GAP.get());
+        TCP_SEGMENTS_AFTER_GAP.set(0);
+        pr.tcp_reassembly_timeouts
+            .inc_by(TCP_REASSEMBLY_TIMEOUTS.get());
+        TCP_REASSEMBLY_TIMEOUTS.set(0);
+        pr.midstream_tcp_adopted.inc_by(MIDSTREAM_TCP_ADOPTED.get());
+        MIDSTREAM_TCP_ADOPTED.set(0);
         pr.total_pkt.inc_by(TOTAL_PKT.get());
         TOTAL_PKT.set(0);
         pr.total_byte.inc_by(TOTAL_BYTE.get());

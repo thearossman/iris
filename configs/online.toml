@@ -29,12 +29,22 @@ nb_buckets = 512
 
 [conntrack]
 max_connections = 10000000
+# Out-of-order segments buffered per direction. On overflow Iris gives up on the
+# oldest sequence gap and resumes after it; the connection is retained.
 max_out_of_order = 500
 timeout_resolution = 100
 udp_inactivity_timeout = 60000
 tcp_inactivity_timeout = 300000
+# How long to wait for a sequence gap to be filled before giving up on it. On
+# expiry the buffered post-gap data is delivered and the connection continues
+# under tcp_inactivity_timeout.
 tcp_reassembly_timeout = 10000
 tcp_establish_timeout = 5000
+# Track TCP connections if first packet seen is not a bare SYN.
+# init_synack = false
+# init_data = false
+# init_fin = false
+# init_rst = false
 
 [online.prometheus]
 port = 9898

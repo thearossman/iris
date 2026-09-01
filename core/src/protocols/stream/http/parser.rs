@@ -8,7 +8,7 @@ use super::transaction::{HttpRequest, HttpResponse};
 use super::Http;
 use crate::conntrack::pdu::L4Pdu;
 use crate::protocols::stream::{
-    ConnParsable, ParseResult, ParsingState, ProbeResult, Session, SessionData,
+    ConnParsable, GapResult, ParseResult, ParsingState, ProbeResult, Session, SessionData,
 };
 
 use httparse::{Request, EMPTY_HEADER};
@@ -153,5 +153,19 @@ impl ConnParsable for HttpParser {
 
     fn body_offset(&mut self) -> Option<usize> {
         std::mem::take(&mut self.last_body_offset)
+    }
+
+    /// HTTP resynchronizes: `parse` treats each segment independently, so lost
+    /// bytes corrupt no parser state and the next segment beginning with a request
+    /// line or status line parses normally. On a persistent connection this keeps
+    /// yielding transactions after the gap.
+    ///
+    /// Request/response pairing is the one casualty. Advance `current_trans` past
+    /// every outstanding request so a post-gap response is not attributed to a
+    /// pre-gap request whose own response was lost. `pending` is left alone: those
+    /// requests were parsed correctly and are still drained at termination.
+    fn on_gap(&mut self, _dir: bool, _nbytes: u32) -> GapResult {
+        self.current_trans = self.cnt;
+        GapResult::Resync
     }
 }

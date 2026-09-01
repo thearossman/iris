@@ -4,8 +4,8 @@ use super::conn_actions::TrackedActions;
 use super::conn_state::{LayerState, StateTransition};
 use crate::conntrack::Actions;
 use crate::protocols::stream::{
-    ConnParser, ParseResult, ParserRegistry, ParsingState, ProbeRegistryResult, SessionData,
-    SessionProto,
+    ConnParser, GapResult, ParseResult, ParserRegistry, ParsingState, ProbeRegistryResult,
+    SessionData, SessionProto,
 };
 use crate::protocols::Session;
 use crate::L4Pdu;
@@ -222,6 +222,51 @@ impl L7Session {
             _ => self.parser.protocol(),
         }
     }
+
+    /// React to `gap` stream bytes having been permanently lost in direction `dir`
+    /// immediately before the segment about to be processed.
+    ///
+    /// Returns `Some(tx)` if the gap concluded this layer, or `None` if the segment
+    /// should be processed normally.
+    fn handle_gap(&mut self, gap: u32, dir: bool) -> Option<StateTransition> {
+        match self.linfo.state {
+            // Probing post-gap bytes means probing from an arbitrary point in the
+            // stream, where protocol magic can appear by coincidence and parsers
+            // readily return `Certain` on garbage. Conclude discovery failed.
+            LayerState::Discovery => {
+                log::debug!("Gap of {} bytes during protocol discovery; giving up", gap);
+                self.linfo.state = LayerState::None;
+                self.linfo.actions.clear(&Actions::Parse);
+                Some(StateTransition::L7OnDisc)
+            }
+            LayerState::Headers => {
+                if matches!(self.parser.on_gap(dir, gap), GapResult::Resync) {
+                    return None;
+                }
+                // The parser cannot make sense of what follows, but what it already
+                // parsed is still good -- a TLS ClientHello's SNI, HTTP request
+                // headers, completed DNS transactions. Deliver it as a truncated
+                // session and stop parsing.
+                //
+                // `L7EndHdrs` even when nothing was recovered, exactly as
+                // `handle_terminate` and `ParseResult::None` do: `StateTxData`
+                // falls back to an empty session. Re-firing `L7OnDisc` here
+                // instead would deliver protocol discovery twice for one
+                // connection, since it already fired when the parser was chosen.
+                //
+                // Multiple drained sessions collapse to one `L7EndHdrs` for the
+                // last; the rest stay reachable via `Layer::sessions()`. Only HTTP
+                // and DNS produce more than one session per connection and both
+                // resync, so this does not arise in practice.
+                log::debug!("Gap of {} bytes mid-headers; finalizing parser", gap);
+                self.sessions.extend(self.parser.drain_sessions());
+                self.linfo.state = LayerState::None;
+                Some(StateTransition::L7EndHdrs)
+            }
+            // Headers are already parsed; a gap in the body changes nothing here.
+            LayerState::Payload | LayerState::None => None,
+        }
+    }
 }
 
 // Clippy #new_without_default warning for pub types
@@ -301,6 +346,12 @@ impl TrackableLayer for L7Session {
     }
 
     fn process_stream(&mut self, pdu: &mut L4Pdu, registry: &ParserRegistry) -> StateTransition {
+        let gap = pdu.gap_before();
+        if gap > 0 {
+            if let Some(tx) = self.handle_gap(gap, pdu.dir) {
+                return tx;
+            }
+        }
         match self.linfo.state {
             LayerState::Discovery => {
                 match registry.probe_all(pdu) {

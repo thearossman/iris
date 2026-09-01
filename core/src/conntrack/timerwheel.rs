@@ -1,4 +1,6 @@
 use crate::conntrack::{Conn, ConnId};
+use crate::protocols::stream::ParserRegistry;
+use crate::stats::{StatExt, TCP_REASSEMBLY_TIMEOUTS};
 use crate::subscription::{Subscription, Trackable};
 
 use hashlink::linked_hash_map::LinkedHashMap;
@@ -16,8 +18,10 @@ pub(super) struct TimerWheel {
     prev_ts: Instant,
     /// Index of the next bucket to expire.
     next_bucket: usize,
-    /// List of timers.
-    timers: Vec<VecDeque<ConnId>>,
+    /// List of timers. Each entry pairs a connection with the deadline it was
+    /// scheduled for (milliseconds since `start_ts`); see
+    /// [`Conn::scheduled_expiry`].
+    timers: Vec<VecDeque<(ConnId, usize)>>,
 }
 
 impl TimerWheel {
@@ -38,19 +42,31 @@ impl TimerWheel {
         }
     }
 
-    /// Insert a new connection ID into the timerwheel.
+    /// When a connection last seen at `last_seen_ts` expires, in milliseconds since
+    /// the wheel's epoch. Comparable across connections and across time, unlike the
+    /// inactivity window on its own.
+    #[inline]
+    pub(super) fn expire_time(&self, last_seen_ts: Instant, inactivity_window: usize) -> usize {
+        (last_seen_ts - self.start_ts).as_millis() as usize + inactivity_window
+    }
+
+    /// Insert a new connection ID into the timerwheel, returning the deadline the
+    /// entry was filed under. The caller must store it in
+    /// [`Conn::scheduled_expiry`]: an entry whose deadline does not match is treated
+    /// as superseded and discarded on sweep.
     #[inline]
     pub(super) fn insert(
         &mut self,
         conn_id: &ConnId,
         last_seen_ts: Instant,
         inactivity_window: usize,
-    ) {
-        let current_time = (last_seen_ts - self.start_ts).as_millis() as usize;
+    ) -> usize {
+        let expire_time = self.expire_time(last_seen_ts, inactivity_window);
         let period = self.period.as_millis() as usize;
-        let timer_index = ((current_time + inactivity_window) / period) % self.timers.len();
-        log::debug!("Inserting into index: {}, {:?}", timer_index, current_time);
-        self.timers[timer_index].push_back(conn_id.to_owned());
+        let timer_index = (expire_time / period) % self.timers.len();
+        log::debug!("Inserting into index: {}, {:?}", timer_index, expire_time);
+        self.timers[timer_index].push_back((conn_id.to_owned(), expire_time));
+        expire_time
     }
 
     /// Checks for and remove inactive connections.
@@ -59,12 +75,15 @@ impl TimerWheel {
         &mut self,
         table: &mut LinkedHashMap<ConnId, Conn<T>>,
         subscription: &Subscription<T::Subscribed>,
+        registry: &ParserRegistry,
+        tcp_inactivity_timeout: usize,
         now: Instant,
     ) {
         let table_len = table.len();
         if now - self.prev_ts >= self.period {
             self.prev_ts = now;
-            let nb_removed = self.remove_inactive(now, table, subscription);
+            let nb_removed =
+                self.remove_inactive(now, table, subscription, registry, tcp_inactivity_timeout);
             log::debug!(
                 "expired: {} ({})",
                 nb_removed,
@@ -77,6 +96,13 @@ impl TimerWheel {
     /// Removes connections that have been inactive for at least their inactivity window time
     /// period.
     ///
+    /// A connection stalled behind a sequence gap carries the shorter
+    /// `tcp_reassembly_timeout` as its window. When that window expires but the
+    /// connection is not yet inactive by the normal `tcp_inactivity_timeout`, the
+    /// expiry means "this gap is never going to be filled" rather than "this
+    /// connection is over": the gap is abandoned, its buffered data delivered, and
+    /// the connection re-queued under the normal timeout.
+    ///
     /// Returns the number of connections removed.
     #[inline]
     pub(super) fn remove_inactive<T: Trackable>(
@@ -84,10 +110,12 @@ impl TimerWheel {
         now: Instant,
         table: &mut LinkedHashMap<ConnId, Conn<T>>,
         subscription: &Subscription<T::Subscribed>,
+        registry: &ParserRegistry,
+        tcp_inactivity_timeout: usize,
     ) -> usize {
         let period = self.period.as_millis() as usize;
         let nb_buckets = self.timers.len();
-        let mut not_expired: Vec<(usize, ConnId)> = vec![];
+        let mut not_expired: Vec<(usize, ConnId, usize)> = vec![];
         let check_time = (now - self.start_ts).as_millis() as usize / period * period;
 
         let mut cnt_exp = 0;
@@ -107,26 +135,63 @@ impl TimerWheel {
             );
             let list = &mut self.timers[expire_bucket % nb_buckets];
 
-            for conn_id in list.drain(..) {
+            for (conn_id, scheduled_expiry) in list.drain(..) {
                 if let RawEntryMut::Occupied(mut occupied) =
                     table.raw_entry_mut().from_key(&conn_id)
                 {
                     let conn = occupied.get_mut();
+                    if scheduled_expiry != conn.scheduled_expiry {
+                        // Superseded by an earlier re-insert (a sequence gap moved
+                        // the deadline forward). Dropping the stale entry keeps
+                        // exactly one live entry per connection, so rescheduling
+                        // cannot accumulate duplicates over a long-lived connection.
+                        continue;
+                    }
                     let last_seen_time = (conn.last_seen_ts - self.start_ts).as_millis() as usize;
                     log::debug!("Last seen time: {}", last_seen_time);
                     let expire_time = last_seen_time + conn.inactivity_window;
-                    if expire_time < check_time {
-                        cnt_exp += 1;
-                        conn.terminate(subscription);
-                        occupied.remove();
-                    } else {
+                    if expire_time >= check_time {
                         let timer_index = (expire_time / period) % nb_buckets;
-                        not_expired.push((timer_index, conn_id));
+                        conn.scheduled_expiry = expire_time;
+                        not_expired.push((timer_index, conn_id, expire_time));
+                        continue;
                     }
+
+                    // The reassembly deadline, not inactivity: give up on the gap
+                    // and keep the connection under the normal timeout.
+                    if conn.has_pending_gap()
+                        && last_seen_time + tcp_inactivity_timeout >= check_time
+                    {
+                        TCP_REASSEMBLY_TIMEOUTS.inc();
+                        conn.recover_gaps(subscription, registry);
+                        if conn.remove_from_table() {
+                            // A subscription lost interest during the flush.
+                            occupied.remove();
+                        } else if conn.terminated() {
+                            // Skipping the gap let `next_seq` catch up with
+                            // `last_ack`, so the FIN/ACK sequence is now complete.
+                            // Such a connection could never terminate naturally
+                            // while the gap stood.
+                            cnt_exp += 1;
+                            conn.terminate(subscription, registry);
+                            occupied.remove();
+                        } else {
+                            conn.inactivity_window = tcp_inactivity_timeout;
+                            let expire_time = last_seen_time + tcp_inactivity_timeout;
+                            let timer_index = (expire_time / period) % nb_buckets;
+                            conn.scheduled_expiry = expire_time;
+                            not_expired.push((timer_index, conn_id, expire_time));
+                        }
+                        continue;
+                    }
+
+                    cnt_exp += 1;
+                    conn.terminate(subscription, registry);
+                    occupied.remove();
                 }
             }
-            for (timer_index, conn_id) in not_expired.drain(..) {
-                self.timers[timer_index].push_back(conn_id);
+            for (timer_index, conn_id, expire_time) in not_expired.drain(..) {
+                self.timers[timer_index].push_back((conn_id, expire_time));
             }
         }
         self.next_bucket = last_expire_bucket;

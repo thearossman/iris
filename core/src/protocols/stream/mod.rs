@@ -63,6 +63,20 @@ pub(crate) enum ParseResult {
     None,
 }
 
+/// Whether a parser can keep making sense of a stream after data was lost.
+///
+/// Reassembly gives up on sequence gaps rather than discarding connections (see
+/// `ConnTrackConfig::max_out_of_order`), so a parser can be handed a segment that
+/// is not byte-contiguous with the previous one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GapResult {
+    /// The parser can resynchronize and continue parsing subsequent segments.
+    Resync,
+    /// The parser's state is unrecoverable. Whatever it has parsed so far is
+    /// delivered as a truncated session and parsing stops.
+    Unrecoverable,
+}
+
 /// Represents the result of a probing one packet as a protocol message type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeResult {
@@ -155,6 +169,18 @@ pub(crate) trait ConnParsable {
     /// where application-layer body begins. Some and non-zero if a payload contains
     /// both header and body data. Clears the offset after access.
     fn body_offset(&mut self) -> Option<usize>;
+
+    /// Notify the parser that `nbytes` of stream data in direction `dir` were
+    /// permanently lost immediately before the next segment, and ask whether it can
+    /// keep going.
+    ///
+    /// Defaults to [`GapResult::Unrecoverable`], which is the safe answer for any
+    /// parser that buffers across segments or relies on length-delimited framing:
+    /// feeding it post-gap bytes as though they were contiguous yields silent
+    /// garbage. Override only where resynchronization is genuinely sound.
+    fn on_gap(&mut self, _dir: bool, _nbytes: u32) -> GapResult {
+        GapResult::Unrecoverable
+    }
 }
 
 /// Data required to filter on Five-Tuple fields after the first packet.
@@ -381,6 +407,21 @@ impl ConnParser {
             ConnParser::Ike(parser) => parser.session_parsed_state(),
             ConnParser::Capwap(parser) => parser.session_parsed_state(),
             ConnParser::Unknown => ParsingState::Stop,
+        }
+    }
+
+    /// See [`ConnParsable::on_gap`].
+    pub(crate) fn on_gap(&mut self, dir: bool, nbytes: u32) -> GapResult {
+        match self {
+            ConnParser::Tls(parser) => parser.on_gap(dir, nbytes),
+            ConnParser::Dns(parser) => parser.on_gap(dir, nbytes),
+            ConnParser::Http(parser) => parser.on_gap(dir, nbytes),
+            ConnParser::Quic(parser) => parser.on_gap(dir, nbytes),
+            ConnParser::Ssh(parser) => parser.on_gap(dir, nbytes),
+            ConnParser::Wireguard(parser) => parser.on_gap(dir, nbytes),
+            ConnParser::Ike(parser) => parser.on_gap(dir, nbytes),
+            ConnParser::Capwap(parser) => parser.on_gap(dir, nbytes),
+            ConnParser::Unknown => GapResult::Unrecoverable,
         }
     }
 
