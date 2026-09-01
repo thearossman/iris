@@ -2,9 +2,12 @@ use crate::conntrack::conn::conn_info::ConnInfo;
 use crate::conntrack::pdu::L4Pdu;
 use crate::protocols::packet::tcp::{ACK, FIN, RST, SYN};
 use crate::protocols::stream::ParserRegistry;
+use crate::stats::{
+    StatExt, TCP_OOO_OVERFLOW, TCP_OOO_SEGMENT_DROPPED, TCP_REASSEMBLY_GAPS,
+    TCP_REASSEMBLY_GAP_BYTES, TCP_SEGMENTS_AFTER_GAP,
+};
 use crate::subscription::{Subscription, Trackable};
 
-use anyhow::{bail, Result};
 use std::collections::VecDeque;
 
 /// Represents a uni-directional TCP flow
@@ -21,6 +24,9 @@ pub(crate) struct TcpFlow {
     pub(crate) ooo_buf: OutOfOrderBuffer,
     /// Number observed (not necessarily reassembled) packets
     pub(crate) observed: usize,
+    /// The start of this flow's stream was never observed, so the number of
+    /// bytes missing before the first delivered segment is unknown.
+    pub(crate) start_unknown: bool,
 }
 
 impl TcpFlow {
@@ -33,6 +39,7 @@ impl TcpFlow {
             consumed_flags: 0,
             ooo_buf: OutOfOrderBuffer::new(capacity),
             observed: 0,
+            start_unknown: false,
         }
     }
 
@@ -46,12 +53,16 @@ impl TcpFlow {
             consumed_flags: flags,
             ooo_buf: OutOfOrderBuffer::new(capacity),
             observed: 1,
+            start_unknown: false,
         }
     }
 
     /// Attempt to insert incoming data segment into flow.
     /// Buffer future segments and drop old segments.
-    /// Shunts TcpStream if the incoming segment causes out-of-order buffer overflow
+    ///
+    /// If the out-of-order buffer is full, reassembly gives up on a sequence gap
+    /// (see [`TcpFlow::skip_gap`]) rather than discarding the connection. The
+    /// arriving segment takes part in that decision, so no re-dispatch is needed.
     #[inline]
     pub(super) fn insert_segment<T: Trackable>(
         &mut self,
@@ -60,10 +71,11 @@ impl TcpFlow {
         subscription: &Subscription<T::Subscribed>,
         registry: &ParserRegistry,
     ) {
-        let length = segment.length() as u32;
-        let cur_seq = segment.seq_no();
         self.observed += 1;
         segment.ctxt.reassembled = true;
+
+        let length = segment.length() as u32;
+        let cur_seq = segment.seq_no();
 
         if let Some(next_seq) = self.next_seq {
             if next_seq == cur_seq {
@@ -82,7 +94,7 @@ impl TcpFlow {
                 self.flush_ooo_buffer::<T>(expected_seq, info, subscription, registry);
             } else if wrapping_lt(next_seq, cur_seq) {
                 // Segment comes after the next expected segment
-                self.buffer_ooo_seg(segment, info);
+                self.buffer_ooo_seg(segment, info, subscription, registry);
             } else if let Some(expected_seq) = overlap(&mut segment, next_seq) {
                 // Segment starts before the next expected segment but has new data
                 self.consumed_flags |= segment.flags();
@@ -99,30 +111,114 @@ impl TcpFlow {
                 segment.mark_no_payload();
                 drop(segment);
             }
-        } else {
+        } else if segment.flags() & (SYN | ACK) != 0 {
             // expecting SYNACK in response to the originator's SYN
-            if segment.flags() & (SYN | ACK) != 0 {
-                let expected_seq = cur_seq.wrapping_add(1 + length);
-                self.next_seq = Some(expected_seq);
-                self.consumed_flags |= segment.flags();
-                self.last_ack = Some(segment.ack_no());
-                info.consume_stream(&mut segment, subscription, registry);
-                self.flush_ooo_buffer::<T>(expected_seq, info, subscription, registry);
-            } else {
-                // Buffer out-of-order non-SYNACK packets
-                self.buffer_ooo_seg(segment, info);
-            }
+            let expected_seq = cur_seq.wrapping_add(1 + length);
+            self.next_seq = Some(expected_seq);
+            self.consumed_flags |= segment.flags();
+            self.last_ack = Some(segment.ack_no());
+            info.consume_stream(&mut segment, subscription, registry);
+            self.flush_ooo_buffer::<T>(expected_seq, info, subscription, registry);
+        } else {
+            // Buffer out-of-order non-SYNACK packets
+            self.buffer_ooo_seg(segment, info, subscription, registry);
         }
     }
 
-    /// Insert packet into ooo buffer and handle overflow
+    /// Insert packet into the ooo buffer.
+    ///
+    /// On overflow, give up on a sequence gap to free at least one slot. The
+    /// arriving segment is buffered *first*, so it competes as a resume point:
+    /// skipping past data already in hand would lose more of the stream than
+    /// necessary. The buffer therefore sits one segment over capacity for the
+    /// duration of the skip, which then flushes at least one segment out.
     #[inline]
-    fn buffer_ooo_seg<T: Trackable>(&mut self, segment: L4Pdu, info: &mut ConnInfo<T>) {
-        if self.ooo_buf.insert_back(segment).is_err() {
-            log::warn!("Out-of-order buffer overflow");
-            // Drop the connection
-            info.exec_drop();
+    fn buffer_ooo_seg<T: Trackable>(
+        &mut self,
+        segment: L4Pdu,
+        info: &mut ConnInfo<T>,
+        subscription: &Subscription<T::Subscribed>,
+        registry: &ParserRegistry,
+    ) {
+        let full = self.ooo_buf.is_full();
+        self.ooo_buf.insert_back(segment);
+        if !full {
+            return;
         }
+        log::debug!("Out-of-order buffer full; abandoning oldest sequence gap");
+        TCP_OOO_OVERFLOW.inc();
+        if !self.skip_gap(info, subscription, registry) {
+            // No progress possible: the connection was dropped mid-flush, so
+            // `skip_gap` left the buffer untouched. Restore the capacity invariant
+            // by discarding the newest segment only.
+            if let Some(mut segment) = self.ooo_buf.buf.pop_back() {
+                segment.mark_no_payload();
+            }
+            TCP_OOO_SEGMENT_DROPPED.inc();
+        }
+    }
+
+    /// Permanently give up on the sequence gap in front of this flow: resume at the
+    /// lowest buffered sequence number and flush everything that becomes contiguous.
+    ///
+    /// The number of skipped bytes is recorded on the flow and stamped onto the
+    /// resuming segment as [`L4Pdu::gap_before`], so parsers and subscriptions can
+    /// tell that the stream is no longer byte-contiguous.
+    ///
+    /// Returns `true` if the buffer made progress.
+    #[inline]
+    pub(super) fn skip_gap<T: Trackable>(
+        &mut self,
+        info: &mut ConnInfo<T>,
+        subscription: &Subscription<T::Subscribed>,
+        registry: &ParserRegistry,
+    ) -> bool {
+        if info.drop() {
+            return false;
+        }
+        let seqs: Vec<u32> = self.ooo_buf.buf.iter().map(|s| s.seq_no()).collect();
+        // With no expected sequence number yet, the lowest buffered segment becomes
+        // the stream start. Nothing is "skipped": the size of the missing prefix is
+        // unknowable, so the gap is zero and the flow is flagged instead.
+        let start_unknown = self.next_seq.is_none();
+        let (resume_seq, gap) = match self.next_seq {
+            Some(next_seq) => match select_resume_seq(next_seq, &seqs) {
+                Some(resume) => resume,
+                None => return false,
+            },
+            None => match lowest_seq(&seqs) {
+                Some(seq) => (seq, 0),
+                None => return false,
+            },
+        };
+
+        self.start_unknown |= start_unknown;
+        TCP_REASSEMBLY_GAPS.inc();
+        TCP_REASSEMBLY_GAP_BYTES.inc_by(u64::from(gap));
+        log::debug!(
+            "Abandoning sequence gap of {} bytes; resuming at {}",
+            gap,
+            resume_seq
+        );
+
+        // Stamp the resuming segment so the gap is visible downstream. Exactly one:
+        // `flush_ordered` scans from the front, so the first segment at `resume_seq`
+        // is the one it will consume. Stamping duplicate retransmissions too would
+        // double-count the same gap in any subscription that survives the overlap
+        // check and sees a second marked segment.
+        if let Some(seg) = self
+            .ooo_buf
+            .buf
+            .iter_mut()
+            .find(|s| s.seq_no() == resume_seq)
+        {
+            seg.ctxt.gap_before = gap;
+            TCP_SEGMENTS_AFTER_GAP.inc();
+        }
+
+        self.next_seq = Some(resume_seq);
+        self.flush_ooo_buffer::<T>(resume_seq, info, subscription, registry);
+        true
     }
 
     /// Flushes the flow's out-of-order buffer given the next expected
@@ -172,6 +268,11 @@ impl OutOfOrderBuffer {
         self.buf.is_empty()
     }
 
+    /// Buffer is at capacity; the next insert would overflow.
+    pub(crate) fn is_full(&self) -> bool {
+        self.len() >= self.capacity
+    }
+
     /// Returns the number of elements in the buffer
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
@@ -179,15 +280,13 @@ impl OutOfOrderBuffer {
     }
 
     /// Inserts segment at the end of the buffer.
-    fn insert_back(&mut self, segment: L4Pdu) -> Result<()> {
+    ///
+    /// Capacity is enforced by the caller via [`OutOfOrderBuffer::is_full`]:
+    /// [`TcpFlow::buffer_ooo_seg`] deliberately exceeds it by one segment while it
+    /// decides which sequence gap to abandon.
+    fn insert_back(&mut self, segment: L4Pdu) {
         log::debug!("insert with seq : {:#?}", segment.seq_no());
-        if self.len() >= self.capacity {
-            // // must clear to drop buffered Mbufs
-            // self.buf.clear();
-            bail!("Out-of-order buffer overflow.");
-        }
         self.buf.push_back(segment);
-        Ok(())
     }
 
     /// Consumes segments with expected data, retains segments with future data,
@@ -243,12 +342,43 @@ impl OutOfOrderBuffer {
                     log::debug!("Dropping old segment during flush.");
                     segment.mark_no_payload();
                     drop(segment);
-                    index += 1;
                 }
             }
         }
         next_seq
     }
+}
+
+/// Pick the sequence number at which to resume after abandoning a gap.
+///
+/// Given the next expected sequence number and the sequence numbers of the
+/// currently buffered out-of-order segments, returns the lowest buffered sequence
+/// number that lies ahead of `next_seq`, paired with the number of bytes skipped
+/// to reach it. Returns `None` when nothing buffered is ahead of `next_seq`, in
+/// which case skipping would make no progress.
+///
+/// Kept free of `L4Pdu` so the wrapping arithmetic is unit-testable without DPDK.
+pub(crate) fn select_resume_seq(next_seq: u32, seqs: &[u32]) -> Option<(u32, u32)> {
+    let resume = seqs
+        .iter()
+        .copied()
+        .filter(|seq| wrapping_lt(next_seq, *seq))
+        .reduce(|acc, seq| if wrapping_lt(seq, acc) { seq } else { acc })?;
+    Some((resume, resume.wrapping_sub(next_seq)))
+}
+
+/// The lowest of `seqs` under TCP's wrapping order, or `None` if empty.
+///
+/// Used when a flow has no expected sequence number yet -- the responder of an
+/// adopted mid-stream connection -- where every buffered segment is a candidate
+/// stream start and the earliest one loses the least data. `select_resume_seq`
+/// cannot serve here: it is a *strict* comparison against a basis sequence number,
+/// so it would exclude that basis from its own candidate set and, with a single
+/// buffered segment, never make progress at all.
+pub(crate) fn lowest_seq(seqs: &[u32]) -> Option<u32> {
+    seqs.iter()
+        .copied()
+        .reduce(|acc, seq| if wrapping_lt(seq, acc) { seq } else { acc })
 }
 
 pub fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
@@ -283,5 +413,88 @@ fn overlap(segment: &mut L4Pdu, expected_seq: u32) -> Option<u32> {
         Some(end_seq)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_select_resume_seq_empty_buffer() {
+        assert_eq!(select_resume_seq(1000, &[]), None);
+    }
+
+    #[test]
+    fn core_select_resume_seq_all_stale() {
+        // Everything buffered is at or behind the expected sequence number, so
+        // skipping the gap would not advance the stream.
+        assert_eq!(select_resume_seq(1000, &[1000, 900, 500]), None);
+    }
+
+    #[test]
+    fn core_select_resume_seq_single_future_segment() {
+        assert_eq!(select_resume_seq(1000, &[1500]), Some((1500, 500)));
+    }
+
+    #[test]
+    fn core_select_resume_seq_picks_minimum() {
+        // The minimal skip is the right one: resume as early as the buffer allows.
+        assert_eq!(
+            select_resume_seq(1000, &[4000, 1200, 9000, 1500]),
+            Some((1200, 200))
+        );
+    }
+
+    #[test]
+    fn core_select_resume_seq_ignores_stale_among_future() {
+        assert_eq!(
+            select_resume_seq(1000, &[800, 2000, 1000, 1400]),
+            Some((1400, 400))
+        );
+    }
+
+    #[test]
+    fn core_select_resume_seq_wraps_around_zero() {
+        // Expected sequence number near the top of the space; buffered segments
+        // have already wrapped past 2^32.
+        let next_seq = u32::MAX - 99;
+        assert_eq!(select_resume_seq(next_seq, &[400, 50]), Some((50, 150)));
+    }
+
+    #[test]
+    fn core_lowest_seq_empty() {
+        assert_eq!(lowest_seq(&[]), None);
+    }
+
+    #[test]
+    fn core_lowest_seq_single() {
+        // The one-segment case that matters: a flow with no expected sequence
+        // number must be able to adopt its only buffered segment as the stream
+        // start. `select_resume_seq` cannot, because its comparison is strict.
+        assert_eq!(lowest_seq(&[1500]), Some(1500));
+        assert_eq!(select_resume_seq(1500, &[1500]), None);
+    }
+
+    #[test]
+    fn core_lowest_seq_ignores_arrival_order() {
+        // Segments are buffered in arrival order, not sequence order, so the front
+        // of the buffer is no guide to the lowest sequence number.
+        assert_eq!(lowest_seq(&[9000, 1200, 4000, 1500]), Some(1200));
+    }
+
+    #[test]
+    fn core_lowest_seq_wraps_around_zero() {
+        assert_eq!(lowest_seq(&[50, u32::MAX - 99, 400]), Some(u32::MAX - 99));
+    }
+
+    #[test]
+    fn core_select_resume_seq_stale_across_wrap() {
+        // A segment just behind a wrapped `next_seq` must not be treated as future.
+        let next_seq = 100u32;
+        assert_eq!(
+            select_resume_seq(next_seq, &[u32::MAX - 10, 900]),
+            Some((900, 800))
+        );
     }
 }

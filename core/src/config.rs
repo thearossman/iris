@@ -670,8 +670,18 @@ pub struct ConnTrackConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
-    /// Maximum number of out-of-order packets allowed per TCP connection before it is force
-    /// expired. Defaults to `100`.
+    /// Maximum number of out-of-order segments buffered **per direction** of a TCP
+    /// connection. Defaults to `100`.
+    ///
+    /// This bounds reassembly memory: a connection holds at most `2 * max_out_of_order`
+    /// buffered segments. When a direction's buffer is full, Iris permanently gives up on
+    /// the oldest sequence-number gap, resumes reassembly at the lowest buffered sequence
+    /// number, and records the skipped bytes. The connection itself is retained, so
+    /// connection-level analysis and any already-parsed application-layer data are still
+    /// delivered.
+    ///
+    /// Segments delivered immediately after an abandoned gap are marked with
+    /// [`L4Pdu::gap_before`](crate::conntrack::pdu::L4Pdu::gap_before).
     #[serde(default = "default_max_out_of_order")]
     pub max_out_of_order: usize,
 

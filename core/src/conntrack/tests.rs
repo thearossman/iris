@@ -108,6 +108,7 @@ fn init_ctxt() -> L4Context {
         flags: SYN,
         reassembled: false,
         app_offset: None,
+        gap_before: 0,
     }
 }
 
