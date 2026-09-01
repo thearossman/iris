@@ -1,6 +1,6 @@
 use crate::conntrack::conn::conn_info::ConnInfo;
 use crate::conntrack::pdu::L4Pdu;
-use crate::protocols::packet::tcp::{ACK, FIN, RST, SYN};
+use crate::protocols::packet::tcp::{FIN, RST, SYN};
 use crate::protocols::stream::ParserRegistry;
 use crate::stats::{
     StatExt, TCP_OOO_OVERFLOW, TCP_OOO_SEGMENT_DROPPED, TCP_REASSEMBLY_GAPS,
@@ -106,10 +106,7 @@ impl TcpFlow {
                     info.consume_stream(&mut segment, subscription, registry);
                     return;
                 }
-                let mut expected_seq = cur_seq.wrapping_add(length);
-                if segment.flags() & FIN != 0 {
-                    expected_seq = cur_seq.wrapping_add(1);
-                }
+                let expected_seq = seq_after(cur_seq, length, segment.flags());
                 info.consume_stream(&mut segment, subscription, registry);
                 self.last_ack = Some(segment.ack_no());
                 self.flush_ooo_buffer::<T>(expected_seq, info, subscription, registry);
@@ -143,13 +140,10 @@ impl TcpFlow {
             // A SYN is the exception worth catching: it carries this flow's ISN, so
             // one arriving late -- reordered behind the SYN/ACK we adopted on --
             // tells us exactly where the stream began, and the start is no longer
-            // unknown. `expected_seq` below already charges the SYN its sequence
-            // number, so only the flags change.
+            // unknown. `seq_after` already charges the SYN its sequence number, so
+            // only the flags change.
             let start_known = segment.flags() & SYN != 0;
-            let mut expected_seq = cur_seq.wrapping_add(length);
-            if segment.flags() & (SYN | FIN) != 0 {
-                expected_seq = expected_seq.wrapping_add(1);
-            }
+            let expected_seq = seq_after(cur_seq, length, segment.flags());
             self.next_seq = Some(expected_seq);
             self.start_unknown = !start_known;
             self.consumed_flags |= segment.flags();
@@ -157,16 +151,22 @@ impl TcpFlow {
             segment.ctxt.stream_start_unknown = !start_known;
             info.consume_stream(&mut segment, subscription, registry);
             self.flush_ooo_buffer::<T>(expected_seq, info, subscription, registry);
-        } else if segment.flags() & (SYN | ACK) != 0 {
-            // expecting SYNACK in response to the originator's SYN
-            let expected_seq = cur_seq.wrapping_add(1 + length);
+        } else if segment.flags() & SYN != 0 {
+            // The SYN/ACK responding to the originator's SYN. Tested on SYN alone:
+            // `SYN | ACK` also matches a bare ACK, which would take this arm if it
+            // arrived before the SYN/ACK and be charged a sequence number for a SYN
+            // that is not there, leaving `next_seq` one past the truth for the rest
+            // of the flow.
+            let expected_seq = seq_after(cur_seq, length, segment.flags());
             self.next_seq = Some(expected_seq);
             self.consumed_flags |= segment.flags();
             self.last_ack = Some(segment.ack_no());
             info.consume_stream(&mut segment, subscription, registry);
             self.flush_ooo_buffer::<T>(expected_seq, info, subscription, registry);
         } else {
-            // Buffer out-of-order non-SYNACK packets
+            // Buffer anything else until the SYN/ACK fixes this flow's sequence
+            // origin. That includes a bare ACK arriving early: it carries no
+            // stream position we can trust yet.
             self.buffer_ooo_seg(segment, info, subscription, registry);
         }
     }
@@ -368,10 +368,7 @@ impl OutOfOrderBuffer {
                     info.consume_stream(&mut segment, subscription, registry);
                     return next_seq;
                 }
-                next_seq = next_seq.wrapping_add(segment.length() as u32);
-                if segment.flags() & FIN != 0 {
-                    next_seq = next_seq.wrapping_add(1);
-                }
+                next_seq = seq_after(next_seq, segment.length() as u32, segment.flags());
                 info.consume_stream(&mut segment, subscription, registry);
                 *last_ack = Some(segment.ack_no());
                 index = 0;
@@ -428,6 +425,31 @@ pub(crate) fn lowest_seq(seqs: &[u32]) -> Option<u32> {
         .reduce(|acc, seq| if wrapping_lt(seq, acc) { seq } else { acc })
 }
 
+/// The sequence number one past the last byte a segment occupies.
+///
+/// TCP's sequence space is not just payload: a SYN and a FIN each consume a
+/// sequence number of their own *in addition to* any data the segment carries, so
+/// a FIN that arrives with a payload advances the stream by `length + 1`.
+///
+/// Every site that moves a flow's `next_seq` past a consumed segment shares this
+/// definition. They have to: a segment can reach `consume_stream` either directly
+/// from [`TcpFlow::insert_segment`] or later out of the out-of-order buffer, and if
+/// those paths disagreed the same connection would end up with a different
+/// `next_seq` depending on which one it took. The two sites that add 1
+/// unconditionally are not exceptions -- SYN is a precondition of the arm they sit
+/// in, not something they test for.
+///
+/// Kept free of `L4Pdu` so the wrapping arithmetic is unit-testable without DPDK.
+pub(crate) fn seq_after(seq: u32, length: u32, flags: u8) -> u32 {
+    let end_seq = seq.wrapping_add(length);
+    // A segment with both flags set is not a real stream (SYN+FIN is a scan
+    // artifact); one sequence number is as good an answer as any.
+    match flags & (SYN | FIN) != 0 {
+        true => end_seq.wrapping_add(1),
+        false => end_seq,
+    }
+}
+
 pub fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
     // From RFC1323:
     //     TCP determines if a data segment is "old" or "new" by testing
@@ -444,10 +466,7 @@ pub fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
 fn overlap(segment: &mut L4Pdu, expected_seq: u32) -> Option<u32> {
     let length = segment.length();
     let cur_seq = segment.seq_no();
-    let mut end_seq = cur_seq.wrapping_add(length as u32);
-    if segment.flags() & FIN != 0 {
-        end_seq = end_seq.wrapping_add(1);
-    }
+    let end_seq = seq_after(cur_seq, length as u32, segment.flags());
 
     if wrapping_lt(expected_seq, end_seq) {
         // contains new data
@@ -466,6 +485,8 @@ fn overlap(segment: &mut L4Pdu, expected_seq: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Flags the reassembly logic itself never has to name.
+    use crate::protocols::packet::tcp::{ACK, PSH};
 
     #[test]
     fn core_select_resume_seq_empty_buffer() {
@@ -533,6 +554,81 @@ mod tests {
     #[test]
     fn core_lowest_seq_wraps_around_zero() {
         assert_eq!(lowest_seq(&[50, u32::MAX - 99, 400]), Some(u32::MAX - 99));
+    }
+
+    #[test]
+    fn core_seq_after_plain_data() {
+        // No control flag: the segment occupies exactly its payload.
+        assert_eq!(seq_after(1000, 500, PSH | ACK), 1500);
+        assert_eq!(seq_after(1000, 0, ACK), 1000);
+    }
+
+    #[test]
+    fn core_seq_after_fin_with_payload() {
+        // The regression this test exists for: a FIN occupies one sequence number
+        // *after* its payload, so the payload length must not be discarded.
+        assert_eq!(seq_after(1000, 500, FIN | PSH | ACK), 1501);
+    }
+
+    #[test]
+    fn core_seq_after_fin_without_payload() {
+        // The common bare FIN/ACK, where payload-discarding and additive forms
+        // happen to agree -- which is why the bug went unnoticed.
+        assert_eq!(seq_after(1000, 0, FIN | ACK), 1001);
+    }
+
+    #[test]
+    fn core_seq_after_syn_with_payload() {
+        // TCP Fast Open and the like: a SYN also occupies a sequence number of its
+        // own on top of any data it carries.
+        assert_eq!(seq_after(1000, 20, SYN), 1021);
+        assert_eq!(seq_after(1000, 0, SYN | ACK), 1001);
+    }
+
+    #[test]
+    fn core_seq_after_syn_and_fin_costs_one() {
+        // SYN+FIN is not a real stream; it must still be charged a bounded amount,
+        // not one sequence number per flag.
+        assert_eq!(seq_after(1000, 0, SYN | FIN), 1001);
+        assert_eq!(seq_after(1000, 7, SYN | FIN), 1008);
+    }
+
+    #[test]
+    fn core_seq_after_rst_is_not_charged() {
+        // RST consumes no sequence space. Reassembly returns early on RST anyway,
+        // but the helper must not quietly disagree with that.
+        assert_eq!(seq_after(1000, 0, RST | ACK), 1000);
+    }
+
+    #[test]
+    fn core_seq_after_wraps_around_zero() {
+        // Payload straddling 2^32.
+        assert_eq!(seq_after(u32::MAX - 9, 20, PSH | ACK), 10);
+        // The wrap falls on the FIN's own sequence number, not on payload: the
+        // payload ends exactly at u32::MAX and the FIN takes that last slot.
+        assert_eq!(seq_after(u32::MAX - 5, 5, FIN | ACK), 0);
+        assert_eq!(seq_after(u32::MAX, 0, FIN | ACK), 0);
+        // Payload alone reaches exactly 2^32; the FIN pushes one past it.
+        assert_eq!(seq_after(u32::MAX - 99, 100, FIN | PSH | ACK), 1);
+    }
+
+    #[test]
+    fn core_seq_after_matches_peer_ack_for_fin_with_payload() {
+        // Real teardown from `traces/small_flows.pcap` (192.168.3.131:55955 <->
+        // 207.46.148.38:80), the shape that could not terminate before this was
+        // shared: the server's FIN/PSH/ACK carries 279 bytes at seq 3974155009, and
+        // the client acknowledges 3974155289 -- payload *and* FIN.
+        //
+        // `TcpConn::is_terminated` compares one side's `last_ack` against the
+        // other's `next_seq`, so anything but the peer's own ack number here leaves
+        // the connection unterminatable. Discarding the payload length, as the
+        // in-order arm used to, yielded 3974155010 and stranded the client's final
+        // ACK in the out-of-order buffer.
+        let ack_sent_by_peer = 3974155289u32;
+        assert_eq!(
+            seq_after(3974155009, 279, FIN | PSH | ACK),
+            ack_sent_by_peer
+        );
     }
 
     #[test]

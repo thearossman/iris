@@ -1,6 +1,6 @@
 pub mod reassembly;
 
-use self::reassembly::TcpFlow;
+use self::reassembly::{seq_after, TcpFlow};
 use crate::conntrack::conn::conn_info::ConnInfo;
 use crate::conntrack::pdu::{L4Context, L4Pdu};
 use crate::protocols::packet::tcp::{ACK, SYN};
@@ -51,12 +51,8 @@ impl TcpConn {
     /// into.
     pub(crate) fn new_midstream(ctxt: L4Context, dir: bool, max_ooo: usize) -> Self {
         // This packet is consumed directly rather than passed through reassembly,
-        // so `next_seq` must already be past it. SYN and FIN each occupy a
-        // sequence number of their own on top of any payload.
-        let mut next_seq = ctxt.seq_no.wrapping_add(ctxt.length as u32);
-        if ctxt.flags & (SYN | FIN) != 0 {
-            next_seq = next_seq.wrapping_add(1);
-        }
+        // so `next_seq` must already be past it.
+        let next_seq = seq_after(ctxt.seq_no, ctxt.length as u32, ctxt.flags);
         // A SYN carries the sender's ISN, so this flow's origin is known after all.
         let observed = match ctxt.flags & SYN != 0 {
             true => TcpFlow::new(max_ooo, next_seq, ctxt.flags, ctxt.ack_no),
