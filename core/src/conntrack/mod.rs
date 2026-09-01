@@ -24,7 +24,7 @@ use self::timerwheel::TimerWheel;
 use crate::config::ConnTrackConfig;
 use crate::lcore::CoreId;
 use crate::memory::mbuf::Mbuf;
-use crate::protocols::packet::tcp::TCP_PROTOCOL;
+use crate::protocols::packet::tcp::{ACK, FIN, RST, SYN, TCP_PROTOCOL};
 use crate::protocols::packet::udp::UDP_PROTOCOL;
 use crate::protocols::stream::ParserRegistry;
 use crate::stats::{
@@ -208,6 +208,14 @@ where
                         // only way to land in this arm is `new_tcp` refusing a flow whose SYN
                         // was never observed. See `stats::PacketLedger::dropped_no_syn`.
                         record(Outcome::DroppedNoSyn, bytes);
+                        // Sub-tallies, recorded on top of the bucket above rather than
+                        // instead of it -- they say *why* the SYN is missing. See the field
+                        // docs on `PacketLedger::dropped_no_syn_synack`.
+                        if ctxt.flags & SYN != 0 && ctxt.flags & ACK != 0 {
+                            record(Outcome::DroppedNoSynSynAck, bytes);
+                        } else if ctxt.flags & (FIN | RST) != 0 {
+                            record(Outcome::DroppedNoSynFinRst, bytes);
+                        }
                     }
                 } else {
                     log::error!("Table full. Dropping packet.");

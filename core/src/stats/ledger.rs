@@ -63,6 +63,20 @@ pub struct PacketLedger {
     /// connection for these, so every one of them is dropped -- including all subsequent
     /// packets of that flow, which retry (and fail) connection creation one by one.
     pub dropped_no_syn: Tally,
+    /// The SYN-ACKs within [`Self::dropped_no_syn`] -- a *subset*, not an extra bucket.
+    ///
+    /// A SYN-ACK refused here means this core watched a connection get established and still
+    /// could not open it, which only happens if the matching SYN went somewhere this core
+    /// could not see: a different RX queue (RSS hashing the two directions apart), a
+    /// different port (a tap feeding each direction to its own fiber), or a path the capture
+    /// does not cover at all. Near-zero here instead means the refused traffic is mid-stream
+    /// data from flows that were already running before the capture started.
+    pub dropped_no_syn_synack: Tally,
+    /// The FIN/RST frames within [`Self::dropped_no_syn`] -- also a subset. Roughly one per
+    /// distinct pre-existing flow that ended during the run, so it separates "a handful of
+    /// elephant flows" from "millions of unseen small ones": divide `dropped_no_syn.bytes`
+    /// by this to get bytes per ended flow.
+    pub dropped_no_syn_fin_rst: Tally,
     /// Dropped because the connection table was at `max_connections`.
     pub dropped_table_full: Tally,
     /// Dropped because the connection is in a drop state -- no subscription still needs it,
@@ -100,6 +114,9 @@ impl PacketLedger {
     }
 
     /// Frames received but never handed to a subscription, for any reason.
+    ///
+    /// `dropped_no_syn_synack` and `dropped_no_syn_fin_rst` are deliberately absent: they are
+    /// subsets of `dropped_no_syn`, and adding them would double-count.
     pub fn dropped(&self) -> Tally {
         let mut tally = self.ignored_by_packet_filter;
         tally.merge(self.not_transport);
@@ -116,6 +133,10 @@ impl PacketLedger {
             .merge(other.ignored_by_packet_filter);
         self.not_transport.merge(other.not_transport);
         self.dropped_no_syn.merge(other.dropped_no_syn);
+        self.dropped_no_syn_synack
+            .merge(other.dropped_no_syn_synack);
+        self.dropped_no_syn_fin_rst
+            .merge(other.dropped_no_syn_fin_rst);
         self.dropped_table_full.merge(other.dropped_table_full);
         self.dropped_unmatched.merge(other.dropped_unmatched);
         self.tracked_tcp.merge(other.tracked_tcp);
@@ -149,6 +170,8 @@ impl fmt::Display for PacketLedger {
             ("  ignored by packet filter", self.ignored_by_packet_filter),
             ("  not TCP/UDP (or unparseable)", self.not_transport),
             ("  dropped: TCP with no SYN seen", self.dropped_no_syn),
+            ("    of which SYN-ACKs", self.dropped_no_syn_synack),
+            ("    of which FIN/RST", self.dropped_no_syn_fin_rst),
             ("  dropped: connection table full", self.dropped_table_full),
             ("  dropped: connection unmatched", self.dropped_unmatched),
             ("  tracked: TCP", self.tracked_tcp),
@@ -194,6 +217,8 @@ thread_local! {
         ignored_by_packet_filter: Tally { pkts: 0, bytes: 0 },
         not_transport: Tally { pkts: 0, bytes: 0 },
         dropped_no_syn: Tally { pkts: 0, bytes: 0 },
+        dropped_no_syn_synack: Tally { pkts: 0, bytes: 0 },
+        dropped_no_syn_fin_rst: Tally { pkts: 0, bytes: 0 },
         dropped_table_full: Tally { pkts: 0, bytes: 0 },
         dropped_unmatched: Tally { pkts: 0, bytes: 0 },
         tracked_tcp: Tally { pkts: 0, bytes: 0 },
@@ -212,6 +237,10 @@ pub(crate) enum Outcome {
     IgnoredByPacketFilter,
     NotTransport,
     DroppedNoSyn,
+    /// A subset of [`Outcome::DroppedNoSyn`], recorded *in addition* to it, not instead.
+    DroppedNoSynSynAck,
+    /// A subset of [`Outcome::DroppedNoSyn`], recorded *in addition* to it, not instead.
+    DroppedNoSynFinRst,
     DroppedTableFull,
     DroppedUnmatched,
     TrackedTcp,
@@ -228,6 +257,8 @@ pub(crate) fn record(outcome: Outcome, bytes: u64) {
             Outcome::IgnoredByPacketFilter => ledger.ignored_by_packet_filter.add(bytes),
             Outcome::NotTransport => ledger.not_transport.add(bytes),
             Outcome::DroppedNoSyn => ledger.dropped_no_syn.add(bytes),
+            Outcome::DroppedNoSynSynAck => ledger.dropped_no_syn_synack.add(bytes),
+            Outcome::DroppedNoSynFinRst => ledger.dropped_no_syn_fin_rst.add(bytes),
             Outcome::DroppedTableFull => ledger.dropped_table_full.add(bytes),
             Outcome::DroppedUnmatched => ledger.dropped_unmatched.add(bytes),
             Outcome::TrackedTcp => ledger.tracked_tcp.add(bytes),
