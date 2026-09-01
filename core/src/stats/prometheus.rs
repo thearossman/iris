@@ -80,6 +80,8 @@ struct Families {
     tcp_segments_after_gap: Family<CoreId, Counter>,
     tcp_reassembly_timeouts: Family<CoreId, Counter>,
     midstream_tcp_adopted: Family<CoreId, Counter>,
+    table_full_dropped_pkt: Family<CoreId, Counter>,
+    table_full_dropped_byte: Family<CoreId, Counter>,
     total_pkt: Family<CoreId, Counter>,
     total_byte: Family<CoreId, Counter>,
     tcp_pkt: Family<CoreId, Counter>,
@@ -241,6 +243,18 @@ pub(crate) static STAT_REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         FAMILIES.midstream_tcp_adopted.clone(),
     );
     r.register_with_unit(
+        "iris_table_full_dropped",
+        "Number of packets dropped because the connection table was full.",
+        Unit::Other("pkts".to_string()),
+        FAMILIES.table_full_dropped_pkt.clone(),
+    );
+    r.register_with_unit(
+        "iris_table_full_dropped",
+        "Number of bytes dropped because the connection table was full.",
+        Unit::Bytes,
+        FAMILIES.table_full_dropped_byte.clone(),
+    );
+    r.register_with_unit(
         "iris_worker_received",
         "Number of total packets received from dpdk.",
         Unit::Other("pkts".to_string()),
@@ -323,6 +337,8 @@ pub(crate) struct PerCorePrometheusStats {
     tcp_segments_after_gap: Counter,
     tcp_reassembly_timeouts: Counter,
     midstream_tcp_adopted: Counter,
+    table_full_dropped_pkt: Counter,
+    table_full_dropped_byte: Counter,
     total_pkt: Counter,
     total_byte: Counter,
     tcp_pkt: Counter,
@@ -370,6 +386,11 @@ pub(crate) fn update_thread_local_stats(core: CoreId) {
                 .get_or_create(&core)
                 .clone(),
             midstream_tcp_adopted: FAMILIES.midstream_tcp_adopted.get_or_create(&core).clone(),
+            table_full_dropped_pkt: FAMILIES.table_full_dropped_pkt.get_or_create(&core).clone(),
+            table_full_dropped_byte: FAMILIES
+                .table_full_dropped_byte
+                .get_or_create(&core)
+                .clone(),
             total_pkt: FAMILIES.total_pkt.get_or_create(&core).clone(),
             total_byte: FAMILIES.total_byte.get_or_create(&core).clone(),
             tcp_pkt: FAMILIES.tcp_pkt.get_or_create(&core).clone(),
@@ -411,6 +432,12 @@ pub(crate) fn update_thread_local_stats(core: CoreId) {
         TCP_REASSEMBLY_TIMEOUTS.set(0);
         pr.midstream_tcp_adopted.inc_by(MIDSTREAM_TCP_ADOPTED.get());
         MIDSTREAM_TCP_ADOPTED.set(0);
+        pr.table_full_dropped_pkt
+            .inc_by(TABLE_FULL_DROPPED_PKT.get());
+        TABLE_FULL_DROPPED_PKT.set(0);
+        pr.table_full_dropped_byte
+            .inc_by(TABLE_FULL_DROPPED_BYTE.get());
+        TABLE_FULL_DROPPED_BYTE.set(0);
         pr.total_pkt.inc_by(TOTAL_PKT.get());
         TOTAL_PKT.set(0);
         pr.total_byte.inc_by(TOTAL_BYTE.get());

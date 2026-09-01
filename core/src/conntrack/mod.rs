@@ -27,7 +27,10 @@ use crate::memory::mbuf::Mbuf;
 use crate::protocols::packet::tcp::TCP_PROTOCOL;
 use crate::protocols::packet::udp::UDP_PROTOCOL;
 use crate::protocols::stream::ParserRegistry;
-use crate::stats::{StatExt, TCP_NEW_CONNECTIONS, UDP_NEW_CONNECTIONS};
+use crate::stats::{
+    StatExt, TABLE_FULL_DROPPED_BYTE, TABLE_FULL_DROPPED_PKT, TCP_NEW_CONNECTIONS,
+    UDP_NEW_CONNECTIONS,
+};
 use crate::subscription::{Subscription, Trackable};
 
 use std::cmp;
@@ -192,7 +195,15 @@ where
                         }
                     }
                 } else {
-                    log::error!("Table full. Dropping packet.");
+                    // Counted, not logged. This fires per packet once the table is
+                    // at `max_connections`, so an `error!` here is both a hot-path
+                    // cost and a log flood exactly when the system is already
+                    // struggling -- and it left the drop invisible to any
+                    // dashboard. `debug!` compiles out of release builds
+                    // (`release_max_level_info`), so the counter is the signal.
+                    TABLE_FULL_DROPPED_PKT.inc();
+                    TABLE_FULL_DROPPED_BYTE.inc_by(mbuf.data_len() as u64);
+                    log::debug!("Table full. Dropping packet.");
                 }
             }
         }
