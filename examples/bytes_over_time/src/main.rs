@@ -64,7 +64,7 @@
 //!
 //! ## `--min-bytes`
 //! As in `encrypted_bytes`: passing `--min-bytes N` excludes any connection whose own total
-//! L4 payload byte count (see "Byte unit" below) is not more than `N` from every counter and
+//! on-wire byte count (see "Byte unit" below) is not more than `N` from every counter and
 //! every slice -- checked once per connection, at `L4Terminated`, using that connection's own
 //! running total. Default is 0.
 //!
@@ -88,16 +88,26 @@
 //! `maybe_iperf3_*` has no such guard, following `encrypted_bytes`'s `MAYBE_IPERF3_BYTES`: it is
 //! the one column that can still double-count against any of the others.
 //!
-//! ## Byte unit: L4 payload, not wire bytes
+//! ## Byte unit: on-wire bytes, headers included
 //! As in `encrypted_bytes`: every column here -- the stdout table, the CSV, and the summary
-//! percentages below -- comes from `L4Pdu::length()` (`pdu.ctxt.length`), the TCP/UDP payload
-//! size once `core/src/conntrack/pdu.rs` strips the Ethernet/IP/TCP/UDP headers; pure ACKs and
-//! other header-only segments contribute 0. This is NOT the same unit as the runtime's own
-//! `Processed: N pkts, M bytes` startup banner (`core/src/runtime/offline.rs`), which counts
-//! full wire bytes (`mbuf.data_len()`) -- on `traces/small_flows.pcap` that banner reports
-//! 9,216,531 bytes against this app's own TCP+UDP total of 8,367,195 for the same trace. Don't
-//! divide one by the other, and don't compare the `tcp_bytes`/`udp_bytes` CSV columns against a
-//! packet-capture tool's byte counts without accounting for the gap.
+//! percentages below -- comes from `Mbuf::data_len()` (`pdu.mbuf.data_len()`), the length of the
+//! whole captured frame, Ethernet/IP/TCP/UDP headers included. `ByteSeries::update` reads it
+//! directly off the `L4Pdu` it updates from.
+//!
+//! This is the same unit as the runtime's own `Processed: N pkts, M bytes` startup banner
+//! (`core/src/runtime/offline.rs`), which sums that same `mbuf.data_len()` over every captured
+//! frame. The two totals still won't necessarily match: the banner sums *every* frame the
+//! runtime saw, including the non-TCP/UDP traffic (ARP, ICMP, malformed packets) this app never
+//! tracks, while the `tcp`/`udp` series only sum frames belonging to a TCP or UDP connection.
+//! This app's TCP+UDP total is a lower bound on the banner's, not necessarily equal to it.
+//!
+//! Because full frames are counted, a pure ACK or an empty UDP encapsulation is not
+//! zero-weight the way it was under the old L4-payload-only accounting: its header bytes count
+//! toward whichever bucket its packet falls in, same as any other packet on the connection. A
+//! run of this app against the same trace will therefore report noticeably *higher* numbers
+//! than it did before the switch -- on `traces/small_flows.pcap` the old payload-only TCP+UDP
+//! total was 8,367,195 against a 9,216,531-byte banner, and header bytes plus previously
+//! uncounted header-only segments close most of that gap.
 //!
 //! ## Timestamps are processing time, not capture time
 //! As in `concurrent_conns`: `L4Pdu::ts` comes from `Instant::now()` when a packet is
@@ -143,8 +153,8 @@ struct Args {
     #[clap(long, value_name = "SECS", default_value_t = 48 * 3600)]
     max_duration_secs: u64,
 
-    /// Only count a connection (and the packets in it) if its total L4 payload byte count
-    /// (see module docs -- headers and pure ACKs are excluded) is more than N. 0 (the default)
+    /// Only count a connection (and the packets in it) if its total on-wire byte count
+    /// (see module docs -- full frames, headers included) is more than N. 0 (the default)
     /// counts every connection.
     #[clap(short, long, value_name = "N", default_value_t = 0)]
     min_bytes: usize,
@@ -158,7 +168,7 @@ struct Args {
 
     /// Path to also write the per-slice byte counts as CSV, one row per slice, columns
     /// `slice_start_s,<proto>_handshake,<proto>_payload,...,tcp_bytes,udp_bytes`. All byte
-    /// columns are L4 payload bytes -- see "Byte unit" in the module docs.
+    /// columns are on-wire bytes -- see "Byte unit" in the module docs.
     #[clap(
         short,
         long,
@@ -630,10 +640,9 @@ impl ByteSeries {
 
     #[datatype_fn("ByteSeries,level=InL4Conn")]
     fn update(&mut self, pdu: &L4Pdu) {
-        let len = pdu.length();
-        if len == 0 {
-            return;
-        }
+        // Full frame, headers included -- see "Byte unit" in the module docs. Never zero, so
+        // there is no header-only-segment case to skip the way the old payload unit needed.
+        let len = pdu.mbuf.data_len();
         let num_slices = DELTAS_LEN.load(Ordering::Relaxed);
         let slice_ms = SLICE_MS.load(Ordering::Relaxed);
         let ts_ms = pdu.ts.saturating_duration_since(*EPOCH).as_millis() as u64;
@@ -960,9 +969,10 @@ fn main() {
     let last = last_nonzero_slice(&all_totals, &transport_totals);
 
     println!(
-        "(Byte counts below and in the CSV are L4 payload bytes -- Ethernet/IP/TCP/UDP headers \
-         and pure ACKs excluded. Not the same unit as this runtime's own \"Processed: N pkts, \
-         M bytes\" line above, which counts full wire bytes; see the module docs.)"
+        "(Byte counts below and in the CSV are on-wire bytes -- full captured frames, \
+         Ethernet/IP/TCP/UDP headers included. Same unit as this runtime's own \"Processed: N \
+         pkts, M bytes\" line above (both sum a packet's full `mbuf.data_len()`), though the two \
+         totals still won't necessarily match; see the module docs.)"
     );
     println!("=== Bytes per {}ms slice, by protocol ===", args.slice_ms);
     if let Some(last) = last {
@@ -1003,7 +1013,7 @@ fn main() {
 
     if args.min_bytes > 0 {
         println!(
-            "\n(Connections with {} or fewer total L4 payload bytes are excluded from every \
+            "\n(Connections with {} or fewer total on-wire bytes are excluded from every \
              count below.)",
             args.min_bytes
         );
