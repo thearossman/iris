@@ -27,6 +27,7 @@
 
 use std::cell::Cell;
 use std::fmt;
+use std::sync::Mutex;
 
 /// A packet count and the on-wire bytes those packets carried.
 ///
@@ -94,6 +95,19 @@ pub struct PacketLedger {
     pub tracked_tcp: Tally,
     /// Accepted into connection tracking, and so visible to subscriptions.
     pub tracked_udp: Tally,
+    /// Every frame with a readable TCP layer-4 context, whatever happened to it next.
+    ///
+    /// **Overlaps the buckets above** and is excluded from [`Self::dropped`] and
+    /// [`Self::unaccounted`] for that reason: it equals [`Self::tracked_tcp`] plus the TCP
+    /// share of every drop bucket. This is "how much TCP was on the wire", the figure
+    /// [`super::tcp_bytes`] and [`super::tcp_packets`] report.
+    pub transport_tcp: Tally,
+    /// Every frame with a readable UDP layer-4 context. Overlaps the buckets above, as
+    /// [`Self::transport_tcp`] does. Reported by [`super::udp_bytes`]/[`super::udp_packets`].
+    ///
+    /// UDP has no handshake to miss, so in practice this equals [`Self::tracked_udp`] unless
+    /// the connection table filled.
+    pub transport_udp: Tally,
     /// Connections opened.
     pub new_tcp_conns: u64,
     /// Connections opened.
@@ -152,6 +166,8 @@ impl PacketLedger {
         self.dropped_unmatched.merge(other.dropped_unmatched);
         self.tracked_tcp.merge(other.tracked_tcp);
         self.tracked_udp.merge(other.tracked_udp);
+        self.transport_tcp.merge(other.transport_tcp);
+        self.transport_udp.merge(other.transport_udp);
         self.new_tcp_conns += other.new_tcp_conns;
         self.new_udp_conns += other.new_udp_conns;
         self.conns_terminated += other.conns_terminated;
@@ -214,6 +230,20 @@ impl fmt::Display for PacketLedger {
             self.conns_discarded,
             pct(self.conns_discarded, closed)
         )?;
+        // Overlapping totals, so kept out of the partition above and labelled as such.
+        for (label, tally) in [
+            ("TCP seen (any outcome)", self.transport_tcp),
+            ("UDP seen (any outcome)", self.transport_udp),
+        ] {
+            writeln!(
+                f,
+                "  {:<34} {:>16} pkts {:>20} bytes  {:>6.2}%",
+                label,
+                tally.pkts,
+                tally.bytes,
+                pct(tally.bytes, total)
+            )?;
+        }
         let unaccounted = self.unaccounted();
         if unaccounted != 0 {
             writeln!(f, "  WARNING: {unaccounted} bytes unaccounted for")?;
@@ -222,23 +252,85 @@ impl fmt::Display for PacketLedger {
     }
 }
 
+/// An all-zero ledger. `PacketLedger::default()` is not usable in a `const` context, and both
+/// the per-core thread-local and the cross-core total need one.
+const EMPTY: PacketLedger = PacketLedger {
+    received: Tally { pkts: 0, bytes: 0 },
+    ignored_by_packet_filter: Tally { pkts: 0, bytes: 0 },
+    not_transport: Tally { pkts: 0, bytes: 0 },
+    dropped_no_syn: Tally { pkts: 0, bytes: 0 },
+    dropped_no_syn_synack: Tally { pkts: 0, bytes: 0 },
+    dropped_no_syn_fin_rst: Tally { pkts: 0, bytes: 0 },
+    dropped_table_full: Tally { pkts: 0, bytes: 0 },
+    dropped_unmatched: Tally { pkts: 0, bytes: 0 },
+    tracked_tcp: Tally { pkts: 0, bytes: 0 },
+    tracked_udp: Tally { pkts: 0, bytes: 0 },
+    transport_tcp: Tally { pkts: 0, bytes: 0 },
+    transport_udp: Tally { pkts: 0, bytes: 0 },
+    new_tcp_conns: 0,
+    new_udp_conns: 0,
+    conns_terminated: 0,
+    conns_discarded: 0,
+};
+
 thread_local! {
-    static LEDGER: Cell<PacketLedger> = const { Cell::new(PacketLedger {
-        received: Tally { pkts: 0, bytes: 0 },
-        ignored_by_packet_filter: Tally { pkts: 0, bytes: 0 },
-        not_transport: Tally { pkts: 0, bytes: 0 },
-        dropped_no_syn: Tally { pkts: 0, bytes: 0 },
-        dropped_no_syn_synack: Tally { pkts: 0, bytes: 0 },
-        dropped_no_syn_fin_rst: Tally { pkts: 0, bytes: 0 },
-        dropped_table_full: Tally { pkts: 0, bytes: 0 },
-        dropped_unmatched: Tally { pkts: 0, bytes: 0 },
-        tracked_tcp: Tally { pkts: 0, bytes: 0 },
-        tracked_udp: Tally { pkts: 0, bytes: 0 },
-        new_tcp_conns: 0,
-        new_udp_conns: 0,
-        conns_terminated: 0,
-        conns_discarded: 0,
-    }) };
+    static LEDGER: Cell<PacketLedger> = const { Cell::new(EMPTY) };
+}
+
+/// Every core's published ledger, merged. See [`publish_ledger`].
+///
+/// A `Mutex` rather than a bank of atomics because it is locked exactly once per core, at
+/// core exit, and read after the cores have joined -- there is no contention to design
+/// around, and one lock keeps every field of a snapshot mutually consistent.
+static TOTALS: Mutex<PacketLedger> = Mutex::new(EMPTY);
+
+/// Folds the calling core's ledger into the cross-core [`TOTALS`].
+///
+/// Call once, when a core stops processing packets and after it has drained its connection
+/// table -- calling it twice would double-count that core. Per-packet accumulation into a
+/// process-global would mean an atomic add per packet per counter on every core, which is not
+/// something a saturated link can afford; publishing once at exit costs nothing.
+pub(crate) fn publish_ledger() {
+    let mine = packet_ledger();
+    if let Ok(mut totals) = TOTALS.lock() {
+        totals.merge(mine);
+    }
+}
+
+/// Every core's accounting, merged.
+///
+/// Meant to be called from an application after `Runtime::run` returns: each core publishes
+/// as it stops, so before then this reports only the cores that have already finished. Cheap
+/// and side-effect-free -- call it as often as you like.
+pub fn total_ledger() -> PacketLedger {
+    TOTALS.lock().map(|t| *t).unwrap_or(EMPTY)
+}
+
+/// Total TCP packets the runtime saw, across all cores.
+///
+/// This is every frame with a readable TCP header, whether or not connection tracking went on
+/// to accept it -- the on-the-wire figure. It is *not* what subscriptions observed: on a live
+/// capture the two differ by however much traffic belongs to flows whose SYN was never seen.
+/// [`total_ledger`] breaks the difference down.
+pub fn tcp_packets() -> u64 {
+    total_ledger().transport_tcp.pkts
+}
+
+/// Total on-wire TCP bytes the runtime saw, across all cores. Full frames, Ethernet header
+/// included -- the same unit as the `Processed: N pkts, M bytes` banner. See
+/// [`tcp_packets`] for the tracked-versus-seen caveat.
+pub fn tcp_bytes() -> u64 {
+    total_ledger().transport_tcp.bytes
+}
+
+/// Total UDP packets the runtime saw, across all cores. See [`tcp_packets`].
+pub fn udp_packets() -> u64 {
+    total_ledger().transport_udp.pkts
+}
+
+/// Total on-wire UDP bytes the runtime saw, across all cores. See [`tcp_bytes`].
+pub fn udp_bytes() -> u64 {
+    total_ledger().transport_udp.bytes
 }
 
 /// Which bucket a frame ended up in. One call per frame per bucket.
@@ -256,6 +348,11 @@ pub(crate) enum Outcome {
     DroppedUnmatched,
     TrackedTcp,
     TrackedUdp,
+    /// Overlaps the buckets above rather than partitioning with them: recorded for every
+    /// frame that has a readable TCP context, in addition to whatever became of it.
+    TransportTcp,
+    /// Overlaps the buckets above, as [`Outcome::TransportTcp`] does.
+    TransportUdp,
 }
 
 /// Records one frame of `bytes` against `outcome` on the calling core.
@@ -274,6 +371,8 @@ pub(crate) fn record(outcome: Outcome, bytes: u64) {
             Outcome::DroppedUnmatched => ledger.dropped_unmatched.add(bytes),
             Outcome::TrackedTcp => ledger.tracked_tcp.add(bytes),
             Outcome::TrackedUdp => ledger.tracked_udp.add(bytes),
+            Outcome::TransportTcp => ledger.transport_tcp.add(bytes),
+            Outcome::TransportUdp => ledger.transport_udp.add(bytes),
         }
         cell.set(ledger);
     });
@@ -366,6 +465,59 @@ mod tests {
         assert_eq!(a.new_tcp_conns, 1);
         assert_eq!(a.new_udp_conns, 3);
         assert_eq!(a.unaccounted(), 0);
+    }
+
+    #[test]
+    fn transport_tallies_overlap_rather_than_partition() {
+        // `transport_tcp` counts the same frames as `tracked_tcp` plus the TCP drops, so it
+        // must stay out of the partition or `unaccounted` would go negative.
+        let ledger = PacketLedger {
+            received: tally(10, 1000),
+            dropped_no_syn: tally(4, 400),
+            tracked_tcp: tally(6, 600),
+            transport_tcp: tally(10, 1000),
+            ..Default::default()
+        };
+        assert_eq!(ledger.unaccounted(), 0);
+        assert_eq!(ledger.dropped(), tally(4, 400));
+    }
+
+    #[test]
+    fn publishing_accumulates_across_cores() {
+        // Two cores' worth of ledgers merged into one total, which is what
+        // `tcp_bytes()`/`udp_bytes()` read after `Runtime::run` returns.
+        let mut total = PacketLedger {
+            received: tally(3, 300),
+            transport_tcp: tally(2, 200),
+            transport_udp: tally(1, 100),
+            ..Default::default()
+        };
+        total.merge(PacketLedger {
+            received: tally(7, 700),
+            transport_tcp: tally(5, 500),
+            transport_udp: tally(2, 200),
+            ..Default::default()
+        });
+        assert_eq!(total.transport_tcp, tally(7, 700));
+        assert_eq!(total.transport_udp, tally(3, 300));
+        assert_eq!(total.received, tally(10, 1000));
+    }
+
+    #[test]
+    fn totals_are_readable_after_publishing() {
+        // The accessors read a process-global, so this test only checks that publishing
+        // moves this thread's counts into it and that the getters agree with the ledger.
+        record(Outcome::TransportTcp, 1500);
+        record(Outcome::TransportUdp, 500);
+        let before = total_ledger();
+        publish_ledger();
+        let after = total_ledger();
+        assert_eq!(
+            after.transport_tcp.bytes - before.transport_tcp.bytes,
+            packet_ledger().transport_tcp.bytes
+        );
+        assert_eq!(tcp_bytes(), after.transport_tcp.bytes);
+        assert_eq!(udp_packets(), after.transport_udp.pkts);
     }
 
     #[test]

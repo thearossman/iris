@@ -165,6 +165,7 @@ use iris_compiler::{callback, datatype, datatype_fn, input_files, iris_end_macro
 use iris_core::protocols::packet::tcp::TCP_PROTOCOL;
 use iris_core::protocols::packet::udp::UDP_PROTOCOL;
 use iris_core::protocols::stream::SessionProto;
+use iris_core::stats;
 use iris_core::subscription::Tracked;
 use iris_core::{config::load_config, L4Pdu, Runtime};
 use std::fs::File;
@@ -1072,6 +1073,31 @@ fn main() {
     println!("\n=== Total transport-layer traffic ===");
     println!("TCP: {}", fmt_pct(pct(tcp_total, transport_total)));
     println!("UDP: {}", fmt_pct(pct(udp_total, transport_total)));
+
+    // What the runtime saw, as opposed to what this app was able to attribute. These read
+    // the cross-core totals every core published as it stopped, so they are only valid after
+    // `runtime.run()` has returned. The gap between the two columns is traffic that never
+    // reached a subscription -- overwhelmingly TCP flows whose SYN was never observed; the
+    // per-core `stats::PacketLedger` blocks printed above break it down by cause.
+    let (seen_tcp, seen_udp) = (stats::tcp_bytes(), stats::udp_bytes());
+    println!("\n=== Attributed here vs. seen by the runtime (on-wire bytes) ===");
+    println!(
+        "TCP  attributed: {:>18}   seen: {:>18}   {}",
+        tcp_total,
+        seen_tcp,
+        fmt_pct(pct(tcp_total, seen_tcp))
+    );
+    println!(
+        "UDP  attributed: {:>18}   seen: {:>18}   {}",
+        udp_total,
+        seen_udp,
+        fmt_pct(pct(udp_total, seen_udp))
+    );
+    println!(
+        "     packets seen: {} TCP, {} UDP",
+        stats::tcp_packets(),
+        stats::udp_packets()
+    );
 
     println!("\n=== Connections observed per series ===");
     for (name, count) in PROTO_NAMES.iter().zip(PROTO_CONN_COUNTS.iter()) {

@@ -4,7 +4,7 @@ use crate::dpdk;
 use crate::lcore::{CoreId, SocketId};
 use crate::memory::mbuf::Mbuf;
 use crate::memory::mempool::Mempool;
-use crate::stats::{packet_ledger, record, Outcome};
+use crate::stats::{packet_ledger, publish_ledger, record, Outcome};
 use crate::subscription::*;
 
 use std::collections::BTreeMap;
@@ -172,6 +172,9 @@ where
         println!("Processed: {} pkts, {} bytes", nb_pkts, nb_bytes);
         println!("CPU time: {:?}ms", cpu_time.as_millis());
         print!("{}", packet_ledger());
+        // See the matching call in `RxCore::rx_process`: publishes this core's accounting so
+        // an application can read it back after `Runtime::run` returns.
+        publish_ledger();
     }
 
     pub(crate) fn get_mempool_raw(&self) -> *mut dpdk::rte_mempool {

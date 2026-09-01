@@ -92,10 +92,15 @@ where
             TCP_PROTOCOL => {
                 TCP_PKT.inc();
                 TCP_BYTE.inc_by(mbuf.data_len() as u64);
+                // Mirrors the two counters above into the never-drained ledger, which is
+                // where `stats::tcp_bytes()` and friends read from: the Prometheus path
+                // resets these as it scrapes, so they cannot be summed at shutdown.
+                record(Outcome::TransportTcp, mbuf.data_len() as u64);
             }
             UDP_PROTOCOL => {
                 UDP_PKT.inc();
                 UDP_BYTE.inc_by(mbuf.data_len() as u64);
+                record(Outcome::TransportUdp, mbuf.data_len() as u64);
             }
             _ => {
                 record(Outcome::NotTransport, mbuf.data_len() as u64);

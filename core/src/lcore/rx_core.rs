@@ -5,8 +5,9 @@ use crate::dpdk;
 use crate::memory::mbuf::Mbuf;
 use crate::port::{RxQueue, RxQueueType};
 use crate::stats::{
-    packet_ledger, record, Outcome, StatExt, IDLE_CYCLES, IGNORED_BY_PACKET_FILTER_BYTE,
-    IGNORED_BY_PACKET_FILTER_PKT, TOTAL_BYTE, TOTAL_CYCLES, TOTAL_PKT,
+    packet_ledger, publish_ledger, record, Outcome, StatExt, IDLE_CYCLES,
+    IGNORED_BY_PACKET_FILTER_BYTE, IGNORED_BY_PACKET_FILTER_PKT, TOTAL_BYTE, TOTAL_CYCLES,
+    TOTAL_PKT,
 };
 use crate::subscription::*;
 
@@ -159,6 +160,10 @@ where
         // they were measured on, this ledger is the first thing worth looking at, and a
         // release build compiles `log::debug!` out entirely.
         println!("Core {}:\n{}", self.id, packet_ledger());
+        // After the drain, so terminations it delivered are included, and exactly once per
+        // core -- this is what makes `stats::total_ledger()` (and `tcp_bytes()` and friends)
+        // readable by an application once `Runtime::run` returns.
+        publish_ledger();
     }
 
     fn rx_sink(&self) {
