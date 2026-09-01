@@ -661,6 +661,7 @@ pub struct OfflineConfig {
 ///     timeout_resolution = 100
 ///     udp_inactivity_timeout = 60_000
 ///     tcp_inactivity_timeout = 300_000
+///     tcp_reassembly_timeout = 10_000
 ///     tcp_establish_timeout = 5000
 /// ```
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -699,12 +700,21 @@ pub struct ConnTrackConfig {
     #[serde(default = "default_tcp_inactivity_timeout")]
     pub tcp_inactivity_timeout: usize,
 
-    /// Override the default TCP connection inactivity timeout with this value (in milliseconds)
-    /// if there are unfilled sequence number gaps.
+    /// How long (in milliseconds) to wait for an unfilled sequence-number gap to be
+    /// filled before giving up on it. Defaults to `tcp_inactivity_timeout`.
     ///
-    /// Defaults to `tcp_inactivity_timeout`. This is used to prevent memory exhaustion
-    /// on networks where there may be loss between the ground truth TCP connection (guaranteed retransmissions)
-    /// and the monitoring vantage point (retransmissions not guaranteed).
+    /// This is a deadline for the *gap*, not for the connection. While either direction
+    /// is stalled behind a gap this replaces `tcp_inactivity_timeout`; on expiry Iris
+    /// abandons the gap, flushes the buffered out-of-order data that sits beyond it, and
+    /// continues tracking the connection under the normal inactivity timeout.
+    ///
+    /// Set this below `tcp_inactivity_timeout` on networks where there may be loss
+    /// between the ground truth TCP connection (guaranteed retransmissions) and the
+    /// monitoring vantage point (retransmissions not guaranteed): a gap that will never
+    /// be filled otherwise pins its buffered segments for the full inactivity timeout.
+    ///
+    /// Abandoning the gap also lets a connection whose FIN/ACK sequence straddled it
+    /// terminate normally, which is impossible while the gap stands.
     #[serde(default = "default_tcp_inactivity_timeout")]
     pub tcp_reassembly_timeout: usize,
 
