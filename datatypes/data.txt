@@ -36,6 +36,8 @@
 {"DatatypeFn":{"group_name":"RespPktStream","func":{"name":"update","datatypes":["L4Pdu"],"returns":"None"},"level":["InL4Conn"]}}
 {"Datatype":{"name":"QuicStream","level":"L7EndHdrs","expl_parsers":["quic"],"filtered":false}}
 {"DatatypeFn":{"group_name":"QuicStream","func":{"name":"from_session","datatypes":["Session"],"returns":{"Constructor":"OptRef"}},"level":["L7EndHdrs"]}}
+{"Datatype":{"name":"ReassemblyStats","level":null,"expl_parsers":[],"filtered":false}}
+{"DatatypeFn":{"group_name":"ReassemblyStats","func":{"name":"update","datatypes":["L4Pdu"],"returns":"None"},"level":["InL4Stream"]}}
 {"Datatype":{"name":"SshHandshake","level":"L7EndHdrs","expl_parsers":["ssh"],"filtered":false}}
 {"DatatypeFn":{"group_name":"SshHandshake","func":{"name":"from_session","datatypes":["Session"],"returns":{"Constructor":"OptRef"}},"level":["L7EndHdrs"]}}
 {"Datatype":{"name":"FiveTuple","level":"L4FirstPacket","expl_parsers":[],"filtered":false}}

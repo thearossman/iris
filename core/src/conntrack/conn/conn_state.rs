@@ -50,6 +50,24 @@ pub enum StateTransition {
     InL4Conn,
     /// Streaming anywhere in TCP or UDP connection, including TCP handshake.
     /// Packets are TCP-reassembled.
+    ///
+    /// ## Cost
+    /// This is the most expensive level in the framework, and the cost is not
+    /// obvious from the name. Subscribing at `InL4Stream` grants L4
+    /// `Actions::Parse` for the **entire lifetime** of every matched connection --
+    /// like `InL4Conn`'s `Update`, a streaming subscription does not unsubscribe
+    /// itself. So TCP reassembly runs on every segment until `L4Terminated`, and
+    /// each direction can hold up to `max_out_of_order` buffered mbufs the whole
+    /// time.
+    ///
+    /// Contrast a subscription whose only need is at `L7OnDisc`/`L7EndHdrs`: there
+    /// reassembly is driven by *L7* `Parse`, which is cleared once the headers are
+    /// parsed or the protocol is ruled out, after which the out-of-order buffers are
+    /// released. That runs for a handful of packets per connection rather than all
+    /// of them.
+    ///
+    /// Prefer `InL4Conn` unless reassembled, in-order bytes are genuinely required,
+    /// and pair a broad filter with this level only deliberately.
     InL4Stream,
 
     /// On L7 protocol identification
