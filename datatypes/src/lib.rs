@@ -26,6 +26,9 @@ pub use maybe_iperf3::*;
 pub mod maybe_quic;
 pub use maybe_quic::*;
 
+pub mod maybe_tls;
+pub use maybe_tls::*;
+
 pub mod maybe_zoom;
 pub use maybe_zoom::*;
 
