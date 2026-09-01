@@ -593,12 +593,13 @@ fn print_proto(name: &str, totals: &ByteTotals, transport_total: usize) {
     let headers = totals.headers.load(Ordering::Relaxed);
     let total = handshake + payload + headers;
     println!(
-        "{:<12} handshake: {}   payload: {}   headers: {}   of total traffic: {}",
+        "{:<12} handshake: {}   payload: {}   headers: {}   of total traffic: {}    (raw: {})",
         name,
         fmt_pct(pct(handshake, total)),
         fmt_pct(pct(payload, total)),
         fmt_pct(pct(headers, total)),
         fmt_pct(pct(total, transport_total)),
+        total,
     );
 }
 
