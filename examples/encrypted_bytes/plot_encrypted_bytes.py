@@ -2,10 +2,18 @@
 """Plot the `encrypted_bytes` example's output as a stacked column chart.
 
 Reads the text printed by `cargo run --example encrypted_bytes` (or a file/pipe
-carrying that output) and draws one column per protocol, split into "Payload"
-and "Handshake" segments, each sized as a % of *total transport traffic*
-(TCP + UDP) -- the same figure the Rust app itself prints as "of total
+carrying that output) and draws one column per protocol, split into "Payload",
+"Headers", and "Handshake" segments, each sized as a % of *total transport
+traffic* (TCP + UDP) -- the same figure the Rust app itself prints as "of total
 traffic" (see `print_proto` in examples/encrypted_bytes/src/main.rs).
+
+The three segments are the app's own three buckets and partition a protocol's
+on-wire bytes: whole frames up to the end of its L7 handshake ("Handshake"),
+then, for every frame after that, the L4 payload ("Payload") and the
+Ethernet/IP/TCP/UDP header bytes carrying it ("Headers"). Payload and Headers
+sit adjacent at the bottom of the stack because they are two halves of the same
+post-handshake traffic; the header segment is what the bulk transfer costs
+beyond the bulk itself.
 
 "QUIC" and "MaybeQUIC" (the real parser's rows vs. the heuristic mid-stream
 detector's row) are merged into a single "QUIC" column, since they're two
@@ -15,14 +23,14 @@ Any protocol whose own % of total transport traffic is below 1% (configurable
 with `--other-threshold`) is folded into a single "Other" column instead of
 getting its own sliver of a bar.
 
-A protocol's handshake share is often a small fraction of its own bytes, and
-that share is then scaled again by the protocol's share of total traffic --
-in practice this routinely produces handshake segments a few hundredths to a
+A protocol's handshake or header share is often a small fraction of its own
+bytes, and that share is then scaled again by the protocol's share of total
+traffic -- in practice this routinely produces segments a few hundredths to a
 few tenths of a percentage point tall, too thin to render as visible area at
-all. To keep a real, nonzero handshake share from silently disappearing, any
-such segment is floored to a minimum rendered height and paired with a small
-text label giving its true (unfloored) percentage -- see `MIN_VISIBLE_HANDSHAKE_FRAC`
-in `plot()`.
+all. To keep a real, nonzero share from silently disappearing, any such segment
+is floored to a minimum rendered height and paired with a small text label
+giving its true (unfloored) percentage -- see `MIN_VISIBLE_SEGMENT_FRAC` in
+`plot()`.
 
 Requires: matplotlib (`pip install matplotlib`)
 
@@ -42,11 +50,12 @@ from collections import OrderedDict
 import matplotlib.pyplot as plt
 
 # One line of `print_proto`'s output, e.g.:
-#   "TLS        handshake:  12.34%   payload:  87.66%   of total traffic:   5.02%"
-#   "MaybeZoom  handshake:    n/a    payload: 100.00%   of total traffic:   0.01%"
+#   "TLS      handshake:  2.34%  payload: 90.00%  headers:  7.66%  of total traffic: 5.02%"
+#   "MaybeZoom  handshake:  n/a   payload: 94.10%  headers:  5.90%  of total traffic: 0.01%"
 LINE_RE = re.compile(
     r"^(?P<name>\S+)\s+handshake:\s*(?P<handshake>\S+)"
     r"\s+payload:\s*(?P<payload>\S+)"
+    r"\s+headers:\s*(?P<headers>\S+)"
     r"\s+of total traffic:\s*(?P<total>\S+)"
 )
 
@@ -58,17 +67,24 @@ QUIC_MERGED_NAME = "QUIC"
 OTHER_THRESHOLD_PCT = 1.0
 OTHER_NAME = "Other"
 
-# Any nonzero handshake segment is floored to at least this fraction of the
-# chart's tallest column, so a real-but-tiny handshake share always renders
-# as a visible sliver instead of vanishing under the payload/handshake gap
-# edge. Purely a rendering floor -- the cap label and axis scaling still use
-# the true value; only the drawn bar geometry is exaggerated.
-MIN_VISIBLE_HANDSHAKE_FRAC = 0.008
+# Any nonzero segment is floored to at least this fraction of the chart's
+# tallest column, so a real-but-tiny share always renders as a visible sliver
+# instead of vanishing under the gap edges between stacked segments. Purely a
+# rendering floor -- the cap labels and axis scaling still use the true values;
+# only the drawn bar geometry is exaggerated.
+MIN_VISIBLE_SEGMENT_FRAC = 0.008
 
-# Fixed categorical order (palette slots 1 and 2 -- a validated adjacent pair,
-# never reordered/cycled): Payload first (bottom of the stack), Handshake second.
+# Fixed categorical slots 1-3, never reordered/cycled. These three validate on
+# every pair in both light and dark modes, so the stack can order them by
+# meaning (Payload and Headers adjacent at the bottom, Handshake on top) rather
+# than by slot index.
 PAYLOAD_COLOR = "#2a78d6"  # slot 1, blue
 HANDSHAKE_COLOR = "#eb6834"  # slot 2, orange
+HEADERS_COLOR = "#1baf7a"  # slot 3, aqua
+# Slot 3 sits just under 3:1 contrast on the light surface, which is fine for a
+# bar (the relief rule is satisfied by the direct labels below) but thin for
+# 7pt text. The labels use the palette's documented dark step for the same slot.
+HEADERS_LABEL_COLOR = "#199e70"
 SURFACE_COLOR = "#fcfcfb"
 INK_PRIMARY = "#0b0b0b"
 INK_SECONDARY = "#52514e"
@@ -91,9 +107,10 @@ def _pct(raw):
 
 
 def parse(text):
-    """Extract each protocol's handshake/payload % of *total transport traffic*.
+    """Extract each protocol's handshake/payload/header % of *total transport traffic*.
 
-    Returns an OrderedDict of name -> (handshake_pct_of_total, payload_pct_of_total),
+    Returns an OrderedDict of
+    name -> (handshake_pct_of_total, payload_pct_of_total, header_pct_of_total),
     in the order the rows first appeared in the input, with "QUIC" and
     "MaybeQUIC" merged into one "QUIC" entry.
     """
@@ -103,26 +120,22 @@ def parse(text):
         if not m:
             continue
         name = m.group("name")
-        handshake_frac = _pct(m.group("handshake")) / 100.0
-        payload_frac = _pct(m.group("payload")) / 100.0
         of_total = _pct(m.group("total"))
 
-        # `handshake`/`payload` are each protocol's *own* split (they sum to
-        # 100% of that protocol's bytes); scale by its share of transport
-        # traffic so every protocol stacks correctly on one shared
+        # `handshake`/`payload`/`headers` are each protocol's *own* split (they
+        # sum to 100% of that protocol's bytes); scale by its share of
+        # transport traffic so every protocol stacks correctly on one shared
         # "% of total transport traffic" axis.
-        handshake_of_total = of_total * handshake_frac
-        payload_of_total = of_total * payload_frac
+        split = tuple(
+            of_total * _pct(m.group(field)) / 100.0
+            for field in ("handshake", "payload", "headers")
+        )
 
         key = QUIC_MERGED_NAME if name in QUIC_ALIASES else name
         if key in rows:
-            prev_handshake, prev_payload = rows[key]
-            rows[key] = (
-                prev_handshake + handshake_of_total,
-                prev_payload + payload_of_total,
-            )
+            rows[key] = tuple(prev + cur for prev, cur in zip(rows[key], split))
         else:
-            rows[key] = (handshake_of_total, payload_of_total)
+            rows[key] = split
     return rows
 
 
@@ -131,21 +144,19 @@ def group_small(rows, threshold=OTHER_THRESHOLD_PCT):
     into a single combined "Other" row, so a long tail of near-zero protocols
     doesn't clutter the chart with unreadable slivers.
 
-    Rows are compared and combined on their *total* (handshake + payload);
-    the combined row's handshake/payload split is just the sum of the folded
+    Rows are compared and combined on their *total* (handshake + payload +
+    headers); the combined row's three-way split is just the sum of the folded
     rows' own splits, same as the QUIC/MaybeQUIC merge in `parse`.
     """
     kept = OrderedDict()
-    other_handshake = 0.0
-    other_payload = 0.0
-    for name, (handshake, payload) in rows.items():
-        if handshake + payload < threshold:
-            other_handshake += handshake
-            other_payload += payload
+    other = None
+    for name, split in rows.items():
+        if sum(split) < threshold:
+            other = split if other is None else tuple(a + b for a, b in zip(other, split))
         else:
-            kept[name] = (handshake, payload)
-    if other_handshake or other_payload:
-        kept[OTHER_NAME] = (other_handshake, other_payload)
+            kept[name] = split
+    if other is not None and any(other):
+        kept[OTHER_NAME] = other
     return kept
 
 
@@ -154,25 +165,33 @@ def plot(rows, out_path):
         raise SystemExit(
             "No protocol rows found -- is this really `encrypted_bytes`'s output? "
             "Expected lines like "
-            "'TLS   handshake: ...  payload: ...  of total traffic: ...'."
+            "'TLS   handshake: ...  payload: ...  headers: ...  of total traffic: ...'."
         )
 
     # Columns sorted by total % of transport traffic, largest first.
     names = sorted(rows.keys(), key=lambda n: sum(rows[n]), reverse=True)
     handshake_vals = [rows[n][0] for n in names]
     payload_vals = [rows[n][1] for n in names]
-    totals = [h + p for h, p in zip(handshake_vals, payload_vals)]
+    header_vals = [rows[n][2] for n in names]
+    totals = [sum(rows[n]) for n in names]
 
-    # Floor nonzero handshake segments to a minimum rendered height (see
-    # MIN_VISIBLE_HANDSHAKE_FRAC) so a real handshake share is never drawn as
-    # literally invisible. `rendered_handshake_vals` is for bar geometry only
-    # -- `handshake_vals`/`totals` (the true values) still drive every label.
+    # Floor nonzero segments to a minimum rendered height (see
+    # MIN_VISIBLE_SEGMENT_FRAC) so a real share is never drawn as literally
+    # invisible. The rendered values are for bar geometry only -- the true
+    # values still drive every label and the axis scale.
     max_total = max(totals) if any(totals) else 1.0
-    min_visible_handshake = max_total * MIN_VISIBLE_HANDSHAKE_FRAC
-    rendered_handshake_vals = [
-        max(h, min_visible_handshake) if h > 0 else 0.0 for h in handshake_vals
-    ]
-    render_tops = [p + rh for p, rh in zip(payload_vals, rendered_handshake_vals)]
+    min_visible = max_total * MIN_VISIBLE_SEGMENT_FRAC
+
+    def rendered(vals):
+        return [max(v, min_visible) if v > 0 else 0.0 for v in vals]
+
+    render_payload = rendered(payload_vals)
+    render_headers = rendered(header_vals)
+    render_handshake = rendered(handshake_vals)
+    # Bottoms of the second and third stacked segments.
+    headers_bottoms = render_payload
+    handshake_bottoms = [p + h for p, h in zip(render_payload, render_headers)]
+    render_tops = [b + hs for b, hs in zip(handshake_bottoms, render_handshake)]
 
     # Figure size tracks the column count directly (rather than a wide fixed
     # minimum) so a trace with only a couple of protocols doesn't end up
@@ -189,75 +208,63 @@ def plot(rows, out_path):
     # with few columns that default margin reads as dead space on both sides.
     ax.set_xlim(-0.5, n - 0.5)
 
-    ax.bar(
-        x,
-        payload_vals,
-        width=bar_width,
-        color=PAYLOAD_COLOR,
-        edgecolor=SURFACE_COLOR,
-        linewidth=gap_lw,
-        label="Payload",
-    )
-    ax.bar(
-        x,
-        rendered_handshake_vals,
-        width=bar_width,
-        bottom=payload_vals,
-        color=HANDSHAKE_COLOR,
-        edgecolor=SURFACE_COLOR,
-        linewidth=gap_lw,
-        label="Handshake",
-    )
-
-    # Two stacked labels per column, offset in points (not data units) so
-    # their gap stays constant regardless of figure size or the data's
-    # scale -- a fixed fraction of `max_total` would compress right along
-    # with a shorter figure and start overlapping.
-    #
-    # Bottom line, right above the cap: the handshake segment's own true %
-    # of total traffic -- since a real handshake sliver is often floored to
-    # a visible minimum (see MIN_VISIBLE_HANDSHAKE_FRAC), its rendered area
-    # can be exaggerated relative to its real value, so the reader needs
-    # the number, not just the area, to read it accurately.
-    #
-    # Top line: the payload segment's % of total traffic. Pushed up an
-    # extra LABEL_LINE_GAP_PT above the handshake line only when a
-    # handshake line is actually drawn beneath it; otherwise it sits right
-    # above the cap like the handshake line would have.
-    HANDSHAKE_LABEL_OFFSET_PT = 4
-    LABEL_LINE_GAP_PT = 13
-    for xi, payload, handshake, render_top in zip(
-        x, payload_vals, handshake_vals, render_tops
+    for values, bottoms, color, label in (
+        (render_payload, None, PAYLOAD_COLOR, "Payload"),
+        (render_headers, headers_bottoms, HEADERS_COLOR, "Headers"),
+        (render_handshake, handshake_bottoms, HANDSHAKE_COLOR, "Handshake"),
     ):
-        if handshake > 0:
-            # ".2f" rounds anything under 0.01% down to a bare "0.00%",
-            # which reads as "no handshake" -- exactly the misleading
-            # impression this label exists to correct. Say "<0.01%" instead.
-            label = "<0.01%" if handshake < 0.005 else f"{handshake:.2f}%"
+        ax.bar(
+            x,
+            values,
+            width=bar_width,
+            bottom=bottoms,
+            color=color,
+            edgecolor=SURFACE_COLOR,
+            linewidth=gap_lw,
+            label=label,
+        )
+
+    # One label line per nonzero segment, stacked above the column in the
+    # stack's own bottom-to-top order (handshake, headers, payload -- reading
+    # up from the cap mirrors reading down the bar). Offsets are in points, not
+    # data units, so the gap between lines stays constant regardless of figure
+    # size or the data's scale -- a fixed fraction of `max_total` would
+    # compress right along with a shorter figure and start overlapping.
+    #
+    # These numbers aren't decoration: a real-but-tiny segment is often floored
+    # to a visible minimum (see MIN_VISIBLE_SEGMENT_FRAC), so its rendered area
+    # can be exaggerated relative to its true value, and the reader needs the
+    # number rather than the area to read it accurately. Lines for segments a
+    # protocol doesn't have are skipped rather than printed as 0.00%, so the
+    # remaining lines close up against the cap.
+    FIRST_LABEL_OFFSET_PT = 4
+    LABEL_LINE_GAP_PT = 13
+    for xi, handshake, headers, payload, render_top in zip(
+        x, handshake_vals, header_vals, payload_vals, render_tops
+    ):
+        offset = FIRST_LABEL_OFFSET_PT
+        for value, color, fontsize in (
+            (handshake, HANDSHAKE_COLOR, 7),
+            (headers, HEADERS_LABEL_COLOR, 7),
+            (payload, PAYLOAD_COLOR, 9),
+        ):
+            if value <= 0:
+                continue
+            # ".2f" rounds anything under 0.01% down to a bare "0.00%", which
+            # reads as "this segment isn't there" -- exactly the misleading
+            # impression these labels exist to correct. Say "<0.01%" instead.
+            label = "<0.01%" if value < 0.005 else f"{value:.2f}%"
             ax.annotate(
                 label,
                 xy=(xi, render_top),
-                xytext=(0, HANDSHAKE_LABEL_OFFSET_PT),
+                xytext=(0, offset),
                 textcoords="offset points",
                 ha="center",
                 va="bottom",
-                fontsize=7,
-                color=HANDSHAKE_COLOR,
+                fontsize=fontsize,
+                color=color,
             )
-        payload_offset = HANDSHAKE_LABEL_OFFSET_PT + (
-            LABEL_LINE_GAP_PT if handshake > 0 else 0
-        )
-        if payload > 0:
-            ax.annotate(
-                f"{payload:.2f}%",
-                xy=(xi, render_top),
-                xytext=(0, payload_offset),
-                textcoords="offset points",
-                ha="center",
-                va="bottom",
-                fontsize=9,
-                color=PAYLOAD_COLOR,
-            )
+            offset += LABEL_LINE_GAP_PT
 
     # The labels above are placed in fixed *point* offsets, not data units,
     # so the axes' data-to-point scale (which depends on figure size) has to
