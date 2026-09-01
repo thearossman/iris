@@ -39,13 +39,23 @@ pub struct GapStats {
     /// Payload bytes delivered after at least one gap. These bytes are real and
     /// were parsed, but they are not stream-contiguous with what preceded them.
     pub bytes_after_gap: u64,
+    /// The beginning of this direction's stream was never observed, so an unknown
+    /// number of bytes precede the first segment seen. Set either when the
+    /// connection was adopted from the middle of a stream, or when reassembly gave
+    /// up waiting for this direction's stream start. See
+    /// [`ReassemblyStats::start_unobserved`] for why those are not distinguished.
+    ///
+    /// Those bytes are *not* counted in `missing_bytes`, which only reports gaps of
+    /// known size.
+    pub start_unknown: bool,
 }
 
 impl GapStats {
-    /// No data was lost in this direction.
+    /// The whole of this direction's stream was observed: no abandoned gaps, and
+    /// the stream start was seen.
     #[inline]
     pub fn complete(&self) -> bool {
-        self.nb_gaps == 0
+        self.nb_gaps == 0 && !self.start_unknown
     }
 }
 
@@ -69,10 +79,27 @@ pub struct ReassemblyStats {
 }
 
 impl ReassemblyStats {
-    /// The reassembled stream is byte-complete in both directions.
+    /// The reassembled stream is byte-complete in both directions: no gaps were
+    /// abandoned and neither stream start was missed.
     #[inline]
     pub fn complete(&self) -> bool {
         self.orig.complete() && self.resp.complete()
+    }
+
+    /// The beginning of at least one direction's stream was never observed, so an
+    /// unknown number of bytes precede everything reported here.
+    ///
+    /// Two situations produce this, and they are not distinguished:
+    /// - the connection was adopted from the middle of a stream (one of the
+    ///   `init_*` options on `ConnTrackConfig`, all off by default);
+    /// - reassembly gave up waiting for a direction's stream start and adopted the
+    ///   lowest buffered segment instead, which a normal connection can hit if its
+    ///   responder buffer fills before the SYN/ACK is observed.
+    ///
+    /// So this does *not* imply the connection was adopted mid-stream.
+    #[inline]
+    pub fn start_unobserved(&self) -> bool {
+        self.orig.start_unknown || self.resp.start_unknown
     }
 
     /// Total stream bytes never observed, across both directions.
@@ -117,6 +144,9 @@ impl ReassemblyStats {
         if gap > 0 {
             flow.nb_gaps += 1;
             flow.missing_bytes += u64::from(gap);
+        }
+        if pdu.stream_start_unknown() {
+            flow.start_unknown = true;
         }
         // Every segment from this direction's first gap onwards is post-gap data,
         // not just the one carrying the mark. Keyed off *this* direction: the two

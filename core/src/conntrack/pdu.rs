@@ -79,6 +79,17 @@ impl L4Pdu {
         self.ctxt.gap_before
     }
 
+    /// Whether this is the first segment seen in its direction on a stream whose
+    /// beginning was never observed, so an unknown number of bytes precede it.
+    ///
+    /// True for connections adopted from the middle of a stream (see the `init_*`
+    /// options on [`ConnTrackConfig`](crate::config::ConnTrackConfig)). Distinct
+    /// from [`L4Pdu::gap_before`], which reports a gap of *known* size.
+    #[inline]
+    pub fn stream_start_unknown(&self) -> bool {
+        self.ctxt.stream_start_unknown
+    }
+
     #[inline]
     pub fn seq_no(&self) -> u32 {
         self.ctxt.seq_no
@@ -129,6 +140,11 @@ pub struct L4Context {
     /// payload. Non-zero only when TCP reassembly has given up on a sequence gap
     /// and resumed after it. See [`L4Pdu::gap_before`].
     pub gap_before: u32,
+    /// This is the first segment observed in its direction, and the start of that
+    /// direction's stream was never seen, so an unknown number of bytes precede it.
+    /// Set for connections adopted from the middle of a stream. See
+    /// [`L4Pdu::stream_start_unknown`].
+    pub stream_start_unknown: bool,
 }
 
 impl L4Context {
@@ -151,6 +167,7 @@ impl L4Context {
                             reassembled: false,
                             app_offset: None,
                             gap_before: 0,
+                            stream_start_unknown: false,
                         })
                     } else {
                         Err(PacketParseError::InvalidRead)
@@ -171,6 +188,7 @@ impl L4Context {
                             reassembled: false,
                             app_offset: None,
                             gap_before: 0,
+                            stream_start_unknown: false,
                         })
                     } else {
                         Err(PacketParseError::InvalidRead)
@@ -195,6 +213,7 @@ impl L4Context {
                             reassembled: false,
                             app_offset: None,
                             gap_before: 0,
+                            stream_start_unknown: false,
                         })
                     } else {
                         Err(PacketParseError::InvalidRead)
@@ -215,6 +234,7 @@ impl L4Context {
                             reassembled: false,
                             app_offset: None,
                             gap_before: 0,
+                            stream_start_unknown: false,
                         })
                     } else {
                         Err(PacketParseError::InvalidRead)

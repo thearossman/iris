@@ -3,6 +3,7 @@
 //! Provides endpoint-specific (distinguishes originator and responder) and generic identifiers for bi-directional connections.
 //! Iris defines a "connection" by five tuple (source/destination addresses, ports, and transport protocol).
 
+use crate::conntrack::pdu::L4Pdu;
 use crate::conntrack::L4Context;
 
 use crate::protocols::packet::tcp::TCP_PROTOCOL;
@@ -34,6 +35,34 @@ impl FiveTuple {
             orig: ctxt.src,
             resp: ctxt.dst,
             proto: ctxt.proto,
+        }
+    }
+
+    /// Creates a new 5-tuple from `ctxt`, treating the packet's *receiver* as the
+    /// connection originator.
+    ///
+    /// Used when a connection is adopted from a packet travelling responder to
+    /// originator -- a SYN/ACK -- so that `orig` still names the client.
+    pub fn from_ctxt_reversed(ctxt: &L4Context) -> Self {
+        FiveTuple {
+            orig: ctxt.dst,
+            resp: ctxt.src,
+            proto: ctxt.proto,
+        }
+    }
+
+    /// Creates a 5-tuple oriented by the PDU's direction.
+    ///
+    /// [`FiveTuple::from_ctxt`] assumes the packet travels originator to responder,
+    /// which is true of every connection opened on a bare SYN but *not* of one
+    /// adopted from a SYN/ACK. Prefer this wherever a `L4Pdu` is available, so that
+    /// `orig`/`resp` agree with `L4Pdu::dir` -- which is what per-direction
+    /// accounting keys off.
+    pub fn from_pdu(pdu: &L4Pdu) -> Self {
+        if pdu.dir {
+            Self::from_ctxt(&pdu.ctxt)
+        } else {
+            Self::from_ctxt_reversed(&pdu.ctxt)
         }
     }
 

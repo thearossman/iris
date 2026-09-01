@@ -17,7 +17,7 @@ pub use conn::conn_layers::Layer;
 pub use conn::conn_state::{LayerState, StateTransition, StateTxData};
 pub use conn::ConnInfo;
 
-use self::conn::{Conn, L4Conn};
+use self::conn::{Conn, InitPolicy, L4Conn};
 use self::conn_id::ConnId;
 use self::pdu::{L4Context, L4Pdu};
 use self::timerwheel::TimerWheel;
@@ -150,7 +150,8 @@ where
                         TCP_PROTOCOL => Conn::<T>::new_tcp(
                             self.config.tcp_establish_timeout,
                             self.config.max_out_of_order,
-                            &pdu,
+                            self.config.init,
+                            &mut pdu,
                             self.core_id,
                         ),
                         UDP_PROTOCOL => Conn::<T>::new_udp(
@@ -254,6 +255,8 @@ pub(crate) struct TrackerConfig {
     pub(super) tcp_reassembly_timeout: usize,
     /// Frequency to check for inactive streams (in milliseconds).
     pub(super) timeout_resolution: usize,
+    /// Which in-progress TCP connections to adopt when no bare SYN was observed.
+    pub(super) init: InitPolicy,
 }
 
 impl From<&ConnTrackConfig> for TrackerConfig {
@@ -266,6 +269,12 @@ impl From<&ConnTrackConfig> for TrackerConfig {
             tcp_establish_timeout: config.tcp_establish_timeout,
             tcp_reassembly_timeout: config.tcp_reassembly_timeout,
             timeout_resolution: config.timeout_resolution,
+            init: InitPolicy {
+                synack: config.init_synack,
+                fin: config.init_fin,
+                rst: config.init_rst,
+                data: config.init_data,
+            },
         }
     }
 }

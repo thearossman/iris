@@ -26,6 +26,55 @@ impl TcpConn {
         }
     }
 
+    /// Adopts a connection already in progress, from a packet that is not a bare
+    /// SYN.
+    ///
+    /// `dir` is the direction of the observed packet. Its flow resumes at that
+    /// packet's sequence number; the peer's flow has been observed not at all, so
+    /// its stream start is unknown.
+    ///
+    /// Whether the *observed* flow's start is unknown depends on the packet: a SYN,
+    /// bare or with ACK, carries the sender's ISN, so adopting on a SYN/ACK pins
+    /// the responder's origin exactly. Only a packet without SYN -- data, FIN, RST
+    /// -- leaves that flow's start genuinely unknown.
+    ///
+    /// The handshake is recorded as done without dispatching `L4EndHshk`: the L4
+    /// layer must leave its pre-handshake state for payload to flow, but we did not
+    /// see a handshake and must not claim otherwise.
+    ///
+    /// Note that where a flow *is* marked `start_unknown`, the first segment is
+    /// still not stamped with `gap_before`. That is deliberate: a non-zero `gap_before`
+    /// during protocol discovery makes L7 conclude discovery failed, which would
+    /// render `init_data` useless. Probing an adopted connection from wherever the
+    /// stream was picked up is the only chance to identify it, and accepting the
+    /// extra risk of misidentification is precisely what enabling the flag opts
+    /// into.
+    pub(crate) fn new_midstream(ctxt: L4Context, dir: bool, max_ooo: usize) -> Self {
+        // This packet is consumed directly rather than passed through reassembly,
+        // so `next_seq` must already be past it. SYN and FIN each occupy a
+        // sequence number of their own on top of any payload.
+        let mut next_seq = ctxt.seq_no.wrapping_add(ctxt.length as u32);
+        if ctxt.flags & (SYN | FIN) != 0 {
+            next_seq = next_seq.wrapping_add(1);
+        }
+        // A SYN carries the sender's ISN, so this flow's origin is known after all.
+        let observed = match ctxt.flags & SYN != 0 {
+            true => TcpFlow::new(max_ooo, next_seq, ctxt.flags, ctxt.ack_no),
+            false => TcpFlow::new_midstream(max_ooo, next_seq, ctxt.flags, ctxt.ack_no),
+        };
+        let unobserved = TcpFlow::unobserved(max_ooo);
+        let (ctos, stoc) = if dir {
+            (observed, unobserved)
+        } else {
+            (unobserved, observed)
+        };
+        TcpConn {
+            ctos,
+            stoc,
+            handshake_done: true,
+        }
+    }
+
     /// Insert TCP segment ordered into ctos or stoc flow
     #[inline]
     pub(crate) fn reassemble<T: Trackable>(
@@ -51,8 +100,10 @@ impl TcpConn {
     /// Permanently give up on every outstanding sequence gap in both directions,
     /// delivering all buffered out-of-order data.
     ///
-    /// Each `skip_gap` call removes at least one buffered segment, so the loops
-    /// terminate. Invoked when the reassembly deadline expires and on every
+    /// The loops terminate: a `skip_gap` that returns `true` has flushed at least
+    /// one buffered segment, and it returns `false` when no progress is possible --
+    /// the connection was dropped mid-flush, or nothing buffered sits ahead of
+    /// `next_seq`. Invoked when the reassembly deadline expires and on every
     /// termination path, so post-gap data is never silently discarded.
     #[inline]
     pub(crate) fn recover_gaps<T: Trackable>(

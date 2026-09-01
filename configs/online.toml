@@ -40,6 +40,11 @@ tcp_inactivity_timeout = 300000
 # under tcp_inactivity_timeout.
 tcp_reassembly_timeout = 10000
 tcp_establish_timeout = 5000
+# Track TCP connections if first packet seen is not a bare SYN.
+# init_synack = false
+# init_data = false
+# init_fin = false
+# init_rst = false
 
 [online.prometheus]
 port = 9898

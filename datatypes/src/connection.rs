@@ -216,7 +216,7 @@ impl ConnRecord {
 
 impl Tracked for ConnRecord {
     fn new(first_pkt: &L4Pdu) -> Self {
-        let five_tuple = FiveTuple::from_ctxt(&first_pkt.ctxt);
+        let five_tuple = FiveTuple::from_pdu(first_pkt);
         let now = Instant::now();
         Self {
             five_tuple,

@@ -79,6 +79,7 @@ struct Families {
     tcp_reassembly_gap_bytes: Family<CoreId, Counter>,
     tcp_segments_after_gap: Family<CoreId, Counter>,
     tcp_reassembly_timeouts: Family<CoreId, Counter>,
+    midstream_tcp_adopted: Family<CoreId, Counter>,
     total_pkt: Family<CoreId, Counter>,
     total_byte: Family<CoreId, Counter>,
     tcp_pkt: Family<CoreId, Counter>,
@@ -234,6 +235,12 @@ pub(crate) static STAT_REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         FAMILIES.tcp_reassembly_timeouts.clone(),
     );
     r.register_with_unit(
+        "iris_midstream_tcp_adopted",
+        "Number of TCP connections adopted from the middle of a stream.",
+        Unit::Other("conns".to_string()),
+        FAMILIES.midstream_tcp_adopted.clone(),
+    );
+    r.register_with_unit(
         "iris_worker_received",
         "Number of total packets received from dpdk.",
         Unit::Other("pkts".to_string()),
@@ -315,6 +322,7 @@ pub(crate) struct PerCorePrometheusStats {
     tcp_reassembly_gap_bytes: Counter,
     tcp_segments_after_gap: Counter,
     tcp_reassembly_timeouts: Counter,
+    midstream_tcp_adopted: Counter,
     total_pkt: Counter,
     total_byte: Counter,
     tcp_pkt: Counter,
@@ -361,6 +369,7 @@ pub(crate) fn update_thread_local_stats(core: CoreId) {
                 .tcp_reassembly_timeouts
                 .get_or_create(&core)
                 .clone(),
+            midstream_tcp_adopted: FAMILIES.midstream_tcp_adopted.get_or_create(&core).clone(),
             total_pkt: FAMILIES.total_pkt.get_or_create(&core).clone(),
             total_byte: FAMILIES.total_byte.get_or_create(&core).clone(),
             tcp_pkt: FAMILIES.tcp_pkt.get_or_create(&core).clone(),
@@ -400,6 +409,8 @@ pub(crate) fn update_thread_local_stats(core: CoreId) {
         pr.tcp_reassembly_timeouts
             .inc_by(TCP_REASSEMBLY_TIMEOUTS.get());
         TCP_REASSEMBLY_TIMEOUTS.set(0);
+        pr.midstream_tcp_adopted.inc_by(MIDSTREAM_TCP_ADOPTED.get());
+        MIDSTREAM_TCP_ADOPTED.set(0);
         pr.total_pkt.inc_by(TOTAL_PKT.get());
         TOTAL_PKT.set(0);
         pr.total_byte.inc_by(TOTAL_BYTE.get());
