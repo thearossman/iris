@@ -35,6 +35,9 @@ pub use packet_list::*;
 pub mod quic_stream;
 pub use quic_stream::QuicStream;
 
+pub mod reassembly_stats;
+pub use reassembly_stats::{GapStats, ReassemblyStats};
+
 pub mod ssh_handshake;
 pub use ssh_handshake::SshHandshake;
 

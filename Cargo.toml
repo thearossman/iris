@@ -8,6 +8,7 @@ members = [
     "examples/bytes_over_time",
     "examples/enc_conns",
     "examples/encrypted_bytes",
+    "examples/gap_recovery",
     "examples/measuring_sec",
     "examples/ml_qos",
     "examples/open_vpn",
