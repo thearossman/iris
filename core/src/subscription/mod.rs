@@ -6,7 +6,9 @@ use crate::memory::mbuf::Mbuf;
 use crate::protocols::packet::tcp::TCP_PROTOCOL;
 use crate::protocols::packet::udp::UDP_PROTOCOL;
 use crate::protocols::stream::ParserRegistry;
-use crate::stats::{StatExt, TCP_BYTE, TCP_PKT, UDP_BYTE, UDP_PKT};
+use crate::stats::{record, Outcome, StatExt, TCP_BYTE, TCP_PKT, UDP_BYTE, UDP_PKT};
+
+use std::time::Instant;
 
 pub mod data;
 pub mod filter;
@@ -75,21 +77,32 @@ where
         }
     }
 
-    pub fn process_packet(&self, mbuf: Mbuf, conn_tracker: &mut ConnTracker<S::Tracked>) {
-        if let Ok(ctxt) = L4Context::new(&mbuf) {
-            match ctxt.proto {
-                TCP_PROTOCOL => {
-                    TCP_PKT.inc();
-                    TCP_BYTE.inc_by(mbuf.data_len() as u64);
-                }
-                UDP_PROTOCOL => {
-                    UDP_PKT.inc();
-                    UDP_BYTE.inc_by(mbuf.data_len() as u64);
-                }
-                _ => {}
+    pub fn process_packet(
+        &self,
+        mbuf: Mbuf,
+        conn_tracker: &mut ConnTracker<S::Tracked>,
+        now: Instant,
+    ) {
+        let Ok(ctxt) = L4Context::new(&mbuf) else {
+            // ARP, ICMP, non-first IP fragments, truncated frames: no L4 to track.
+            record(Outcome::NotTransport, mbuf.data_len() as u64);
+            return;
+        };
+        match ctxt.proto {
+            TCP_PROTOCOL => {
+                TCP_PKT.inc();
+                TCP_BYTE.inc_by(mbuf.data_len() as u64);
             }
-            conn_tracker.process(mbuf, ctxt, self);
+            UDP_PROTOCOL => {
+                UDP_PKT.inc();
+                UDP_BYTE.inc_by(mbuf.data_len() as u64);
+            }
+            _ => {
+                record(Outcome::NotTransport, mbuf.data_len() as u64);
+                return;
+            }
         }
+        conn_tracker.process(mbuf, ctxt, self, now);
     }
     /// Invokes the software packet filter.
     /// Used for each packet to determine

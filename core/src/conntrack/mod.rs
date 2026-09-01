@@ -27,7 +27,10 @@ use crate::memory::mbuf::Mbuf;
 use crate::protocols::packet::tcp::TCP_PROTOCOL;
 use crate::protocols::packet::udp::UDP_PROTOCOL;
 use crate::protocols::stream::ParserRegistry;
-use crate::stats::{StatExt, TCP_NEW_CONNECTIONS, UDP_NEW_CONNECTIONS};
+use crate::stats::{
+    record, record_conn_closed, record_new_conn, Outcome, StatExt, TCP_NEW_CONNECTIONS,
+    UDP_NEW_CONNECTIONS,
+};
 use crate::subscription::{Subscription, Trackable};
 
 use std::cmp;
@@ -85,25 +88,41 @@ where
         self.table.len()
     }
 
-    /// Process a single incoming packet `mbuf` with layer-4 context `ctxt`.
+    /// Process a single incoming packet `mbuf` with layer-4 context `ctxt`, observed at `now`.
+    ///
+    /// `now` is the clock the caller wants this packet stamped with -- it becomes the
+    /// connection's `last_seen_ts` and the `L4Pdu::ts` every subscription sees. Live capture
+    /// passes `Instant::now()`; offline replay passes either that or, under
+    /// [`OfflineConfig::replay_clock`](crate::config::OfflineConfig::replay_clock), a clock
+    /// derived from the pcap's capture timestamps.
     pub(crate) fn process(
         &mut self,
         mbuf: Mbuf,
         ctxt: L4Context,
         subscription: &Subscription<T::Subscribed>,
+        now: Instant,
     ) {
         let conn_id = ConnId::new(ctxt.src, ctxt.dst, ctxt.proto);
+        // Read before the mbuf is moved into a PDU; every ledger arm below needs it.
+        let bytes = mbuf.data_len() as u64;
+        let tracked_outcome = match ctxt.proto {
+            UDP_PROTOCOL => Outcome::TrackedUdp,
+            _ => Outcome::TrackedTcp,
+        };
         match self.table.raw_entry_mut().from_key(&conn_id) {
             RawEntryMut::Occupied(mut occupied) => {
                 let conn = occupied.get_mut();
-                conn.last_seen_ts = Instant::now();
+                conn.last_seen_ts = now;
                 if conn.remove_from_table() {
                     log::error!("Conn in Drop state when occupied in table");
+                    record(Outcome::DroppedUnmatched, bytes);
                     return;
                 }
                 if conn.drop_pdu() {
+                    record(Outcome::DroppedUnmatched, bytes);
                     return;
                 }
+                record(tracked_outcome, bytes);
                 let dir = conn.packet_dir(&ctxt);
                 let pdu = L4Pdu::new(mbuf, ctxt, dir, conn.last_seen_ts);
 
@@ -112,6 +131,12 @@ where
 
                 // Delete stale data for connections no longer matching
                 if conn.remove_from_table() {
+                    // Removed without `terminate()`, so no `L4Terminated` runs and whatever
+                    // subscriptions accumulated for this connection goes with it. Reached
+                    // when the connection entered a drop state during `update` above --
+                    // notably TCP reassembly abandoning a flow after `max_out_of_order`
+                    // segments backed up behind a sequence hole.
+                    record_conn_closed(false);
                     occupied.remove();
                 } else if conn.drop_pdu() {
                     conn.info.clear();
@@ -131,7 +156,7 @@ where
             }
             RawEntryMut::Vacant(_) => {
                 if self.size() < self.config.max_connections {
-                    let mut pdu = L4Pdu::new(mbuf, ctxt, true, Instant::now());
+                    let mut pdu = L4Pdu::new(mbuf, ctxt, true, now);
                     let conn = match ctxt.proto {
                         TCP_PROTOCOL => Conn::<T>::new_tcp(
                             self.config.tcp_establish_timeout,
@@ -147,6 +172,7 @@ where
                         _ => Err(anyhow!("Invalid L4 Protocol")),
                     };
                     if let Ok(mut conn) = conn {
+                        record(tracked_outcome, bytes);
                         conn.info.filter_first_packet(subscription, &pdu);
                         // Pre-reassembly update
                         if conn.info.needs_update() {
@@ -168,16 +194,24 @@ where
                             match ctxt.proto {
                                 TCP_PROTOCOL => {
                                     TCP_NEW_CONNECTIONS.inc();
+                                    record_new_conn(true);
                                 }
                                 UDP_PROTOCOL => {
                                     UDP_NEW_CONNECTIONS.inc();
+                                    record_new_conn(false);
                                 }
                                 _ => {}
                             }
                         }
+                    } else {
+                        // `new_udp` cannot fail and non-TCP/UDP never reaches here, so the
+                        // only way to land in this arm is `new_tcp` refusing a flow whose SYN
+                        // was never observed. See `stats::PacketLedger::dropped_no_syn`.
+                        record(Outcome::DroppedNoSyn, bytes);
                     }
                 } else {
                     log::error!("Table full. Dropping packet.");
+                    record(Outcome::DroppedTableFull, bytes);
                 }
             }
         }

@@ -57,10 +57,18 @@
 //! of avoided: each connection's histogram is a sparse `Vec<SliceBytes>` (one entry per slice
 //! actually touched, appended in order since packet timestamps are non-decreasing within a
 //! connection) capped at `--max-conn-slices` (default 512, ~12KB/conn). Once the cap is hit,
-//! the vector is coarsened -- pairwise-merged into half as many entries, each now covering two
-//! slices -- so coverage stays complete but temporal resolution degrades, and only
-//! logarithmically: at the default 1s slice width a connection gets full 1s resolution for its
-//! first ~8.5 minutes, 2s resolution for the next ~17 minutes, 4s for the next ~34, and so on.
+//! the vector is coarsened -- pairwise-merged into half as many entries, each now covering the
+//! combined slice range of the pair it replaced -- so coverage stays complete but temporal
+//! resolution degrades, and only logarithmically: at the default 1s slice width a connection
+//! that is busy every second gets full 1s resolution for its first ~8.5 minutes, 2s resolution
+//! for the next ~17 minutes, 4s for the next ~34, and so on.
+//!
+//! Each entry carries the inclusive global-slice range (`first..=last`) its bytes came from,
+//! and a coarsened entry's bytes are spread evenly back over exactly that range at flush time.
+//! Blurring *within* a connection's own activity is the intended cost of coarsening; moving
+//! bytes outside it is not, and ranges make that impossible. A connection idle between bursts
+//! keeps its bursts where they happened no matter how many times its histogram is coarsened,
+//! which matters here because per-slice peaks -- not just run totals -- are the output.
 //!
 //! ## `--min-bytes`
 //! As in `encrypted_bytes`: passing `--min-bytes N` excludes any connection whose own total
@@ -112,8 +120,45 @@
 //! ## Timestamps are processing time, not capture time
 //! As in `concurrent_conns`: `L4Pdu::ts` comes from `Instant::now()` when a packet is
 //! processed, not from any timestamp recorded in a capture file. For offline pcap replay an
-//! entire trace can be replayed in far less than a second of processing time, so offline runs
-//! are useful here only as a correctness smoke test, not a trace-accurate measurement.
+//! entire trace can be replayed in far less than a second of processing time, so by default
+//! offline runs collapse into a single time slice -- useful as a correctness smoke test, not
+//! as a trace-accurate measurement.
+//!
+//! Setting `replay_clock = true` in the config's `[offline]` block changes that: the runtime
+//! then derives the clock it hands connection tracking from the pcap's own capture
+//! timestamps, so a trace spanning an hour of capture time produces an hour of slices (and
+//! inactivity timeouts fire on the same clock). See
+//! [`OfflineConfig::replay_clock`](iris_core::config::OfflineConfig::replay_clock).
+//!
+//! ## Testing this app offline, over many windows
+//! Three pieces, all in this directory:
+//!
+//! * `replay_clock = true` in the `[offline]` config, so a trace spans real time slices.
+//! * `make_stress_trace.py` replicates a small real trace into one with the properties a
+//!   busy link has -- high connection concurrency, long-lived flows, connections still open
+//!   at the end, flows with no SYN, and RX-drop-style sequence holes -- while keeping the
+//!   packets real enough that the protocol parsers still identify them.
+//! * `check_bytes.py` re-derives per-slice TCP/UDP totals straight from that pcap and diffs
+//!   them against the CSV, checking conservation (columns sum to the run total), containment
+//!   (no slice reports more than the wire carried), and placement (no bytes outside the
+//!   trace's active window).
+//!
+//! ```text
+//! python3 examples/bytes_over_time/make_stress_trace.py traces/small_flows.pcap /tmp/stress.pcap \
+//!     --replicas 40 --stagger 30 --stretch 12
+//! ./target/release/bytes_over_time --config configs/offline-replay.toml -o /tmp/bytes.csv
+//! python3 examples/bytes_over_time/check_bytes.py /tmp/stress.pcap /tmp/bytes.csv
+//! ```
+//!
+//! Sweeping `--max-conn-slices` down (512 -> 32 -> 8 -> 2) forces the coarsening path that a
+//! very long-lived connection would otherwise take hours to reach, which is how the range
+//! invariant described under "Bounding per-connection memory" is exercised cheaply.
+//!
+//! The runtime also prints a per-core packet-accounting ledger
+//! ([`stats::PacketLedger`](iris_core::stats::PacketLedger)) at the end of a run: of the bytes
+//! it received, how many reached connection tracking and where the rest went. When this app's
+//! totals come out below the link they were measured on, that ledger says how much of the gap
+//! happened before the app ever saw a packet.
 
 use clap::Parser;
 use iris_compiler::{callback, datatype, datatype_fn, input_files, iris_end_macros};
@@ -361,65 +406,74 @@ mod global_slice_tests {
     }
 }
 
-/// One (possibly coarsened) entry in a connection's in-progress byte histogram. `key` is an
-/// absolute *coarse* slice index: the connection's current `coarsen_shift` determines how many
-/// real slices (`1 << coarsen_shift`) it represents, starting at `key << coarsen_shift`.
+/// One (possibly coarsened) entry in a connection's in-progress byte histogram, holding the
+/// bytes seen across the *inclusive* range of global slices `first..=last`. An uncoarsened
+/// entry has `first == last`; coarsening widens the range rather than rescaling an index, so
+/// an entry always names the real slices its bytes actually came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SliceBytes {
-    key: u32,
+    first: u32,
+    last: u32,
     handshake: u64,
     payload: u64,
 }
 
-/// Appends `(handshake, payload)` bytes at `global_slice`, coarsened by `shift`, onto `buckets`
-/// -- extending the last entry if its key matches, else pushing a new one. Packet timestamps
-/// are non-decreasing within a connection, so this only ever needs to look at the last entry;
-/// defensively, a coarse key *less* than the last one (an out-of-order packet) is folded into
-/// the last entry instead of breaking the ordering invariant `coarsen`/flush depend on.
-fn push_bytes(
-    buckets: &mut Vec<SliceBytes>,
-    global_slice: usize,
-    shift: u32,
-    handshake: u64,
-    payload: u64,
-) {
-    let key = (global_slice >> shift) as u32;
+impl SliceBytes {
+    /// How many global slices this entry's bytes get spread back over at flush time.
+    fn span(&self) -> usize {
+        (self.last - self.first) as usize + 1
+    }
+}
+
+/// Appends `(handshake, payload)` bytes at `global_slice` onto `buckets` -- extending the last
+/// entry if it already covers that slice, else pushing a new single-slice one. Packet
+/// timestamps are non-decreasing within a connection, so this only ever needs to look at the
+/// last entry; defensively, a slice at or before the last entry's range (an out-of-order
+/// packet) is folded into that entry rather than breaking the ordering invariant
+/// `coarsen`/flush depend on.
+fn push_bytes(buckets: &mut Vec<SliceBytes>, global_slice: usize, handshake: u64, payload: u64) {
+    let slice = global_slice as u32;
     match buckets.last_mut() {
-        Some(last) if last.key == key => {
-            last.handshake += handshake;
-            last.payload += payload;
-        }
-        Some(last) if key < last.key => {
+        Some(last) if slice <= last.last => {
             last.handshake += handshake;
             last.payload += payload;
         }
         _ => buckets.push(SliceBytes {
-            key,
+            first: slice,
+            last: slice,
             handshake,
             payload,
         }),
     }
 }
 
-/// Halves `buckets` in place by merging adjacent pairs (summing their bytes, halving their
-/// key), doubling the slice width each entry represents. Byte-conserving: the sum of all
-/// `handshake`/`payload` fields is unchanged. An odd trailing entry is kept as-is (its pair
-/// hasn't arrived yet).
+/// Halves `buckets` in place by merging adjacent pairs: the merged entry sums their bytes and
+/// covers from the first entry's `first` to the second's `last`. Byte-conserving, and -- since
+/// entries are in slice order -- range-conserving too: a merged entry never claims a slice
+/// outside the span its constituents already covered. So coarsening can blur *where within a
+/// connection's own activity* a byte arrived, but it cannot move that byte outside it.
+///
+/// An earlier version keyed entries by `global_slice >> coarsen_shift` and merged by halving
+/// that key. On a sparse histogram -- a connection idle for most of its life, which is most
+/// long-lived connections -- positionally adjacent entries could be thousands of slices apart,
+/// and the merged entry took the *first* entry's rescaled key while covering a fixed
+/// `1 << shift` slices from it. Bytes from the second entry were then flushed to whenever the
+/// first entry happened to be, and a trailing entry could spread past the end of the run
+/// entirely. Ranges make both impossible.
+///
+/// An odd trailing entry is kept as-is (its pair hasn't arrived yet).
 fn coarsen(buckets: &mut Vec<SliceBytes>) {
     let mut merged = Vec::with_capacity(buckets.len().div_ceil(2));
     let mut iter = std::mem::take(buckets).into_iter();
     while let Some(first) = iter.next() {
         match iter.next() {
             Some(second) => merged.push(SliceBytes {
-                key: first.key / 2,
+                first: first.first,
+                last: second.last,
                 handshake: first.handshake + second.handshake,
                 payload: first.payload + second.payload,
             }),
-            None => merged.push(SliceBytes {
-                key: first.key / 2,
-                handshake: first.handshake,
-                payload: first.payload,
-            }),
+            None => merged.push(first),
         }
     }
     *buckets = merged;
@@ -429,106 +483,63 @@ fn coarsen(buckets: &mut Vec<SliceBytes>) {
 mod bucket_tests {
     use super::*;
 
-    #[test]
-    fn same_key_extends_last() {
-        let mut buckets = Vec::new();
-        push_bytes(&mut buckets, 5, 0, 10, 0);
-        push_bytes(&mut buckets, 5, 0, 0, 20);
-        assert_eq!(
-            buckets,
-            vec![SliceBytes {
-                key: 5,
-                handshake: 10,
-                payload: 20
-            }]
-        );
+    fn bucket(first: u32, last: u32, handshake: u64, payload: u64) -> SliceBytes {
+        SliceBytes {
+            first,
+            last,
+            handshake,
+            payload,
+        }
     }
 
     #[test]
-    fn new_key_pushes() {
+    fn same_slice_extends_last() {
         let mut buckets = Vec::new();
-        push_bytes(&mut buckets, 5, 0, 10, 0);
-        push_bytes(&mut buckets, 6, 0, 0, 20);
-        assert_eq!(
-            buckets,
-            vec![
-                SliceBytes {
-                    key: 5,
-                    handshake: 10,
-                    payload: 0
-                },
-                SliceBytes {
-                    key: 6,
-                    handshake: 0,
-                    payload: 20
-                },
-            ]
-        );
+        push_bytes(&mut buckets, 5, 10, 0);
+        push_bytes(&mut buckets, 5, 0, 20);
+        assert_eq!(buckets, vec![bucket(5, 5, 10, 20)]);
+    }
+
+    #[test]
+    fn new_slice_pushes() {
+        let mut buckets = Vec::new();
+        push_bytes(&mut buckets, 5, 10, 0);
+        push_bytes(&mut buckets, 6, 0, 20);
+        assert_eq!(buckets, vec![bucket(5, 5, 10, 0), bucket(6, 6, 0, 20)]);
     }
 
     #[test]
     fn out_of_order_folds_into_last() {
         let mut buckets = Vec::new();
-        push_bytes(&mut buckets, 6, 0, 10, 0);
-        push_bytes(&mut buckets, 5, 0, 5, 0);
-        assert_eq!(
-            buckets,
-            vec![SliceBytes {
-                key: 6,
-                handshake: 15,
-                payload: 0
-            }]
-        );
+        push_bytes(&mut buckets, 6, 10, 0);
+        push_bytes(&mut buckets, 5, 5, 0);
+        assert_eq!(buckets, vec![bucket(6, 6, 15, 0)]);
     }
 
     #[test]
     fn coarsen_halves_and_conserves_bytes() {
-        let mut buckets = vec![
-            SliceBytes {
-                key: 0,
-                handshake: 1,
-                payload: 2,
-            },
-            SliceBytes {
-                key: 1,
-                handshake: 3,
-                payload: 4,
-            },
-            SliceBytes {
-                key: 2,
-                handshake: 5,
-                payload: 6,
-            },
-        ];
+        let mut buckets = vec![bucket(0, 0, 1, 2), bucket(1, 1, 3, 4), bucket(2, 2, 5, 6)];
         let total_before: u64 = buckets.iter().map(|b| b.handshake + b.payload).sum();
         coarsen(&mut buckets);
         let total_after: u64 = buckets.iter().map(|b| b.handshake + b.payload).sum();
         assert_eq!(total_before, total_after);
-        assert_eq!(
-            buckets,
-            vec![
-                SliceBytes {
-                    key: 0,
-                    handshake: 4,
-                    payload: 6
-                },
-                SliceBytes {
-                    key: 1,
-                    handshake: 5,
-                    payload: 6
-                },
-            ]
-        );
+        assert_eq!(buckets, vec![bucket(0, 1, 4, 6), bucket(2, 2, 5, 6)]);
     }
 
     #[test]
-    fn repeated_coarsening_still_conserves_bytes() {
+    fn coarsen_keeps_bytes_inside_the_span_they_came_from() {
+        // The sparse case the old key-halving merge got wrong: two entries thousands of
+        // slices apart. The merged entry must cover exactly 1000..=9000, not a fixed-width
+        // window anchored on the first entry.
+        let mut buckets = vec![bucket(1000, 1000, 7, 0), bucket(9000, 9000, 0, 11)];
+        coarsen(&mut buckets);
+        assert_eq!(buckets, vec![bucket(1000, 9000, 7, 11)]);
+    }
+
+    #[test]
+    fn repeated_coarsening_still_conserves_bytes_and_span() {
         let mut buckets: Vec<SliceBytes> = (0..8)
-            .map(|i| SliceBytes {
-                key: i,
-                handshake: i as u64,
-                payload: 1,
-            })
+            .map(|i| bucket(i * 100, i * 100, i as u64, 1))
             .collect();
         let total_before: u64 = buckets.iter().map(|b| b.handshake + b.payload).sum();
         coarsen(&mut buckets);
@@ -536,24 +547,22 @@ mod bucket_tests {
         coarsen(&mut buckets);
         let total_after: u64 = buckets.iter().map(|b| b.handshake + b.payload).sum();
         assert_eq!(total_before, total_after);
-        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets, vec![bucket(0, 700, 28, 8)]);
     }
 }
 
-/// Distributes one coarse bucket's bytes evenly across the real global slices it covers
-/// (`[key << shift, (key << shift) + (1 << shift) - 1]`), with the integer-division remainder
-/// going to the first slice, clamping any slice past `num_slices - 1` into the final slice.
-/// Returns `true` iff clamping was needed (i.e. this bucket ran past the accounting horizon).
-fn flush_bucket(
-    bucket: &SliceBytes,
-    shift: u32,
-    num_slices: usize,
-    add: impl Fn(usize, u64, u64),
-) -> bool {
-    let span = 1usize << shift;
-    let first_slice = (bucket.key as usize) << shift;
+/// Distributes one bucket's bytes evenly across the global slices it covers
+/// (`bucket.first..=bucket.last`), with the integer-division remainder going to the first
+/// slice, clamping any slice past `num_slices - 1` into the final slice. Returns `true` iff
+/// clamping was needed (i.e. this bucket ran past the accounting horizon).
+///
+/// Even distribution is the only honest choice once a bucket has been coarsened: the
+/// within-range detail is exactly what coarsening threw away. An uncoarsened bucket spans one
+/// slice, so it is placed exactly.
+fn flush_bucket(bucket: &SliceBytes, num_slices: usize, add: impl Fn(usize, u64, u64)) -> bool {
+    let span = bucket.span();
+    let first_slice = bucket.first as usize;
     let last_idx = num_slices - 1;
-    let overflowed = first_slice > last_idx;
 
     let hs_base = bucket.handshake / span as u64;
     let hs_rem = bucket.handshake % span as u64;
@@ -566,7 +575,7 @@ fn flush_bucket(
         let pl = pl_base + if i == 0 { pl_rem } else { 0 };
         add(slice, hs, pl);
     }
-    overflowed || (first_slice + span - 1) > last_idx
+    bucket.last as usize > last_idx
 }
 
 #[cfg(test)]
@@ -577,17 +586,17 @@ mod flush_bucket_tests {
     #[test]
     fn even_split_preserves_total() {
         let bucket = SliceBytes {
-            key: 1,
+            first: 4,
+            last: 7,
             handshake: 10,
             payload: 21,
         };
         let seen = RefCell::new(Vec::new());
-        let overflowed = flush_bucket(&bucket, 2, 100, |slice, hs, pl| {
+        let overflowed = flush_bucket(&bucket, 100, |slice, hs, pl| {
             seen.borrow_mut().push((slice, hs, pl));
         });
         assert!(!overflowed);
         let seen = seen.into_inner();
-        // key=1, shift=2 -> covers global slices 4..=7
         assert_eq!(seen.len(), 4);
         // base (10/4=2, 21/4=5) plus remainder (10%4=2, 21%4=1) lands on the first slice.
         assert_eq!(seen[0], (4, 4, 6));
@@ -598,15 +607,31 @@ mod flush_bucket_tests {
     }
 
     #[test]
+    fn single_slice_bucket_is_placed_exactly() {
+        let bucket = SliceBytes {
+            first: 42,
+            last: 42,
+            handshake: 3,
+            payload: 5,
+        };
+        let seen = RefCell::new(Vec::new());
+        assert!(!flush_bucket(&bucket, 100, |slice, hs, pl| {
+            seen.borrow_mut().push((slice, hs, pl));
+        }));
+        assert_eq!(seen.into_inner(), vec![(42, 3, 5)]);
+    }
+
+    #[test]
     fn clamps_past_horizon() {
         let bucket = SliceBytes {
-            key: 3,
+            first: 12,
+            last: 15,
             handshake: 8,
             payload: 0,
         };
         let seen = RefCell::new(Vec::new());
-        // shift=2 -> covers global slices 12..=15, but num_slices=10 (valid indices 0..=9)
-        let overflowed = flush_bucket(&bucket, 2, 10, |slice, hs, pl| {
+        // num_slices=10, so valid indices are 0..=9 and the whole bucket is past the horizon.
+        let overflowed = flush_bucket(&bucket, 10, |slice, hs, pl| {
             seen.borrow_mut().push((slice, hs, pl));
         });
         assert!(overflowed);
@@ -614,6 +639,24 @@ mod flush_bucket_tests {
         assert!(seen.iter().all(|(slice, _, _)| *slice == 9));
         let total_hs: u64 = seen.iter().map(|(_, hs, _)| hs).sum();
         assert_eq!(total_hs, 8);
+    }
+
+    #[test]
+    fn partially_past_horizon_still_conserves() {
+        let bucket = SliceBytes {
+            first: 8,
+            last: 11,
+            handshake: 0,
+            payload: 40,
+        };
+        let seen = RefCell::new(Vec::new());
+        assert!(flush_bucket(&bucket, 10, |slice, hs, pl| {
+            seen.borrow_mut().push((slice, hs, pl));
+        }));
+        let seen = seen.into_inner();
+        let total_pl: u64 = seen.iter().map(|(_, _, pl)| pl).sum();
+        assert_eq!(total_pl, 40);
+        assert!(seen.iter().all(|(slice, _, _)| *slice <= 9));
     }
 }
 
@@ -627,7 +670,6 @@ struct ByteSeries {
     l4_proto: usize,
     in_payload: bool,
     buckets: Vec<SliceBytes>,
-    coarsen_shift: u32,
 }
 
 impl ByteSeries {
@@ -653,12 +695,11 @@ impl ByteSeries {
         } else {
             (len as u64, 0)
         };
-        push_bytes(&mut self.buckets, slice, self.coarsen_shift, hs, pl);
+        push_bytes(&mut self.buckets, slice, hs, pl);
 
         let max_slices = MAX_CONN_SLICES.load(Ordering::Relaxed);
         if self.buckets.len() >= max_slices {
             coarsen(&mut self.buckets);
-            self.coarsen_shift += 1;
         }
     }
 
@@ -679,14 +720,12 @@ impl Tracked for ByteSeries {
             l4_proto: first_pkt.ctxt.proto,
             in_payload: false,
             buckets: Vec::new(),
-            coarsen_shift: 0,
         }
     }
 
     fn clear(&mut self) {
         self.in_payload = false;
         self.buckets.clear();
-        self.coarsen_shift = 0;
     }
 }
 
@@ -702,15 +741,14 @@ fn flush_series(series: &ByteSeries, arrays: &SeriesArrays, conn_count: &AtomicU
     let num_slices = arrays.handshake.len();
     let mut overflowed = false;
     for bucket in &series.buckets {
-        let bucket_overflowed =
-            flush_bucket(bucket, series.coarsen_shift, num_slices, |slice, hs, pl| {
-                if hs > 0 {
-                    arrays.handshake[slice].fetch_add(hs, Ordering::Relaxed);
-                }
-                if pl > 0 {
-                    arrays.payload[slice].fetch_add(pl, Ordering::Relaxed);
-                }
-            });
+        let bucket_overflowed = flush_bucket(bucket, num_slices, |slice, hs, pl| {
+            if hs > 0 {
+                arrays.handshake[slice].fetch_add(hs, Ordering::Relaxed);
+            }
+            if pl > 0 {
+                arrays.payload[slice].fetch_add(pl, Ordering::Relaxed);
+            }
+        });
         overflowed |= bucket_overflowed;
     }
     if overflowed {
@@ -728,13 +766,12 @@ fn flush_transport(series: &ByteSeries, dest: &[AtomicU64]) {
     let num_slices = dest.len();
     let mut overflowed = false;
     for bucket in &series.buckets {
-        let bucket_overflowed =
-            flush_bucket(bucket, series.coarsen_shift, num_slices, |slice, hs, pl| {
-                let bytes = hs + pl;
-                if bytes > 0 {
-                    dest[slice].fetch_add(bytes, Ordering::Relaxed);
-                }
-            });
+        let bucket_overflowed = flush_bucket(bucket, num_slices, |slice, hs, pl| {
+            let bytes = hs + pl;
+            if bytes > 0 {
+                dest[slice].fetch_add(bytes, Ordering::Relaxed);
+            }
+        });
         overflowed |= bucket_overflowed;
     }
     if overflowed {

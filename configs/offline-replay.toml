@@ -1,0 +1,34 @@
+# Offline mode with the capture-timestamp replay clock enabled, for testing time-bucketing
+# applications (examples/bytes_over_time, examples/concurrent_conns) over many time windows
+# without a live link.
+#
+# `replay_clock = true` pins the first frame's capture timestamp to the runtime's start
+# instant and offsets every later frame by its capture-time delta, so a trace spanning an
+# hour of capture time produces an hour of `L4Pdu::ts` -- without the replay taking an hour.
+# Inactivity timeouts run on the same clock. Without it, an entire trace replays inside a
+# single instant and every packet lands in one slice.
+#
+# The `dpdk_supl_args` here take memory from the regular heap instead of hugepages and skip
+# NIC probing, so this config runs without root. Expect a performance hit; this is for
+# testing, not measurement.
+
+main_core = 0
+nb_memory_channels = 6
+
+[mempool]
+    capacity = 262_144
+    cache_size = 512
+
+[offline]
+    pcap = "./traces/small_flows.pcap"
+    mtu = 9702
+    replay_clock = true
+    dpdk_supl_args = ["--no-huge", "--no-pci", "-m", "6144"]
+
+[conntrack]
+    max_connections = 10_000_000
+    max_out_of_order = 500
+    timeout_resolution = 100
+    udp_inactivity_timeout = 60_000
+    tcp_inactivity_timeout = 300_000
+    tcp_establish_timeout = 5000

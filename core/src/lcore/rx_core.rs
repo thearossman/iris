@@ -5,8 +5,8 @@ use crate::dpdk;
 use crate::memory::mbuf::Mbuf;
 use crate::port::{RxQueue, RxQueueType};
 use crate::stats::{
-    StatExt, IDLE_CYCLES, IGNORED_BY_PACKET_FILTER_BYTE, IGNORED_BY_PACKET_FILTER_PKT, TOTAL_BYTE,
-    TOTAL_CYCLES, TOTAL_PKT,
+    packet_ledger, record, Outcome, StatExt, IDLE_CYCLES, IGNORED_BY_PACKET_FILTER_BYTE,
+    IGNORED_BY_PACKET_FILTER_PKT, TOTAL_BYTE, TOTAL_CYCLES, TOTAL_PKT,
 };
 use crate::subscription::*;
 
@@ -129,13 +129,16 @@ where
 
                     TOTAL_PKT.inc();
                     TOTAL_BYTE.inc_by(mbuf.data_len() as u64);
+                    record(Outcome::Received, mbuf.data_len() as u64);
 
                     let cont = self.subscription.filter_packet(&mbuf, &self.id);
                     if cont {
-                        self.subscription.process_packet(mbuf, &mut conn_table);
+                        self.subscription
+                            .process_packet(mbuf, &mut conn_table, Instant::now());
                     } else {
                         IGNORED_BY_PACKET_FILTER_PKT.inc();
                         IGNORED_BY_PACKET_FILTER_BYTE.inc_by(mbuf.data_len() as u64);
+                        record(Outcome::IgnoredByPacketFilter, mbuf.data_len() as u64);
                     }
                 }
             }
@@ -152,6 +155,10 @@ where
             nb_pkts,
             nb_bytes
         );
+        // Printed, not logged: when an application's byte totals come out below the link
+        // they were measured on, this ledger is the first thing worth looking at, and a
+        // release build compiles `log::debug!` out entirely.
+        println!("Core {}:\n{}", self.id, packet_ledger());
     }
 
     fn rx_sink(&self) {

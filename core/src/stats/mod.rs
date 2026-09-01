@@ -1,5 +1,9 @@
 use std::cell::Cell;
 
+mod ledger;
+pub use ledger::{packet_ledger, PacketLedger, Tally};
+pub(crate) use ledger::{record, record_conn_closed, record_new_conn, Outcome};
+
 #[cfg(feature = "prometheus")]
 mod prometheus;
 

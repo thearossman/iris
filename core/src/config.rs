@@ -218,6 +218,7 @@ impl Default for RuntimeConfig {
                 // assumes Iris is being run from crate root
                 pcap: "./traces/small_flows.pcap".to_string(),
                 dpdk_supl_args: Vec::new(),
+                replay_clock: false,
             }),
             conntrack: ConnTrackConfig {
                 max_connections: 100_000,
@@ -644,6 +645,24 @@ pub struct OfflineConfig {
     /// performance hit; this is for testing, not measurement.
     #[serde(default = "default_dpdk_supl_args")]
     pub dpdk_supl_args: Vec<String>,
+
+    /// Derive the clock the runtime hands to connection tracking from the pcap's own
+    /// per-frame capture timestamps instead of from `Instant::now()` at processing time.
+    /// Defaults to `false` (processing time, the historical behavior).
+    ///
+    /// Without this, an entire trace is replayed in however long the replay takes -- often
+    /// well under a second -- so every packet lands in the same instant. Any application
+    /// that buckets by `L4Pdu::ts` (`examples/bytes_over_time`,
+    /// `examples/concurrent_conns`) therefore sees exactly one time slice offline, and
+    /// inactivity timeouts never fire. With `replay_clock`, the first frame's capture
+    /// timestamp is pinned to the runtime's start instant and every later frame is offset
+    /// from it by its capture-time delta, so a trace spanning an hour of capture time
+    /// spans an hour of `L4Pdu::ts` -- reproducibly, and without the replay taking an
+    /// hour. Timeout checks run against the same clock.
+    ///
+    /// This changes only the timestamps and timeout checks; it does not pace the replay.
+    #[serde(default)]
+    pub replay_clock: bool,
 }
 
 /* --------------------------------------------------------------------------------- */

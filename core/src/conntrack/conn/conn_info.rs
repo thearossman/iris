@@ -4,6 +4,7 @@ use super::conn_actions::TrackedActions;
 use crate::lcore::CoreId;
 use crate::protocols::packet::tcp::TCP_PROTOCOL;
 use crate::protocols::stream::{ConnData, ParserRegistry};
+use crate::stats::record_conn_closed;
 use crate::subscription::{Subscription, Trackable};
 use crate::FiveTuple;
 use crate::L4Pdu;
@@ -139,7 +140,11 @@ where
                 break;
             }
         }
-        if !self.drop() {
+        // A connection already in a drop state gets no `L4Terminated`, so anything a
+        // subscription accumulated for it is discarded. See `stats::PacketLedger`.
+        let delivered = !self.drop();
+        record_conn_closed(delivered);
+        if delivered {
             self.exec_state_tx(StateTransition::L4Terminated, subscription);
         }
     }

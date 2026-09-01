@@ -10,6 +10,7 @@ use crate::subscription::{Subscribable, Trackable};
 use crate::L4Pdu;
 use crate::Runtime;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Instant;
 
 ///// Dummy types /////
 
@@ -133,7 +134,7 @@ fn core_state_tx() {
     let conn_id = ConnId::new(ctxt.src, ctxt.dst, ctxt.proto);
 
     // Process TCP SYN
-    conntrack.process(mbuf.clone(), ctxt, &subscription);
+    conntrack.process(mbuf.clone(), ctxt, &subscription, Instant::now());
     assert!(
         conntrack.size() == 1,
         "ConnTracker should have one entry after processing a SYN packet."
@@ -158,7 +159,7 @@ fn core_state_tx() {
     }
 
     // Process duplicate packet
-    conntrack.process(mbuf.clone(), ctxt, &subscription);
+    conntrack.process(mbuf.clone(), ctxt, &subscription, Instant::now());
     assert!(conntrack.size() == 1);
     {
         let entry = conntrack
@@ -187,7 +188,7 @@ fn core_state_tx() {
     conntrack.clear_registry();
     ctxt.flags = 0;
     ctxt.seq_no = 1;
-    conntrack.process(mbuf, ctxt, &subscription);
+    conntrack.process(mbuf, ctxt, &subscription, Instant::now());
     {
         let entry = conntrack
             .table
