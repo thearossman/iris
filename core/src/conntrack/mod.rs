@@ -116,7 +116,7 @@ where
                 } else if conn.drop_pdu() {
                     conn.info.clear();
                 } else if conn.terminated() {
-                    conn.terminate(subscription);
+                    conn.terminate(subscription, &self.registry);
                     occupied.remove();
                 } else {
                     // Update inactivity timeout
@@ -127,6 +127,20 @@ where
                         ),
                         L4Conn::Udp(_) => self.config.udp_inactivity_timeout,
                     };
+                    // The wheel schedules each connection once, at insert time. A
+                    // deadline that just moved earlier -- a sequence gap opening,
+                    // swapping in the shorter reassembly timeout -- would otherwise
+                    // go unnoticed until the original, much later bucket. Compare
+                    // absolute deadlines, not windows: windows measured from
+                    // different `last_seen_ts` are not comparable, and the initial
+                    // one is `tcp_establish_timeout`, which is shorter than any
+                    // sensible reassembly timeout. Re-inserting supersedes the old
+                    // entry rather than duplicating it.
+                    let (last_seen_ts, window) = (conn.last_seen_ts, conn.inactivity_window);
+                    if self.timerwheel.expire_time(last_seen_ts, window) < conn.scheduled_expiry {
+                        conn.scheduled_expiry =
+                            self.timerwheel.insert(&conn_id, last_seen_ts, window);
+                    }
                 }
             }
             RawEntryMut::Vacant(_) => {
@@ -159,7 +173,7 @@ where
                                 .consume_stream(&mut pdu, subscription, &self.registry);
                         }
                         if !conn.remove_from_table() {
-                            self.timerwheel.insert(
+                            conn.scheduled_expiry = self.timerwheel.insert(
                                 &conn_id,
                                 conn.last_seen_ts,
                                 conn.inactivity_window,
@@ -187,7 +201,7 @@ where
     pub(crate) fn drain(&mut self, subscription: &Subscription<T::Subscribed>) {
         log::info!("Draining Connection table");
         for (_, mut conn) in self.table.drain() {
-            conn.terminate(subscription);
+            conn.terminate(subscription, &self.registry);
         }
     }
 
@@ -197,8 +211,15 @@ where
         subscription: &Subscription<T::Subscribed>,
         now: Instant,
     ) {
-        self.timerwheel
-            .check_inactive(&mut self.table, subscription, now);
+        // Destructured for disjoint field borrows: expiry may need to flush
+        // buffered stream data through the parser registry.
+        let ConnTracker {
+            registry,
+            table,
+            timerwheel,
+            ..
+        } = self;
+        timerwheel.check_inactive(table, subscription, registry, now);
     }
 
     /// Clears the parser registry. Used in testing.

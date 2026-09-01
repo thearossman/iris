@@ -48,6 +48,29 @@ impl TcpConn {
         }
     }
 
+    /// Permanently give up on every outstanding sequence gap in both directions,
+    /// delivering all buffered out-of-order data.
+    ///
+    /// Each `skip_gap` call removes at least one buffered segment, so the loops
+    /// terminate. Invoked when the reassembly deadline expires and on every
+    /// termination path, so post-gap data is never silently discarded.
+    #[inline]
+    pub(crate) fn recover_gaps<T: Trackable>(
+        &mut self,
+        info: &mut ConnInfo<T>,
+        subscription: &Subscription<T::Subscribed>,
+        registry: &ParserRegistry,
+    ) {
+        while !self.ctos.ooo_buf.is_empty() && self.ctos.skip_gap(info, subscription, registry) {}
+        while !self.stoc.ooo_buf.is_empty() && self.stoc.skip_gap(info, subscription, registry) {}
+    }
+
+    /// Returns `true` if either direction is stalled behind an unfilled sequence gap.
+    #[inline]
+    pub(crate) fn has_pending_gap(&self) -> bool {
+        !self.ctos.ooo_buf.is_empty() || !self.stoc.ooo_buf.is_empty()
+    }
+
     /// Returns true if the PDU currently being processed is the last
     /// packet in the TCP handshake.
     /// Note: we define this pretty loosely -- we just require that both sides have sent SYNs and ACKs,
@@ -83,17 +106,20 @@ impl TcpConn {
             || (self.ctos.consumed_flags & RST | self.stoc.consumed_flags & RST) != 0
     }
 
-    /// Returns the correct inactivity timeout
-    /// (reassembly timeout if there are out-of-order segments, default otherwise)
+    /// Returns the correct inactivity timeout.
+    ///
+    /// While either direction is stalled behind a sequence gap, the shorter
+    /// `reassembly_timeout` applies: it is the deadline for that gap to be filled
+    /// before Iris gives up on it, not a deadline for the connection.
     #[inline]
     pub(crate) fn inactivity_timeout(
         &self,
         default_inactivity_timeout: usize,
         reassembly_timeout: usize,
     ) -> usize {
-        match self.ctos.ooo_buf.is_empty() && self.stoc.ooo_buf.is_empty() {
-            true => default_inactivity_timeout,
-            false => reassembly_timeout,
+        match self.has_pending_gap() {
+            false => default_inactivity_timeout,
+            true => reassembly_timeout,
         }
     }
 

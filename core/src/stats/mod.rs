@@ -21,6 +21,8 @@ thread_local! {
     pub(crate) static TCP_SEGMENTS_AFTER_GAP: Cell<u64> = const { Cell::new(0) };
     /// Segments dropped because the out-of-order buffer could not be drained.
     pub(crate) static TCP_OOO_SEGMENT_DROPPED: Cell<u64> = const { Cell::new(0) };
+    /// Times the reassembly deadline expired on a connection stalled behind a gap.
+    pub(crate) static TCP_REASSEMBLY_TIMEOUTS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static TOTAL_PKT: Cell<u64> = const { Cell::new(0) };
     pub(crate) static TOTAL_BYTE: Cell<u64> = const { Cell::new(0) };
     pub(crate) static TCP_PKT: Cell<u64> = const { Cell::new(0) };

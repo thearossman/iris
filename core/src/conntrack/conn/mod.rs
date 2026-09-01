@@ -46,6 +46,20 @@ where
     pub(crate) last_seen_ts: Instant,
     /// Amount of time (in milliseconds) before the connection should be expired for inactivity.
     pub(crate) inactivity_window: usize,
+    /// When the connection's live timerwheel entry is due to fire, in milliseconds
+    /// since the wheel's epoch; `usize::MAX` before the first insert.
+    ///
+    /// The wheel schedules a connection once, at insert time, so a deadline that
+    /// later moves *earlier* -- a sequence gap opening, which swaps in the shorter
+    /// reassembly timeout -- would otherwise go unnoticed until the originally
+    /// scheduled bucket came round. Comparing absolute deadlines (rather than
+    /// windows, which are not comparable across different `last_seen_ts`) drives a
+    /// re-insert at the earlier bucket.
+    ///
+    /// It doubles as the wheel's liveness token: an entry whose stored deadline no
+    /// longer matches this field has been superseded and is discarded on sweep, so
+    /// re-inserting never accumulates duplicates.
+    pub(crate) scheduled_expiry: usize,
     /// Layer-4 connection tracking.
     pub(crate) l4conn: L4Conn,
     /// Connection tracking for filtering and parsing.
@@ -79,6 +93,7 @@ where
         Ok(Conn {
             last_seen_ts: pdu.ts,
             inactivity_window: initial_timeout,
+            scheduled_expiry: usize::MAX,
             l4conn: L4Conn::Tcp(tcp_conn),
             info: ConnInfo::new(pdu, core_id),
         })
@@ -92,6 +107,7 @@ where
         Ok(Conn {
             last_seen_ts: pdu.ts,
             inactivity_window: initial_timeout,
+            scheduled_expiry: usize::MAX,
             l4conn: L4Conn::Udp(udp_conn),
             info: ConnInfo::new(pdu, core_id),
         })
@@ -205,12 +221,43 @@ where
         self.info.cdata.five_tuple.orig == ctxt.src
     }
 
+    /// Returns `true` if this is a TCP connection stalled behind an unfilled
+    /// sequence gap.
+    pub(super) fn has_pending_gap(&self) -> bool {
+        match &self.l4conn {
+            L4Conn::Tcp(tcp_conn) => tcp_conn.has_pending_gap(),
+            L4Conn::Udp(_) => false,
+        }
+    }
+
+    /// Permanently give up on any outstanding sequence gaps, delivering the
+    /// buffered out-of-order data that sits beyond them.
+    pub(crate) fn recover_gaps(
+        &mut self,
+        subscription: &Subscription<T::Subscribed>,
+        registry: &ParserRegistry,
+    ) {
+        if let L4Conn::Tcp(tcp_conn) = &mut self.l4conn {
+            tcp_conn.recover_gaps(&mut self.info, subscription, registry);
+        }
+    }
+
     /// Invokes connection termination tasks that are triggered when any of the following conditions
     /// occur:
     /// - the connection naturally terminates (e.g., FIN/RST)
     /// - the connection expires due to inactivity
     /// - the connection is drained at the end of the run
-    pub(crate) fn terminate(&mut self, subscription: &Subscription<T::Subscribed>) {
+    ///
+    /// Any data still buffered behind an unfilled sequence gap is recovered first,
+    /// so it reaches parsers and subscriptions instead of being freed with the
+    /// connection. This matters most when draining at end of run: for an offline
+    /// pcap, every gap is unfillable at EOF.
+    pub(crate) fn terminate(
+        &mut self,
+        subscription: &Subscription<T::Subscribed>,
+        registry: &ParserRegistry,
+    ) {
+        self.recover_gaps(subscription, registry);
         self.info.handle_terminate(subscription);
     }
 }
