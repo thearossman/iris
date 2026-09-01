@@ -39,7 +39,10 @@ where
     T: Trackable,
 {
     pub(super) fn new(pdu: &L4Pdu, core_id: CoreId) -> Self {
-        let five_tuple = FiveTuple::from_ctxt(&pdu.ctxt);
+        // Oriented by `pdu.dir`: a connection adopted from a SYN/ACK is opened by a
+        // packet travelling responder to originator, so the five-tuple has to be
+        // read in reverse to name the client as originator.
+        let five_tuple = FiveTuple::from_pdu(pdu);
         ConnInfo {
             linfo: LayerInfo {
                 state: if pdu.ctxt.proto == TCP_PROTOCOL {
@@ -90,6 +93,16 @@ where
         if needs_update && subscription.update(self, pdu, tx) {
             self.exec_state_tx(tx, subscription);
         }
+    }
+
+    /// Move an adopted mid-stream connection out of the pre-handshake state.
+    ///
+    /// Payload cannot flow while L4 sits in `Headers`, but no handshake was
+    /// observed, so unlike [`ConnInfo::handshake_done`] this dispatches no
+    /// `L4EndHshk` transition. Subscriptions to that transition simply never fire
+    /// for adopted connections.
+    pub(super) fn adopt_midstream(&mut self) {
+        self.linfo.state = LayerState::Payload;
     }
 
     /// Invoked by reassembly infrastructure when the TCP handshake is completed.

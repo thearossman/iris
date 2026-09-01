@@ -57,6 +57,27 @@ impl TcpFlow {
         }
     }
 
+    /// Creates a TCP flow adopted from the middle of a stream: `next_seq` is taken
+    /// from the first observed segment, and everything before it is a gap of
+    /// unknown size.
+    #[inline]
+    pub(super) fn new_midstream(capacity: usize, next_seq: u32, flags: u8, ack: u32) -> Self {
+        TcpFlow {
+            start_unknown: true,
+            ..TcpFlow::new(capacity, next_seq, flags, ack)
+        }
+    }
+
+    /// Creates a TCP flow for a direction that has not been observed at all. Its
+    /// stream start is unknown, unlike a flow awaiting a SYN/ACK.
+    #[inline]
+    pub(super) fn unobserved(capacity: usize) -> Self {
+        TcpFlow {
+            start_unknown: true,
+            ..TcpFlow::default(capacity)
+        }
+    }
+
     /// Attempt to insert incoming data segment into flow.
     /// Buffer future segments and drop old segments.
     ///
@@ -111,6 +132,31 @@ impl TcpFlow {
                 segment.mark_no_payload();
                 drop(segment);
             }
+        } else if self.start_unknown {
+            // This direction of an adopted mid-stream connection. Take the first
+            // segment we see as the stream start rather than buffering it until the
+            // reassembly deadline. Checked ahead of the SYN/ACK arm below, which
+            // would otherwise claim any ACK-flagged packet -- including the bare ACK
+            // that completes a handshake we joined at the SYN/ACK -- and burn a
+            // sequence number on a SYN that is not there.
+            //
+            // A SYN is the exception worth catching: it carries this flow's ISN, so
+            // one arriving late -- reordered behind the SYN/ACK we adopted on --
+            // tells us exactly where the stream began, and the start is no longer
+            // unknown. `expected_seq` below already charges the SYN its sequence
+            // number, so only the flags change.
+            let start_known = segment.flags() & SYN != 0;
+            let mut expected_seq = cur_seq.wrapping_add(length);
+            if segment.flags() & (SYN | FIN) != 0 {
+                expected_seq = expected_seq.wrapping_add(1);
+            }
+            self.next_seq = Some(expected_seq);
+            self.start_unknown = !start_known;
+            self.consumed_flags |= segment.flags();
+            self.last_ack = Some(segment.ack_no());
+            segment.ctxt.stream_start_unknown = !start_known;
+            info.consume_stream(&mut segment, subscription, registry);
+            self.flush_ooo_buffer::<T>(expected_seq, info, subscription, registry);
         } else if segment.flags() & (SYN | ACK) != 0 {
             // expecting SYNACK in response to the originator's SYN
             let expected_seq = cur_seq.wrapping_add(1 + length);
@@ -223,6 +269,7 @@ impl TcpFlow {
             .find(|s| s.seq_no() == resume_seq)
         {
             seg.ctxt.gap_before = gap;
+            seg.ctxt.stream_start_unknown |= start_unknown;
             TCP_SEGMENTS_AFTER_GAP.inc();
         }
 

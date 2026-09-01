@@ -23,6 +23,8 @@ thread_local! {
     pub(crate) static TCP_OOO_SEGMENT_DROPPED: Cell<u64> = const { Cell::new(0) };
     /// Times the reassembly deadline expired on a connection stalled behind a gap.
     pub(crate) static TCP_REASSEMBLY_TIMEOUTS: Cell<u64> = const { Cell::new(0) };
+    /// TCP connections adopted from the middle of a stream (no bare SYN observed).
+    pub(crate) static MIDSTREAM_TCP_ADOPTED: Cell<u64> = const { Cell::new(0) };
     pub(crate) static TOTAL_PKT: Cell<u64> = const { Cell::new(0) };
     pub(crate) static TOTAL_BYTE: Cell<u64> = const { Cell::new(0) };
     pub(crate) static TCP_PKT: Cell<u64> = const { Cell::new(0) };

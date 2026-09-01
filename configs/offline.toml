@@ -25,3 +25,8 @@ nb_memory_channels = 6
     # under tcp_inactivity_timeout. Defaults to tcp_inactivity_timeout.
     tcp_reassembly_timeout = 10_000
     tcp_establish_timeout = 5000
+    # Track TCP connections if first packet seen is not a bare SYN.
+    # init_synack = false
+    # init_data = false
+    # init_fin = false
+    # init_rst = false

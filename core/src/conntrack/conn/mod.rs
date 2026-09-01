@@ -19,10 +19,11 @@ use self::tcp_conn::TcpConn;
 use crate::conntrack::conn::udp_conn::UdpConn;
 use crate::conntrack::pdu::{L4Context, L4Pdu};
 use crate::lcore::CoreId;
-use crate::protocols::packet::tcp::{ACK, RST, SYN};
+use crate::protocols::packet::tcp::{ACK, FIN, RST, SYN};
 use crate::protocols::stream::ParserRegistry;
 use crate::stats::{
     StatExt, DROPPED_MIDDLE_OF_CONNECTION_TCP_BYTE, DROPPED_MIDDLE_OF_CONNECTION_TCP_PKT,
+    MIDSTREAM_TCP_ADOPTED,
 };
 use crate::subscription::{Subscription, Trackable};
 
@@ -35,6 +36,42 @@ use std::time::Instant;
 pub(crate) enum L4Conn {
     Tcp(TcpConn),
     Udp(UdpConn),
+}
+
+/// Which TCP connections Iris will adopt when the first packet it sees is not a
+/// bare SYN, i.e. when the connection was already in progress.
+///
+/// All default to `false`: adopting a connection mid-stream means probing for the
+/// application-layer protocol from an arbitrary offset, which is error-prone. See
+/// the corresponding fields on [`ConnTrackConfig`](crate::config::ConnTrackConfig).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct InitPolicy {
+    pub(crate) synack: bool,
+    pub(crate) fin: bool,
+    pub(crate) rst: bool,
+    pub(crate) data: bool,
+}
+
+impl InitPolicy {
+    /// Whether a first packet with these `flags` and payload `length` should be
+    /// adopted as an in-progress connection.
+    ///
+    /// Checked in teardown-first order: a FIN or RST that also carries data is a
+    /// teardown, not a data packet.
+    #[inline]
+    fn adopts(&self, flags: u8, length: usize) -> bool {
+        if flags & RST != 0 {
+            return self.rst;
+        }
+        if flags & FIN != 0 {
+            return self.fin;
+        }
+        if flags & SYN != 0 && flags & ACK != 0 {
+            return self.synack;
+        }
+        // A bare ACK with no payload carries no stream position worth adopting.
+        self.data && length > 0
+    }
 }
 
 /// Connection state.
@@ -71,31 +108,66 @@ where
     T: Trackable,
 {
     /// Creates a new TCP connection from `ctxt` with an initial inactivity window of
-    /// `initial_timeout` and a maximum out-or-order tolerance of `max_ooo`. This means that there
-    /// can be at most `max_ooo` packets buffered out of sequence before Iris chooses to discard
-    /// the connection.
+    /// `initial_timeout` and a per-direction out-of-order buffer of `max_ooo` segments.
+    ///
+    /// A bare SYN starts a connection from its beginning. Anything else means the
+    /// connection was already in progress, and whether Iris adopts it is governed
+    /// by `init`; by default all four cases are rejected.
     pub(super) fn new_tcp(
         initial_timeout: usize,
         max_ooo: usize,
-        pdu: &L4Pdu,
+        init: InitPolicy,
+        pdu: &mut L4Pdu,
         core_id: CoreId,
     ) -> Result<Self> {
-        let tcp_conn = if pdu.ctxt.flags & SYN != 0
-            && pdu.ctxt.flags & ACK == 0
-            && pdu.ctxt.flags & RST == 0
-        {
-            TcpConn::new_on_syn(pdu.ctxt, max_ooo)
-        } else {
+        let flags = pdu.ctxt.flags;
+        let is_bare_syn = flags & SYN != 0 && flags & ACK == 0 && flags & RST == 0;
+
+        if !is_bare_syn && !init.adopts(flags, pdu.length()) {
             DROPPED_MIDDLE_OF_CONNECTION_TCP_PKT.inc();
             DROPPED_MIDDLE_OF_CONNECTION_TCP_BYTE.inc_by(pdu.mbuf.data_len() as u64);
             bail!("Not SYN")
+        }
+
+        let tcp_conn = if is_bare_syn {
+            TcpConn::new_on_syn(pdu.ctxt, max_ooo)
+        } else {
+            // The sender of a SYN/ACK is the *responder*. Flip the packet's
+            // direction so the five-tuple derived below names the client as
+            // originator, rather than recording the server as the one who opened
+            // the connection. `ConnId` is order-independent, so the table key is
+            // unaffected.
+            if flags & SYN != 0 && flags & ACK != 0 {
+                pdu.dir = false;
+            }
+            MIDSTREAM_TCP_ADOPTED.inc();
+            let tcp_conn = TcpConn::new_midstream(pdu.ctxt, pdu.dir, max_ooo);
+            // This packet is consumed directly rather than through reassembly, so
+            // stamp it here with what `TcpFlow` stamps on the peer's first segment:
+            // an unknown number of bytes precede it. Without this the adopted
+            // direction looks byte-complete to every downstream datatype.
+            //
+            // Unless it is a SYN: a SYN/ACK carries the responder's ISN, so that
+            // direction's origin is exact and claiming otherwise would understate
+            // what we know.
+            if flags & SYN == 0 {
+                pdu.ctxt.stream_start_unknown = true;
+            }
+            tcp_conn
         };
+
+        let mut info = ConnInfo::new(pdu, core_id);
+        if !is_bare_syn {
+            // Leave the pre-handshake state so payload can flow. Deliberately
+            // without dispatching `L4EndHshk`: no handshake was observed.
+            info.adopt_midstream();
+        }
         Ok(Conn {
             last_seen_ts: pdu.ts,
             inactivity_window: initial_timeout,
             scheduled_expiry: usize::MAX,
             l4conn: L4Conn::Tcp(tcp_conn),
-            info: ConnInfo::new(pdu, core_id),
+            info,
         })
     }
 

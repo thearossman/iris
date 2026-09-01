@@ -44,11 +44,17 @@ static GAPPED_CONNS: AtomicU64 = AtomicU64::new(0);
 static MISSING_BYTES: AtomicU64 = AtomicU64::new(0);
 static RECOVERED_BYTES: AtomicU64 = AtomicU64::new(0);
 static TRUNCATED_TLS: AtomicU64 = AtomicU64::new(0);
+static START_UNOBSERVED_CONNS: AtomicU64 = AtomicU64::new(0);
 
 /// Every TCP connection, whether or not its stream was complete.
 #[callback("tcp,level=L4Terminated")]
 fn tally_conn(reassembly: &ReassemblyStats, record: &ConnRecord) {
     CONNS.fetch_add(1, Ordering::Relaxed);
+    if reassembly.start_unobserved() {
+        // Either adopted mid-stream (needs an `init_*` option) or reassembly gave
+        // up waiting for a direction's stream start.
+        START_UNOBSERVED_CONNS.fetch_add(1, Ordering::Relaxed);
+    }
     if reassembly.complete() {
         return;
     }
@@ -110,5 +116,9 @@ fn main() {
     println!(
         "  TLS handshakes recovered from lossy streams: {}",
         TRUNCATED_TLS.load(Ordering::Relaxed)
+    );
+    println!(
+        "  stream start never observed:  {}",
+        START_UNOBSERVED_CONNS.load(Ordering::Relaxed)
     );
 }

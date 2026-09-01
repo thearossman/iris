@@ -727,27 +727,55 @@ pub struct ConnTrackConfig {
     #[serde(default = "default_tcp_establish_timeout")]
     pub tcp_establish_timeout: usize,
 
-    #[doc(hidden)]
-    /// Whether to track TCP connections where the first observed packet is a SYN/ACK. Defaults to
-    /// `false`.
+    /// Whether to track aTCP connection whose first observed packet is a SYN/ACK.
+    /// Defaults to `false`.
+    ///
+    /// The sender of a SYN/ACK is the responder, so Iris orients the five-tuple
+    /// accordingly rather than mistaking the server for the client. The
+    /// originator's stream start is unknown; the responder's is not.
+    ///
+    /// See [`init_data`](Self::init_data) for what mid-stream adoption costs in
+    /// general.
     #[serde(default = "default_init_synack")]
     pub init_synack: bool,
 
-    #[doc(hidden)]
-    /// Whether to track TCP connections where the first observed packet is a FIN. Defaults to
-    /// `false`.
+    /// Whether to track aTCP connection whose first observed packet is a FIN.
+    /// Defaults to `false`.
+    ///
+    /// Such a connection yields little beyond the fact that it was torn down, but
+    /// that is enough for census and endpoint-inventory applications. It terminates
+    /// or times out almost immediately.
     #[serde(default = "default_init_fin")]
     pub init_fin: bool,
 
-    #[doc(hidden)]
-    /// Whether to track TCP connections where the first observed packet is a RST. Defaults to
-    /// `false`.
+    /// Whether to track aTCP connection whose first observed packet is a RST.
+    /// Defaults to `false`.
+    ///
+    /// As with [`init_fin`](Self::init_fin), this records that a teardown was seen.
     #[serde(default = "default_init_rst")]
     pub init_rst: bool,
 
-    #[doc(hidden)]
-    /// Whether to track TCP connections where the first observed packet is a DATA. Defaults to
-    /// `false`.
+    /// Whether to track a TCP connection whose first observed packet carries data
+    /// but no SYN. Defaults to `false`.
+    ///
+    /// This is the substantive case: long-lived connections established before Iris
+    /// started, connections whose handshake was routed past the vantage point, and
+    /// lossy captures.
+    /// Without it they are dropped outright and counted only in the
+    /// `DROPPED_MIDDLE_OF_CONNECTION_TCP_*` statistics.
+    ///
+    /// ## Costs
+    /// An adopted connection is one whose stream begins with a gap of unknown size,
+    /// so it inherits the same caveats as any recovered stream, plus:
+    /// - `L4EndHshk` never fires: the handshake was not observed, and reporting it
+    ///   would be a fabrication. `L4FirstPacket` and the streaming transitions
+    ///   behave normally.
+    /// - Protocol discovery probes from an arbitrary point in the stream, so
+    ///   misidentification is likelier than usual. This is the main reason the flag
+    ///   is opt-in.
+    /// - `is_terminated` cannot be satisfied without both directions' sequence
+    ///   numbers, so adopted connections are reaped by inactivity timeout rather
+    ///   than by observing FIN/ACK.
     #[serde(default = "default_init_data")]
     pub init_data: bool,
 }
