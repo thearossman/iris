@@ -2,6 +2,10 @@
 
 """Plot bytes_over_time's CSV output as a stacked area chart.
 
+The CSV holds byte counts per slice; the y-axis is the throughput they imply -- bits per
+second, averaged over the slice (bytes * 8 / slice width), in decimal units (Gbps = 1e9
+bits/s) as bit rates are conventionally quoted.
+
 The encrypted protocol series are stacked because they are disjoint protocol buckets.
 
 The `tcp_bytes`/`udp_bytes` transport totals are drawn as well, but as a lightly-shaded
@@ -19,6 +23,7 @@ handshake-only or payload-only protocol stack would compare two different quanti
 
 import argparse
 import csv
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -128,12 +133,13 @@ def pick_time_unit(duration_s):
     return "seconds", 1.0
 
 
-def pick_byte_unit(max_bytes):
-    units = [(1024**3, "GiB"), (1024**2, "MiB"), (1024, "KiB")]
+def pick_rate_unit(max_bits_per_s):
+    # Decimal, not binary: bit rates are quoted in powers of ten (1 Gbps = 1e9 bits/s).
+    units = [(1e9, "Gbps"), (1e6, "Mbps"), (1e3, "kbps")]
     for divisor, name in units:
-        if max_bytes >= divisor:
+        if max_bits_per_s >= divisor:
             return divisor, name
-    return 1, "bytes"
+    return 1, "bits/s"
 
 
 def format_slice_width(seconds):
@@ -222,8 +228,15 @@ def main():
     slice_width_s = detect_slice_width(offsets)
     # A step series needs a right-hand boundary or its last sample has zero visible width.
     # One-row CSVs do not expose their configured slice width, so give that lone slice a
-    # one-second display width while keeping the axis label honest ("per slice").
+    # one-second display width while keeping the axis label honest ("per slice"). The rate
+    # on the y-axis divides by that width, so say so rather than quoting a silent guess.
     display_slice_width_s = slice_width_s if slice_width_s is not None else 1.0
+    if slice_width_s is None:
+        print(
+            f"warning: {args.csv_path} has one data row, so its slice width is unknown; "
+            "assuming 1 s when converting bytes to bits/s",
+            file=sys.stderr,
+        )
     duration_s = offsets[-1] - offsets[0] + display_slice_width_s
     time_unit, time_divisor = pick_time_unit(duration_s)
     x_values = [(offset - offsets[0]) / time_divisor for offset in offsets]
@@ -235,7 +248,11 @@ def main():
         sum(values) for values in zip(*(values for _, _, values in transport_plotted))
     ]
     y_max = max(max(totals), max(transport_totals, default=0))
-    y_divisor, byte_unit = pick_byte_unit(y_max)
+    # The series stay in bytes; only the y-axis formatter and limits speak bits/s, so the
+    # divisor folds the bytes -> bits/s conversion (x8, per slice second) into the unit scale.
+    bits_per_s_per_byte = 8.0 / display_slice_width_s
+    rate_divisor, rate_unit = pick_rate_unit(y_max * bits_per_s_per_byte)
+    y_divisor = rate_divisor / bits_per_s_per_byte
     slice_label = format_slice_width(slice_width_s)
 
     plt.rcParams.update(
@@ -267,12 +284,12 @@ def main():
             alpha=TRANSPORT_ALPHA,
         )
 
-    # With the transport overlay in the frame the axis no longer covers encrypted bytes alone.
+    # With the transport overlay in the frame the axis no longer covers encrypted traffic alone.
     encrypted_prefix = "" if transport_plotted else "encrypted "
     component_label = "" if args.component == "total" else f"{args.component} "
-    y_label = f"{encrypted_prefix}{component_label}bytes".capitalize()
+    y_label = f"{encrypted_prefix}{component_label}throughput".capitalize()
     ax.set_xlabel(f"Time ({time_unit})")
-    ax.set_ylabel(f"{y_label}\nper {slice_label} ({byte_unit})")
+    ax.set_ylabel(f"{y_label}\n({rate_unit}, mean per {slice_label})")
     ax.yaxis.set_major_formatter(
         FuncFormatter(lambda value, _: f"{value / y_divisor:,.4g}")
     )
